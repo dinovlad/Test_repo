@@ -82,7 +82,16 @@ The panel must contain one row per store per day, with no missing outcomes or du
 
 This specification uses the theoretical convention $G=\infty$ for never-treated units in formulas and `cohort=0` in data. Code must explicitly handle that sentinel. Requested `event_times` are distinct nonnegative integers; requested doses are distinct, finite, positive numbers. Inputs are copied as needed; fitting must not alter the caller's DataFrame.
 
-Dependencies are NumPy, pandas, SciPy, and the Python standard library. The first version covers balanced daily panels, equal unit weights, no anticipation, and post-treatment level estimates. Covariates, inference, plotting, treatment slopes, and changing-dose paths are outside this initial scope.
+Runtime dependencies are NumPy, pandas, PyFixest, SciPy, and the Python standard library. Exact runtime pins and development-tool requirements are declared in [pyproject.toml](pyproject.toml). The supported project interpreters are Python 3.10 and 3.11, matching the requested pandas 1.5.3 wheel availability; Python 3.11 is recommended. The first version covers balanced daily panels, equal unit weights, no anticipation, and post-treatment level estimates. Covariates, inference, plotting, treatment slopes, and changing-dose paths are outside this initial scope.
+
+Use the supplied [.pre-commit-config.yaml](.pre-commit-config.yaml) for spelling, formatting, lint, and type checks on Python, Markdown, and notebooks. The hooks use system executables, so activate the development environment before installing or running them:
+
+```bash
+uv sync --python 3.11 --group dev
+source .venv/bin/activate
+pre-commit install
+pre-commit run --all-files
+```
 
 **`ATT` owns independent cohort-time fits.** The class is panel-level for convenience, but never pools regression coefficients across cohorts. Its signatures are:
 

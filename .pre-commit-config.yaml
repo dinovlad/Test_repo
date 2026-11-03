@@ -1,0 +1,52 @@
+repos:
+  - repo: local
+    hooks:
+      - id: codespell
+        name: codespell
+        entry: codespell
+        language: system
+        args: [ "--ignore-words-list=ure,missings" ]
+        pass_filenames: true
+        files: ^.*\.(py|md)$
+  - repo: local
+    hooks:
+      - id: nbqa_codespell
+        name: nbqa_codespell
+        entry: nbqa codespell
+        language: system
+        args: [ "--ignore-words-list=ure,missings", "--nbqa-shell" ]
+        pass_filenames: true
+        files: ^.*\.(ipynb)$
+  - repo: local
+    hooks:
+      - id: ruff_format
+        name: ruff_format
+        entry: ruff format
+        language: system
+        pass_filenames: true
+        files: ^.*\.(py|ipynb)$
+  - repo: local
+    hooks:
+      - id: ruff_check
+        name: ruff_check
+        entry: ruff check
+        language: system
+        args: [ "--fix" ]
+        pass_filenames: true
+        files: ^.*\.(py|ipynb)$
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: mypy
+        language: system
+        pass_filenames: true
+        files: ^.*\.(py)$
+  - repo: local
+    hooks:
+      - id: nbqa_mypy
+        name: nbqa_mypy
+        entry: nbqa mypy
+        language: system
+        pass_filenames: true
+        files: ^.*\.(ipynb)$
