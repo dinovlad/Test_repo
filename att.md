@@ -44,7 +44,7 @@ theta = evaluate_theta(
 
 The standalone weight example requires the precise retained `(store_id, employee_id)` pairs eligible at one event day. `evaluate_theta()` constructs that set automatically. The bandwidth is supplied in hours. The illustrated isolation window is a configuration example, not a recommended empirical choice; `history_start` and `history_end` declare the dates over which termination recording is complete for all outcome stores.
 
-**Event identifiers and store outcomes.** Let $i=(s,j)$ identify employee $j$ at store $s$, with termination day $G_i$ and previous daily scheduled hours $D_i>0$. The pair `(store_id, employee_id)` is the sole event key, with at most one termination per pair in the supplied history. Repeated terminations of the same employee at the same store are outside this input contract; reject repeated pairs rather than creating another identifier. Several sufficiently separated events from the same store can enter the analysis. There is no single permanent focal employee or first termination selected for each store: each eligible termination is focal in its own comparison.
+**Event identifiers and store outcomes.** Let $i=(s,j)$ identify employee $j$ at store $s$, with termination day $G_i$ and previous daily scheduled hours $D_i>0$. The pair `(store_id, employee_id)` is the sole estimation-unit key. The input may contain several events for that pair; keep its first event by normalized termination date as the only candidate for estimation. Later events do not become additional targets or enter the aggregation weights. The duplicate-event rule below logs how many rows were dropped for how many pairs. Several sufficiently separated events from the same store can enter the analysis. There is no single permanent focal employee or first termination selected for each store: each eligible termination is focal in its own comparison.
 
 The event's treatment label and associated outcome are
 
@@ -57,7 +57,7 @@ The dose is the fixed number of daily hours removed by that employee's terminati
 
 Store sales are shared outcomes. Copying the sales series across employees does not create independent observations or valid untreated coworkers. If employee A leaves a store, employee B at that same store cannot serve as a control merely because B has not left. Keep the outcomes and events in separate tables and construct comparison samples explicitly.
 
-**Isolation and event eligibility.** Prespecify an isolation window $(L,H)$, where $L\ge1$ and $H\ge\max(e)$ across fitted event days. For an event at $g$, screen the closed calendar interval $[g-L,g+H]$. An event is design-eligible only if its termination and preceding calendar date lie within the overall outcome date range, it has complete termination-history coverage for that entire interval, and no other employee termination at its store occurs inside it. Simultaneous terminations therefore exclude every affected event. Apply this rule to each event against the complete original history, before any filtering; do not remove one event and thereby make another artificially eligible.
+**Isolation and event eligibility.** Prespecify an isolation window $(L,H)$, where $L\ge1$ and $H\ge\max(e)$ across fitted event days. For an event at $g$, screen the closed calendar interval $[g-L,g+H]$. An event is design-eligible only if its termination and preceding calendar date lie within the overall outcome date range, it has complete termination-history coverage for that entire interval, and no other distinct termination at its store occurs inside it, including a later termination of the same employee. Simultaneous terminations therefore exclude every affected event. Apply this rule to each first-event candidate using the complete distinct-date termination history described below. Exclude only that candidate's exact `(store, employee, date)` from its own overlap check, not every termination of its pair. Repeated input rows for the same pair and date are one historical termination. Dropping rows from target estimation must not make another event artificially eligible.
 
 Here, an overlapping event means another termination falls within the specified screening interval. Reuse of a store's sales observations in separate comparisons is still possible and creates dependence. Window lengths must address the plausible duration of anticipation and changing carryover effects; spacing alone does not establish identification.
 
@@ -123,26 +123,47 @@ The event-based input tables, isolation screen, store-history-based control rule
 
 Other intentional implementation differences are retaining the fitted basis at prediction, warning and dropping small or unidentifiable cohort–event-day comparisons, and adding dose-conditional kernel aggregation. Thus compatibility refers to the regression calculation on the same comparison sample with a consistent fitted basis. The inspected R prediction path rebuilds its basis on the prediction grid. Sources were inspected on 2026-11-03; implementation validation should record the R version or source revision actually used.
 
-**Input contract and configurable columns.** `ATT.fit()` accepts two pandas DataFrames. Every required input column name is selected by a constructor parameter. The outcome table uses:
+**Input contract and configurable columns.** `ATT.fit()` accepts two pandas DataFrames. All seven input-column parameters are required keyword-only constructor arguments with no defaults. The names supplied in the introductory example are explicit caller choices. The outcome table uses:
 
-| `ATT` parameter | Default column name | Meaning |
-| --- | --- | --- |
-| `outcome_store_col` | `store_id` | Store identifier |
-| `outcome_date_col` | `date` | Outcome date; dtype `datetime64[ns]`, with time ignored |
-| `outcome_col` | `sales` | Finite numeric daily store sales; no missing values on present rows |
+| `ATT` parameter | Meaning |
+| --- | --- |
+| `outcome_store_col` | Store identifier |
+| `outcome_date_col` | Outcome date; dtype `datetime64[ns]`, with time ignored |
+| `outcome_col` | Finite numeric daily store sales; no missing values on present rows |
 
 The event table contains the complete termination history within the declared history window for those stores:
 
-| `ATT` parameter | Default column name | Meaning |
-| --- | --- | --- |
-| `event_store_col` | `store_id` | Store whose sales are affected |
-| `employee_col` | `employee_id` | Employee identifier; together with the store, uniquely identifies the termination |
-| `event_date_col` | `termination_date` | Termination date; dtype `datetime64[ns]`, with time ignored |
-| `dose_col` | `dose` | Positive finite daily hours removed at termination |
+| `ATT` parameter | Meaning |
+| --- | --- |
+| `event_store_col` | Store whose sales are affected |
+| `employee_col` | Employee identifier; together with the store, identifies the estimation unit |
+| `event_date_col` | Termination date; dtype `datetime64[ns]`, with time ignored |
+| `dose_col` | Positive finite daily hours removed at termination |
 
 The two store-column parameters allow different names in the two tables; their identifier values must still refer to the same stores. Each parameter must be a nonempty string naming an existing column. Require distinct mapped columns within each table and unique DataFrame column labels. The same name may be used in different tables. Extra columns are ignored. No new identifier column is required or generated for events: represent each key as a `(store_id, employee_id)` tuple or a two-level index, never by concatenating strings.
 
-Validate both date columns as timezone-naive `datetime64[ns]` with no `NaT`. Do not silently parse strings, accept object-date columns, or convert timezone-aware datetimes. Normalize copies with `.dt.normalize()` so only the calendar date is used while retaining `datetime64[ns]`. Validate uniqueness of `(store, normalized date)` in the outcome table after normalization. Two intraday rows that collapse to the same store-day are an error, not an instruction to sum or select one. The event table must have exactly one row per store–employee pair; repeated pairs are an error even if their dates differ. Different employees terminated at the same store on the same normalized date are simultaneous events and fail the isolation screen.
+Validate both date columns as timezone-naive `datetime64[ns]` with no `NaT`. Do not silently parse strings, accept object-date columns, or convert timezone-aware datetimes. Normalize copies with `.dt.normalize()` so only the calendar date is used while retaining `datetime64[ns]`. Validate uniqueness of `(store, normalized date)` in the outcome table after normalization. Two intraday rows that collapse to the same store-day are an error, not an instruction to sum or select one. Repeated store–employee pairs in the event input are allowed and processed by the first-event rule below. Different employees terminated at the same store on the same normalized date are simultaneous events and fail the isolation screen.
+
+**First-event selection and duplicate-event logging.** Validate required input values and normalize dates before selecting the first event. Group by the columns named by `event_store_col` and `employee_col`, sort by the normalized `event_date_col` using a stable sort, and keep that entire first row for each pair. If several rows share the earliest normalized date, retain the first in the original input row order; time of day is ignored even for ties. Retain that row's dose without averaging across duplicates.
+
+Select the first event across the full supplied history, before isolation, outcome availability, or sample-size screening. If that event is subsequently ineligible, do not promote a later event of the same pair. The target is therefore restricted to eligible first events per store–employee pair within the supplied history, not necessarily each employee's first-ever termination outside that history.
+
+Let `n_dropped_events` be the input row count minus the number of distinct store–employee pairs. Let `n_affected_units` be the number of those pairs with more than one input row. When `n_dropped_events > 0`, emit one aggregate message per `fit()` call:
+
+```python
+logging.warning(
+    "Dropped %d duplicate event rows from the target table for %d "
+    "store-employee units; kept the first event by date for each unit.",
+    n_dropped_events,
+    n_affected_units,
+)
+```
+
+For example, three rows for one pair and two for another mean three dropped events for two affected units. Count both repeated same-day records and later dated records in this message. With no duplicates, do not emit this message. Record both counts in `duplicate_diagnostics_`.
+
+Only the first-event rows populate `events_`, fitted targets, global knot selection, and kernel-weight inputs. Separately build `termination_history_` from all distinct `(store, employee, normalized termination date)` combinations in the original input. This table needs no dose or new event identifier. Later distinct dates remain solely to screen isolation and control exposure; repeated records on the same pair/date do not create false overlapping terminations. This preserves the existing requirement that target exclusions cannot erase treatment history.
+
+**Logging convention.** Every nonfatal warning in this specification must use the standard-library function `logging.warning()`, including duplicate-event summaries, failed comparison screens, missing controls, extrapolation, incomplete prediction tables, and restricted aggregations. Do not import or use the `warnings` module, warning categories, or `warnings.warn()`. Do not explicitly configure logging handlers or levels in the module; leave logging setup to the caller. Validation and required-model failures remain exceptions.
 
 The outcome panel may have missing store-days, including temporary inactivity and permanent closure. Every row that is present must have a finite, nonmissing outcome. An absent row is not a zero outcome. Do not fill missing dates, impute outcomes, carry observations forward, or replace a required endpoint with the nearest observed date. A real observed zero is allowed. A store or event contributes to a comparison only when its exact baseline and endpoint rows exist. Missing intermediate dates alone do not invalidate that comparison.
 
@@ -168,16 +189,16 @@ pre-commit run --all-files
 ```python
 ATT(
     *,
+    outcome_store_col,
+    outcome_date_col,
+    outcome_col,
+    event_store_col,
+    employee_col,
+    event_date_col,
+    dose_col,
     degree=3,
     num_knots=0,
     min_cohort_size=10,
-    outcome_store_col="store_id",
-    outcome_date_col="date",
-    outcome_col="sales",
-    event_store_col="store_id",
-    employee_col="employee_id",
-    event_date_col="termination_date",
-    dose_col="dose",
 )
 
 ATT.fit(
@@ -192,7 +213,7 @@ ATT.fit(
 ATT.predict(doses, *, event_times=None) -> pandas.DataFrame
 ```
 
-Construction requires a positive integer `degree`, a nonnegative integer `num_knots`, and a positive integer `min_cohort_size`. Require integer window bounds with $L\ge1$ and $H\ge0$, and distinct nonnegative fitted event days no greater than $H$. Dose requests must be distinct, finite, and positive. Event-time and dose requests must be nonempty.
+Construction requires all seven column-name arguments, a positive integer `degree`, a nonnegative integer `num_knots`, and a positive integer `min_cohort_size`. Require integer window bounds with $L\ge1$ and $H\ge0$, and distinct nonnegative fitted event days no greater than $H$. Dose requests must be distinct, finite, and positive. Event-time and dose requests must be nonempty.
 
 `fit()` returns `self` and replaces any previously fitted state; a failed refit must not leave an earlier model available for prediction. `predict()` before successful fitting raises an error. Omitting `event_times` in prediction requests all fitted horizons; explicitly requesting an unfitted horizon raises an error rather than fitting additional models implicitly.
 
@@ -253,7 +274,7 @@ Count each observed treated pair once; the isolation rule makes this the distinc
 
 For each nonempty treated comparison failing sample size, dose support, rank, or knot compatibility, warn with its cohort date, event day, store count, distinct-dose count, design dimension, and reason. Record the failure in `cell_diagnostics_`. Drop that cohort only at the affected horizon. This replaces the previous rule that dropped a cohort at every horizon: missing endpoints can make one comparison fail while another remains estimable. Do not reduce degree, remove knots, or pool cohorts to rescue a fit.
 
-Keep every excluded pair in the full termination history. Its store can still be a control in other clean comparisons with observed endpoints. Exclusion must never erase a termination from history screening.
+Keep every distinct termination date of every excluded pair in `termination_history_`. Its store can still be a control in other clean comparisons with observed endpoints. Exclusion must never erase a termination from history screening.
 
 Distinguish availability exclusions from estimation failures. An endpoint outside the overall outcome range is `outside_outcome_period`. If an in-range comparison has no treated pairs with both endpoints, mark `no_observed_treated`; it has no events in that horizon's observed-endpoint population. Record per-pair `missing_baseline` and `missing_endpoint` reasons in the availability diagnostics. If a nonempty treated design passes screening but has zero endpoint-observed clean controls, warn and mark `no_controls`; do not fit that cell. `evaluate_theta()` must error for an affected requested horizon rather than drop the cell and renormalize silently. A singleton control group is computable for point estimation and its count is reported.
 
@@ -262,8 +283,10 @@ If no requested comparison can be fitted, `fit()` raises an error after recordin
 **Stored state and unpooled output.** Keep the information needed for prediction, weights, and diagnostics:
 
 - `column_names_`: the seven supplied input-column mappings.
-- `events_`: canonical columns `store_id`, `employee_id`, `cohort`, `dose`, and `design_eligible`, with one row per original pair. `cohort` is a normalized `datetime64[ns]` date. Includes excluded events; these canonical names are internal/output conventions, not required names in the user's input.
-- `event_diagnostics_`: design eligibility and reasons such as `outside_outcome_period`, `incomplete_history`, and `overlapping_termination`, keyed by the pair; report conflicting pairs where relevant.
+- `events_`: canonical columns `store_id`, `employee_id`, `cohort`, `dose`, and `design_eligible`, with the selected first-event row per original pair. `cohort` is a normalized `datetime64[ns]` date. Includes excluded events; these canonical names are internal/output conventions, not required names in the user's input.
+- `termination_history_`: canonical `store_id`, `employee_id`, and normalized `cohort` date, unique by those three columns; includes later distinct dates dropped from estimation.
+- `duplicate_diagnostics_`: `n_dropped_events` and `n_affected_units` from first-event selection.
+- `event_diagnostics_`: design eligibility and reasons such as `outside_outcome_period`, `incomplete_history`, and `overlapping_termination`, keyed by the pair; report conflicting pairs and dates where relevant.
 - `availability_diagnostics_`: endpoint availability and missing-date reasons keyed by pair and event day, including the exact baseline and endpoint dates.
 - `event_times_`, `origin_date_`, `last_date_`, `last_day_`, `isolation_window_`, `history_window_`, and `knots_`.
 - `retained_cohorts_`: a mapping from event day to the cohort dates whose nonempty treated designs pass that horizon's screen. A missing control group does not remove a cohort from this set.
@@ -285,7 +308,7 @@ estimate_pi(
 ) -> pandas.DataFrame
 ```
 
-`events` uses the canonical metadata schema above: `store_id`, `employee_id`, normalized datetime `cohort`, and positive `dose`. It is independent of the fitted model and can be constructed directly; custom input columns are mapped to this schema by `ATT.fit()`. Require unique store–employee pairs. `eligible_pairs` is an explicit nonempty collection of unique two-element tuples, all present in `events`. Repeated stores with different employees are permitted. The caller supplies only pairs with observed endpoints in retained comparisons at the intended horizon; the function does not decide availability, isolation, or fit regressions. Validate pairs and filter to that exact set before normalization. A cohort-only argument is insufficient because the isolation screen can exclude individual events within a retained cohort.
+`events` uses the canonical metadata schema above: `store_id`, `employee_id`, normalized datetime `cohort`, and positive `dose`. It is independent of the fitted model and can be constructed directly; custom input columns are mapped to this schema by `ATT.fit()`. Require the already-selected first-event metadata with unique store–employee pairs; this helper does not repeat `fit()` preprocessing. `eligible_pairs` is an explicit nonempty collection of unique two-element tuples, all present in `events`. Repeated stores with different employees are permitted. The caller supplies only pairs with observed endpoints in retained comparisons at the intended horizon; the function does not decide availability, isolation, or fit regressions. Validate pairs and filter to that exact set before normalization. A cohort-only argument is insufficient because the isolation screen can exclude individual events within a retained cohort.
 
 Let $\mathcal I_e$ be the supplied set of store–employee pairs and $\mathcal R_e$ the represented cohorts. For a common bandwidth $h>0$, use
 
@@ -335,7 +358,7 @@ The function only aggregates existing estimates. It neither refits the curves no
 
 Return `event_time`, `dose`, `theta`, `n_cohorts_eligible`, `n_cohorts_used`, `n_events_design`, `n_events_eligible`, `n_events_used`, `n_stores_eligible`, `n_stores_used`, `availability_restricted`, `restricted_target`, and `extrapolated`. `n_events_design` counts all design-eligible pairs, including pairs without observed endpoints at this horizon. Eligible counts refer to the endpoint-observed population before comparison screening; used counts refer to retained comparisons. Store counts deduplicate across pairs for reporting only. `availability_restricted` is true when some design-eligible pairs lack either endpoint, including endpoints beyond the study range. `restricted_target` is true when any nonempty eligible cohort is excluded at this horizon by a sample-size, rank, dose-support, or knot screen. Isolation restrictions always define the target and are recorded separately. `extrapolated` is true if any contributing prediction is outside that comparison's observed dose range. Sort by event time and dose; component estimates and weights remain separately inspectable.
 
-**Observation availability and screening change the target.** The isolation design first restricts the population to $S_i=1$. Outcome availability then restricts it to $A_i(e)=1$ at each horizon. After comparison screening, weights estimate
+**Observation availability and screening change the target.** First-event selection first limits candidates to one event per store–employee pair. The isolation design then restricts that population to $S_i=1$. Outcome availability then restricts it to $A_i(e)=1$ at each horizon. After comparison screening, weights estimate
 
 $$
 P(G_i=g\mid D_i=d,S_i=1,A_i(e)=1,G_i\in\mathcal R_e).
@@ -354,16 +377,19 @@ This equals the pre-screen observed-endpoint target only when every eligible coh
 
 The screen is sample-dependent; this description is not an inferential result about selection. Both within-cohort event composition and retained cohorts may change across horizons. No common balanced sample is imposed. A fixed isolation window does not prevent horizon-specific loss of outcomes from inactivity or closure.
 
-**Implementation boundaries and validation plan.** Put the class, both public functions, and a few private validation, window-selection, and basis helpers in one `att.py` file. Use ordinary warning categories and small dictionaries or records for fitted cells. External R code is not a runtime dependency. No generic estimator framework, serialization layer, or extra classes are needed.
+**Implementation boundaries and validation plan.** Put the class, both public functions, and a few private validation, window-selection, and basis helpers in one `att.py` file. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. No generic estimator framework, serialization layer, or extra classes are needed.
 
 When the Python implementation is written, verify these behaviors with targeted examples:
 
-- Renaming every input column through the constructor leaves results unchanged. Different store-column names across the tables map correctly.
-- Time-of-day differences do not affect estimates; same-store intraday duplicates are rejected after normalization, as are `NaT`, timezone-aware inputs, and duplicate store–employee pairs. Missing calendar days are never compressed.
+- All seven column-name arguments are required; omitting one fails construction. Renaming every input column through the constructor leaves results unchanged, including different store-column names across tables.
+- Time-of-day differences do not affect estimates; same-store intraday duplicates in the outcome table are rejected after normalization, as are `NaT` and timezone-aware inputs. Missing calendar days are never compressed.
+- Repeated pairs retain only their earliest normalized-date row and its dose. Same-day ties use original row order; an ineligible first event is not replaced. Check the aggregate log counts, including three dropped rows for two units in the example, and no duplicate warning for unique pairs.
+- Later distinct dates dropped from targets still block conflicting controls or isolation windows. Repeated rows for the same pair/date create only one historical termination and do not create false overlaps.
+- Capture warning-level log records to verify every specified warning uses `logging.warning()`; no warnings-module emissions are produced.
 - A missing baseline or endpoint excludes that pair only from affected comparisons; missing intervening days alone do not. Present rows with missing or infinite outcomes fail validation. Temporary inactivity can cause a pair to contribute at one horizon, disappear at another, and reappear later.
 - A two-period comparison with a known polynomial dose effect and a nonzero control trend recovers the curve, subtracting the control mean once.
-- Predictions at a fixed dose are invariant to other requested doses and input row order. Where R training and prediction bases coincide, unpooled estimates on the same constructed sample agree numerically; otherwise compare against an R reference that explicitly reuses the training basis.
-- Two sufficiently separated events at one store both enter eligible cohorts and kernel weights. Coworkers never become extra control rows, and every control store contributes once per comparison.
+- Predictions at a fixed dose are invariant to other requested doses and to input row order when there are no conflicting ties at a pair's earliest normalized date. For conflicting same-day ties, the documented first-row selection intentionally depends on input order. Where R training and prediction bases coincide, unpooled estimates on the same constructed sample agree numerically; otherwise compare against an R reference that explicitly reuses the training basis.
+- Two sufficiently separated first events for different employees at one store both enter eligible cohorts and kernel weights. Coworkers never become extra control rows, and every control store contributes once per comparison.
 - Simultaneous and overlapping events are excluded using the original complete history. An excluded event or a dropped cohort still disqualifies its store from controls in every conflicting window.
 - Incomplete screening coverage excludes an event without silently assuming no future termination. Complete extended history permits late events to contribute at observed shorter horizons. Changing only the prediction horizons leaves the fitted isolation screen unchanged.
 - Small, rank-deficient, and incompatible-knot comparisons warn and disappear from the corresponding horizon only, while retaining the complete history. Verify that an estimable short horizon survives a sparse later horizon, with separate fitted bases and matching pair-specific kernel inputs.
