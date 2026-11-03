@@ -5,7 +5,18 @@ This document specifies a future self-contained Python module, `att.py`. It does
 The public API consists of one class and two functions:
 
 ```python
-model = ATT(degree=3, num_knots=0, min_cohort_size=10)
+model = ATT(
+    degree=3,
+    num_knots=0,
+    min_cohort_size=10,
+    outcome_store_col="store_id",
+    outcome_date_col="date",
+    outcome_col="sales",
+    event_store_col="store_id",
+    employee_col="employee_id",
+    event_date_col="termination_date",
+    dose_col="dose",
+)
 model.fit(
     outcomes,
     events,
@@ -19,7 +30,7 @@ unpooled = model.predict(doses=[4, 6, 8, 10, 12])
 weights = estimate_pi(
     model.events_,
     doses=[4, 6, 8, 10, 12],
-    eligible_event_ids=eligible_event_ids,
+    eligible_pairs=eligible_pairs,
     bandwidth=bandwidth,
 )
 
@@ -31,9 +42,9 @@ theta = evaluate_theta(
 )
 ```
 
-The standalone weight example requires the precise retained event IDs eligible at one event day. `evaluate_theta()` constructs that set automatically. The bandwidth is supplied in hours. The illustrated isolation window is a configuration example, not a recommended empirical choice; `history_start` and `history_end` declare the dates over which termination recording is complete for all outcome stores.
+The standalone weight example requires the precise retained `(store_id, employee_id)` pairs eligible at one event day. `evaluate_theta()` constructs that set automatically. The bandwidth is supplied in hours. The illustrated isolation window is a configuration example, not a recommended empirical choice; `history_start` and `history_end` declare the dates over which termination recording is complete for all outcome stores.
 
-**Event identifiers and store outcomes.** Let $i=(s,j)$ identify an employee employment spell $j$ at store $s$, with termination day $G_i$ and previous daily scheduled hours $D_i>0$. Use a separate spell identifier if an employee is rehired. Several sufficiently separated events from the same store can enter the analysis. There is no single permanent focal employee or first termination selected for each store: each eligible termination is focal in its own comparison.
+**Event identifiers and store outcomes.** Let $i=(s,j)$ identify employee $j$ at store $s$, with termination day $G_i$ and previous daily scheduled hours $D_i>0$. The pair `(store_id, employee_id)` is the sole event key, with at most one termination per pair in the supplied history. Repeated terminations of the same employee at the same store are outside this input contract; reject repeated pairs rather than creating another identifier. Several sufficiently separated events from the same store can enter the analysis. There is no single permanent focal employee or first termination selected for each store: each eligible termination is focal in its own comparison.
 
 The event's treatment label and associated outcome are
 
@@ -46,92 +57,102 @@ The dose is the fixed number of daily hours removed by that employee's terminati
 
 Store sales are shared outcomes. Copying the sales series across employees does not create independent observations or valid untreated coworkers. If employee A leaves a store, employee B at that same store cannot serve as a control merely because B has not left. Keep the outcomes and events in separate tables and construct comparison samples explicitly.
 
-**Isolation and event eligibility.** Prespecify an isolation window $(L,H)$, where $L\ge1$ and $H\ge\max(e)$ across fitted event days. For an event at $g$, screen the closed calendar interval $[g-L,g+H]$. An event is eligible only if it has an observed baseline, lies within the outcome period, has complete termination-history coverage for that entire interval, and no other employee termination at its store occurs inside it. Simultaneous terminations therefore exclude every affected event. Apply this rule to each event against the complete original history, before any filtering; do not remove one event and thereby make another artificially eligible.
+**Isolation and event eligibility.** Prespecify an isolation window $(L,H)$, where $L\ge1$ and $H\ge\max(e)$ across fitted event days. For an event at $g$, screen the closed calendar interval $[g-L,g+H]$. An event is design-eligible only if its termination and preceding calendar date lie within the overall outcome date range, it has complete termination-history coverage for that entire interval, and no other employee termination at its store occurs inside it. Simultaneous terminations therefore exclude every affected event. Apply this rule to each event against the complete original history, before any filtering; do not remove one event and thereby make another artificially eligible.
 
 Here, an overlapping event means another termination falls within the specified screening interval. Reuse of a store's sales observations in separate comparisons is still possible and creates dependence. Window lengths must address the plausible duration of anticipation and changing carryover effects; spacing alone does not establish identification.
 
-Write $S_i=1$ for an event passing these design restrictions and $\mathcal E$ for the resulting event population, before small-cohort screening. Keep $(L,H)$ fixed when comparing different event days or prediction requests. Refitting with a different window can change even the event-day-zero target. Do not infer complete history from the first and last recorded termination dates. If history ends at $T$, events whose screening interval extends beyond $T$ are ineligible even for shorter horizons. Complete termination records beyond the sales panel can avoid that exclusion without providing additional outcome observations.
+Write $S_i=1$ for an event passing these design restrictions and $\mathcal E$ for the resulting event population, before endpoint-availability and small-sample screening. Keep $(L,H)$ fixed when comparing different event days or prediction requests. Refitting with a different window can change even the event-day-zero target. Do not infer complete history from the first and last recorded termination dates. If history ends at $T$, events whose screening interval extends beyond $T$ are ineligible even for shorter horizons. Complete termination records beyond the sales panel can avoid that exclusion without providing additional outcome observations.
 
-**Statistical target and identifying restriction.** For an eligible event, let $Y^{\mathrm{term}}_{i,t}$ be store sales under the observed termination and $Y^{\mathrm{keep}}_{i,t}$ sales if that employee instead continues at their original daily hours through the comparison endpoint. The regimes share the actual history before the current event; subsequent staffing responses follow their respective regimes. The contrast does not remove every earlier termination from the store's history.
-
-The event-specific analogue of the article's unpooled target is
+**Statistical target and identifying restriction.** For each comparison let $e=t-g\ge0$. Define $O_{s,u}=1$ when the outcome table contains a valid observation for store $s$ on calendar date $u$, and zero otherwise. Event endpoint availability is
 
 $$
-ATT_{\mathcal E}(g,t,d\mid g,d)
+A_i(e)=O_{s(i),G_i-1}\thinspace{}O_{s(i),G_i+e}.
+$$
+
+Both dates must be observed exactly. Missing intervening days do not prevent that particular long-difference comparison. Let $\mathcal E_e$ contain the design-eligible events with $A_i(e)=1$.
+
+For an eligible event, let $Y^{\mathrm{term}}_{i,t}$ be store sales under the observed termination and $Y^{\mathrm{keep}}_{i,t}$ sales if that employee instead continues at their original daily hours through the comparison endpoint. The regimes share the actual history before the current event; subsequent staffing responses follow their respective regimes. The contrast does not remove every earlier termination from the store's history.
+
+The event-specific analogue of the article's unpooled target, restricted to observed endpoints, is
+
+$$
+ATT_{\mathcal E_e}(g,t,d\mid g,d)
 =E[Y^{\mathrm{term}}_{i,t}-Y^{\mathrm{keep}}_{i,t}
-\mid G_i=g,D_i=d,S_i=1].
+\mid G_i=g,D_i=d,S_i=1,A_i(e)=1].
 $$
 
-For $e=t-g\ge0$, define
-
-$$
-\mathcal G_e=\lbrace g:\ g\text{ has eligible events},\ g+e\le T\rbrace.
-$$
-
-The requested aggregation, adapted to eligible events, is
+Define $\mathcal G_e$ as the cohorts represented among $\mathcal E_e$. The requested aggregation is
 
 $$
 \theta_{\mathcal E}(d,e)=\sum_{g\in\mathcal G_e}\pi_g(e,d)
-ATT_{\mathcal E}(g,g+e,d\mid g,d),
+ATT_{\mathcal E_e}(g,g+e,d\mid g,d),
 \qquad
-\pi_g(e,d)=P(G_i=g\mid D_i=d,S_i=1,G_i\in\mathcal G_e).
+\pi_g(e,d)=P(G_i=g\mid D_i=d,S_i=1,A_i(e)=1).
 $$
 
-Dose and event day remain fixed; only calendar-day cohorts are averaged. These probabilities sample termination events, not stores with equal total weight. A store with more eligible terminations contributes more events. Throughout the API, the short names `att` and `theta` refer to these event-population quantities, subject to the additional cohort restriction described below.
+Dose and event day remain fixed; only calendar-day cohorts are averaged. These probabilities sample termination events, not stores with equal total weight. A store with more eligible, endpoint-observed terminations contributes more events. Throughout the API, `att` and `theta` refer to these quantities, subject to the additional comparison-specific cohort restriction below.
 
-Let $\mathcal C_g$ be the clean control stores defined below. In addition to consistency, no anticipation of the focal termination, and no relevant spillovers between stores, the required parallel-trends restriction is
+Let $\mathcal C_{g,e}$ be the clean control stores with observed endpoints, defined below. In addition to consistency, no anticipation of the focal termination, and no relevant spillovers between stores, the identifying parallel-trends restriction is
 
 $$
 E[Y^{\mathrm{keep}}_{i,t}-Y^{\mathrm{keep}}_{i,g-1}
-\mid G_i=g,D_i=d,S_i=1]
-=E[Y_{s,t}-Y_{s,g-1}\mid s\in\mathcal C_g].
+\mid G_i=g,D_i=d,S_i=1,A_i(e)=1]
+=E[Y_{s,t}-Y_{s,g-1}\mid s\in\mathcal C_{g,e}].
 $$
 
-The right-hand expectation weights control stores equally. This is an explicit identifying assumption for the selected events and their comparison stores, not a result implied by distance between terminations. Earlier terminations may leave persistent level effects that difference out; changing carryover effects must still be compatible with this restriction. The first version has no covariate or treatment-history adjustment to repair a failure of that assumption.
+The right-hand expectation weights control stores equally. This is an assumption for the selected events and their observed comparison stores, not a result implied by distance between terminations. Earlier terminations may leave persistent level effects that difference out; changing carryover effects must still be compatible with this restriction. The first version has no covariate or treatment-history adjustment to repair a failure of that assumption.
 
-Selection on the absence of later terminations uses post-event information and may itself be affected by the focal event. Identification is therefore asserted only under the stated restriction for the selected population. It does not recover effects for excluded events or identify a population that would remain isolated under both counterfactual regimes. Parametric estimation also requires an adequate specification of each cohort-time dose curve and relevant dose support. Strong parallel trends is not assumed, and slopes across doses are not interpreted as causal marginal responses.
+Selection on later terminations and on observed outcomes uses post-event information and may itself be affected by the focal event. Identification is asserted only under the stated restriction for the selected population. In particular, excluding stores after closure does not recover a treatment effect that includes their subsequent sales or closure consequences. Generalizing to all isolated events requires additional assumptions or a different outcome definition. The target is not a population guaranteed to remain isolated and observed under both counterfactual regimes. Parametric estimation also requires an adequate specification of each comparison's dose curve and relevant dose support. Strong parallel trends is not assumed, and slopes across doses are not interpreted as causal marginal responses.
 
-**Differences from the article.** Callaway, Goodman-Bacon and Sant'Anna (2025), abbreviated CGBS, provide the starting point. The distinctions below are substantive design changes, not merely a relabeling of the unit.
+**Differences from the article.** Callaway et. al. (2025) provide the starting point. The distinctions below are substantive design changes, not merely a relabeling of the unit.
 
 | Feature | Article's staggered-adoption setting | This plan |
 | --- | --- | --- |
-| Treatment histories | One adoption date and a fixed subsequent dose per unit, Assumption 3-MP, printed p. 39 | One absorbing label per termination spell, but potentially several events affecting a store |
+| Treatment histories | One adoption date and a fixed subsequent dose per unit, Assumption 3-MP, printed p. 39 | One absorbing label per store–employee pair, but potentially several events affecting a store |
 | Observation structure | Independent sampled units, Assumption 1-MP, p. 39 | Events within a store share outcomes and histories; independent event sampling is not assumed |
-| Counterfactual and PT | Outcomes without treatment; PT-MP and Theorem C.1, pp. 39–40 | No current focal termination, retaining prior history; a separate PT restriction for selected events and clean comparison stores |
+| Outcome availability | The stated panel contains outcomes in every modeled period | Store-day gaps are allowed; each comparison uses its own observed endpoints and therefore its own selected population |
+| Counterfactual and PT | Outcomes without treatment; PT-MP and Theorem C.1, pp. 39–40 | No current focal termination, retaining prior history; a separate PT restriction for selected events and clean comparison stores with observed endpoints |
 | Controls | Not-yet-treated or never-treated units, Theorem C.1, p. 40 | Stores without a termination in the specified window; sufficiently earlier terminations are allowed only under the stated identifying restriction |
-| Aggregation population | Dose-specific event-study aggregation over treatment cohorts, p. 41 | The same aggregation structure applied to eligible termination events, with an additional retained-cohort restriction |
+| Aggregation population | Dose-specific event-study aggregation over treatment cohorts, p. 41 | The same structure applied to endpoint-observed eligible terminations, with a horizon-specific retained-cohort restriction |
 
-The article's dose-specific event-study aggregation on printed page 41 is unnumbered; it is the source of the aggregation structure, not an equation proving this repeated-event extension. Remark C.1 on page 42 discusses estimating components and aggregating them. [CGBS, Appendix C](https://psantanna.com/files/CGBS_v4.pdf#page=40)
+The article's dose-specific event-study aggregation on printed page 41 is unnumbered; it is the source of the aggregation structure, not an equation proving this repeated-event extension. Remark C.1 on page 42 discusses estimating components and aggregating them. [Callaway et. al. (2025), Appendix C](https://psantanna.com/files/CGBS_v4.pdf#page=40)
 
 **Relationship to the R implementation.** The reference calculation is the parametric level-effect part of `contdid::cont_did_acrt`: regress raw outcome changes on an intercept and dose B-splines among the focal treated cohort, then subtract the comparison group's mean change. Use baseline $g-1$ and reproduce that calculation for each constructed comparison. [Estimator and subset source](https://github.com/bcallaway11/contdid/blob/main/R/cont_did.R)
 
-The event-based input tables, isolation screen, and store-history-based control rule are custom additions. Passing a duplicated store–employee panel directly to the package would not implement them. The earlier `control_group` choices are replaced by the single clean-window rule below; a coworker's own future termination date is never sufficient for control eligibility.
+The event-based input tables, isolation screen, store-history-based control rule, and explicit handling of missing store-days are custom additions. Passing a duplicated store–employee panel directly to the package would not implement them. The earlier `control_group` choices are replaced by the single clean-window rule below; a coworker's own future termination date is never sufficient for control eligibility.
 
-Other intentional implementation differences are retaining the fitted basis at prediction, warning and dropping small or unidentifiable target cohorts, and adding dose-conditional kernel aggregation. Thus compatibility refers to the regression calculation on the same comparison sample with a consistent fitted basis. The inspected R prediction path rebuilds its basis on the prediction grid. Sources were inspected on 2026-11-03; implementation validation should record the R version or source revision actually used.
+Other intentional implementation differences are retaining the fitted basis at prediction, warning and dropping small or unidentifiable cohort–event-day comparisons, and adding dose-conditional kernel aggregation. Thus compatibility refers to the regression calculation on the same comparison sample with a consistent fitted basis. The inspected R prediction path rebuilds its basis on the prediction grid. Sources were inspected on 2026-11-03; implementation validation should record the R version or source revision actually used.
 
-**Input contract.** `ATT.fit()` accepts two pandas DataFrames. The outcome table has these standard column names:
+**Input contract and configurable columns.** `ATT.fit()` accepts two pandas DataFrames. Every required input column name is selected by a constructor parameter. The outcome table uses:
 
-| Column | Meaning |
-| --- | --- |
-| `store_id` | Store identifier |
-| `day` | Integer calendar-day index from 1 through $T$ |
-| `sales` | Finite numeric daily store sales |
+| `ATT` parameter | Default column name | Meaning |
+| --- | --- | --- |
+| `outcome_store_col` | `store_id` | Store identifier |
+| `outcome_date_col` | `date` | Outcome date; dtype `datetime64[ns]`, with time ignored |
+| `outcome_col` | `sales` | Finite numeric daily store sales; no missing values on present rows |
 
 The event table contains the complete termination history within the declared history window for those stores:
 
-| Column | Meaning |
-| --- | --- |
-| `event_id` | Unique store–employee employment-spell identifier |
-| `store_id` | Store whose sales are affected |
-| `employee_id` | Employee identifier; may repeat across distinct employment spells |
-| `cohort` | Integer termination day on the same calendar as `day` |
-| `dose` | Positive finite daily hours removed at termination |
+| `ATT` parameter | Default column name | Meaning |
+| --- | --- | --- |
+| `event_store_col` | `store_id` | Store whose sales are affected |
+| `employee_col` | `employee_id` | Employee identifier; together with the store, uniquely identifies the termination |
+| `event_date_col` | `termination_date` | Termination date; dtype `datetime64[ns]`, with time ignored |
+| `dose_col` | `dose` | Positive finite daily hours removed at termination |
 
-The outcome panel is balanced, with exactly one row per `(store_id, day)` and no missing days or outcomes. The events table has one row per termination and unique `event_id`; stores with no terminations need no event row. Event dates may lie outside the outcome panel but must lie within the declared history window. A target event must have $2\le G_i\le T$. Do not encode never-treated stores as artificial zero-dose events. Validate identifiers, foreign keys, integer dates, finite values, and nonmissing required columns; reject duplicate event IDs rather than silently deduplicating them. Different event IDs at the same store/date are simultaneous events and are excluded by the isolation rule.
+The two store-column parameters allow different names in the two tables; their identifier values must still refer to the same stores. Each parameter must be a nonempty string naming an existing column. Require distinct mapped columns within each table and unique DataFrame column labels. The same name may be used in different tables. Extra columns are ignored. No new identifier column is required or generated for events: represent each key as a `(store_id, employee_id)` tuple or a two-level index, never by concatenating strings.
 
-`history_window=(a,b)` is a caller declaration of complete termination recording for every outcome store, including stores with no recorded events, with $a\le1\le T\le b$. Coverage cannot be verified from event records alone. Preserve all history rows, including events outside the sales panel, overlapping events, and events in dropped cohorts, for subsequent control screening. Calendar dates can be converted to integer offsets before fitting; missing calendar days must not be compressed. Validate the inputs rather than balancing or imputing them silently. Fitting must not alter the caller's DataFrames.
+Validate both date columns as timezone-naive `datetime64[ns]` with no `NaT`. Do not silently parse strings, accept object-date columns, or convert timezone-aware datetimes. Normalize copies with `.dt.normalize()` so only the calendar date is used while retaining `datetime64[ns]`. Validate uniqueness of `(store, normalized date)` in the outcome table after normalization. Two intraday rows that collapse to the same store-day are an error, not an instruction to sum or select one. The event table must have exactly one row per store–employee pair; repeated pairs are an error even if their dates differ. Different employees terminated at the same store on the same normalized date are simultaneous events and fail the isolation screen.
 
-Runtime dependencies are NumPy, pandas, PyFixest, SciPy, and the Python standard library. Exact runtime pins and development-tool requirements are declared in [pyproject.toml](pyproject.toml). The project requires Python 3.11; [.python-version](.python-version) selects that interpreter for tools such as uv. The first version covers balanced daily outcomes, equal treated-event weights within each regression, equal control-store weights, no anticipation, and post-treatment level estimates. Covariates, inference, plotting, treatment slopes, and changing the dose within an event are outside this initial scope.
+The outcome panel may have missing store-days, including temporary inactivity and permanent closure. Every row that is present must have a finite, nonmissing outcome. An absent row is not a zero outcome. Do not fill missing dates, impute outcomes, carry observations forward, or replace a required endpoint with the nearest observed date. A real observed zero is allowed. A store or event contributes to a comparison only when its exact baseline and endpoint rows exist. Missing intermediate dates alone do not invalidate that comparison.
+
+Use the earliest and latest normalized outcome dates as the overall study range. An optional internal integer day index may be constructed as the number of calendar days since the earliest date plus one, with the same origin for outcome dates, termination dates, and history bounds. Set $T$ to the last such index. Preserve gaps: neither within-store row numbers nor ranks of observed dates are calendar-day indices. The formulas in this document use these internal day indices for convenience; users supply datetime columns. Event days and isolation lengths are integer numbers of calendar days.
+
+A design-eligible target event has $2\le G_i\le T$; actual endpoint observation is checked separately for each comparison. Events outside the outcome range are allowed in the history table. Stores with no terminations need no event row; do not create zero-dose events. Validate nonmissing identifiers, event-store foreign keys, finite doses and outcomes, and all date and uniqueness requirements. Preserve the caller's identifier values without string coercion. Fitting must not alter either input DataFrame.
+
+`history_window=(a,b)` accepts date or timezone-naive pandas Timestamp bounds, normalized to dates. It declares complete termination recording for every outcome store from $a$ through $b$, including stores with no recorded events. The history window must contain the overall outcome date range, and every supplied termination must lie within it. Completeness cannot be verified from event records or inferred from observed sales dates. Preserve all terminations for screening, including those during missing outcome periods, outside the sales panel, overlapping other events, or excluded from estimation.
+
+Runtime dependencies are NumPy, pandas, PyFixest, SciPy, and the Python standard library. Exact runtime pins and development-tool requirements are declared in [pyproject.toml](pyproject.toml). The project requires Python 3.11; [.python-version](.python-version) selects that interpreter for tools such as uv. The first version covers daily outcomes with missing store-days allowed, equal treated-event weights within each regression, equal control-store weights, no anticipation, and post-treatment level estimates. Covariates, inference, plotting, treatment slopes, and changing the dose within an event are outside this initial scope.
 
 Use the supplied [.pre-commit-config.yaml](.pre-commit-config.yaml) for spelling, formatting, lint, and type checks on Python, Markdown, and notebooks. The hooks use system executables, so activate the development environment before installing or running them:
 
@@ -145,7 +166,19 @@ pre-commit run --all-files
 **`ATT` owns independent cohort-time fits.** The class manages the two tables but never pools regression coefficients across cohorts. Its signatures are:
 
 ```python
-ATT(*, degree=3, num_knots=0, min_cohort_size=10)
+ATT(
+    *,
+    degree=3,
+    num_knots=0,
+    min_cohort_size=10,
+    outcome_store_col="store_id",
+    outcome_date_col="date",
+    outcome_col="sales",
+    event_store_col="store_id",
+    employee_col="employee_id",
+    event_date_col="termination_date",
+    dose_col="dose",
+)
 
 ATT.fit(
     outcomes,
@@ -163,79 +196,82 @@ Construction requires a positive integer `degree`, a nonnegative integer `num_kn
 
 `fit()` returns `self` and replaces any previously fitted state; a failed refit must not leave an earlier model available for prediction. `predict()` before successful fitting raises an error. Omitting `event_times` in prediction requests all fitted horizons; explicitly requesting an unfitted horizon raises an error rather than fitting additional models implicitly.
 
-For a retained cohort $g$ and an in-window horizon $e$, set $t=g+e$. Use one treated row per eligible event at $g$. Under the isolation rule these events necessarily occur at distinct stores; assert that fact when constructing the sample. Select control stores using every recorded termination, not only retained target events:
+For a cohort $g$ and a horizon $e$, set $t=g+e$. Use one treated row per design-eligible event at $g$ with $A_i(e)=1$. These events necessarily occur at distinct stores under the isolation rule; assert that fact. The baseline is the preceding calendar day, even if that store was inactive then. Select controls using the complete termination history and exact endpoint availability:
 
 $$
-\mathcal C_g=\lbrace s:\quad
-\text{no termination at store }s\text{ lies in }[g-L,g+H]\rbrace.
+\mathcal C_{g,e}=\lbrace s:\quad
+\text{no termination at store }s\text{ lies in }[g-L,g+H],\quad
+O_{s,g-1}=O_{s,g+e}=1\rbrace.
 $$
 
-Count each control store once, regardless of its number of employees or recorded events. A treated store cannot also enter its own comparison as a control. A store may serve as a control for another comparison outside the window of its termination, including after an earlier termination, only under the stated PT and carryover conditions. The same fixed screening window applies at all fitted horizons for $g$; control means still depend on the endpoint. This rule deliberately screens through $g+H$ even when estimating a shorter horizon.
+Count each control store once, regardless of workforce size. A treated store cannot also be its own control. A store may control for another event outside its own termination window, including after an earlier termination, only under the stated PT and carryover conditions. The history screen remains fixed through $g+H$ at all horizons; the observed-endpoint restriction can change both treated and control samples across horizons.
 
-Compute $\Delta Y_s^{g,t}=Y_{s,t}-Y_{s,g-1}$ on those exact calendar dates. Let $b_g(d)$ denote the saved B-spline columns, excluding the first column of the full B-spline basis. The fitted design includes a separate intercept:
-
-$$
-x_g(d)=(1,b_g(d)')',\qquad
-\widehat\gamma_{gt}
-=\arg\min_\gamma\sum_{i:G_i=g,S_i=1}
-\left(\Delta Y_{s(i)}^{g,t}-x_g(D_i)'\gamma\right)^2.
-$$
-
-The control correction is calculated separately and stored:
+Compute $\Delta Y_s^{g,t}=Y_{s,t}-Y_{s,g-1}$. Let $b_{g,e}(d)$ denote the saved B-spline columns for this comparison, excluding the first full-basis column. The fitted design includes a separate intercept:
 
 $$
-\widehat m_{0,gt}
-=\frac{1}{|\mathcal C_g|}\sum_{s\in\mathcal C_g}\Delta Y_s^{g,t}.
+x_{g,e}(d)=(1,b_{g,e}(d)')',\qquad
+\widehat\gamma_{g,e}
+=\arg\min_\gamma\sum_{i:G_i=g,S_i=1,A_i(e)=1}
+\left(\Delta Y_{s(i)}^{g,t}-x_{g,e}(D_i)'\gamma\right)^2.
+$$
+
+Store the control correction separately:
+
+$$
+\widehat m_{0,g,e}
+=\frac{1}{|\mathcal C_{g,e}|}\sum_{s\in\mathcal C_{g,e}}\Delta Y_s^{g,t}.
 $$
 
 Prediction is
 
 $$
-\widehat{ATT}_{\mathcal E}(g,t,d\mid g,d)
-=x_g(d)'\widehat\gamma_{gt}-\widehat m_{0,gt}.
+\widehat{ATT}_{\mathcal E_e}(g,t,d\mid g,d)
+=x_{g,e}(d)'\widehat\gamma_{g,e}-\widehat m_{0,g,e}.
 $$
 
-The intercept belongs to the raw treated-outcome regression. The stored control mean is subtracted exactly once. Neither controls nor kernel weights enter the treated OLS fit. Use a numerically stable least-squares solver, not an explicit inverse of $X'X$.
+The intercept belongs to the raw treated-outcome regression. Subtract the stored control mean exactly once. Neither controls nor kernel weights enter the treated OLS fit. Use a numerically stable least-squares solver, not an explicit inverse of $X'X$.
 
 **Fitted basis and knots.** Let $q$ be the degree and $K$ the number of internal knots. The regression has $p=q+K+1$ columns, including the intercept. Defaults $q=3,K=0$ give a cubic polynomial expressed in a B-spline basis.
 
-For $K>0$, choose shared internal knots once using the positive doses from one row per design-eligible termination event, before the small-cohort screen. Use quantiles at $k/(K+1)$, $k=1,\ldots,K$, with linear interpolation matching R's default quantile convention. This retains the package's global knot-selection structure, now applied to the eligible event population. Keep the selected knots fixed after screening. [Setup source](https://github.com/bcallaway11/contdid/blob/main/R/setup_pte_cont.R), [quantile helper](https://github.com/bcallaway11/contdid/blob/main/R/helper_functions.R)
+For $K>0$, choose shared internal knots once using the positive doses from one row per design-eligible store–employee pair, before endpoint-availability and small-sample screening. A pair contributes once even if it is observed at several requested horizons. Use quantiles at $k/(K+1)$, $k=1,\ldots,K$, with linear interpolation matching R's default quantile convention. This retains the package's global knot-selection structure, now applied to the eligible event population. Keep the selected knots fixed after screening. [Setup source](https://github.com/bcallaway11/contdid/blob/main/R/setup_pte_cont.R), [quantile helper](https://github.com/bcallaway11/contdid/blob/main/R/helper_functions.R)
 
-For each retained cohort, use its observed treated-dose minimum and maximum as boundary knots. Build and store the resulting basis definition: degree, internal knots, repeated boundary knots, and retained-column convention. A SciPy `BSpline` representation can evaluate that saved basis. Construct the full basis, omit its first column, and add an explicit intercept, consistent with the R parameterization. [B-spline conventions](https://wwenjie.org/splines2/reference/bspline)
+For each `(cohort, event_time)` comparison, use the minimum and maximum doses among its endpoint-observed treated pairs as boundary knots. Build and store the resulting basis definition: degree, internal knots, repeated boundary knots, and retained-column convention. A SciPy `BSpline` representation can evaluate that saved basis. Construct the full basis, omit its first column, and add an explicit intercept, consistent with the R parameterization. [B-spline conventions](https://wwenjie.org/splines2/reference/bspline)
 
-Reject duplicate global internal knots with a configuration error; do not silently change $K$. If a shared internal knot is not strictly inside a cohort's boundary knots, warn and drop that target cohort with an `incompatible_knots` reason. Degenerate dose ranges and rank-deficient designs are handled by the cohort screen below.
+Reject duplicate global internal knots with a configuration error; do not silently change $K$. If a shared internal knot is not strictly inside a comparison's boundary knots, warn and drop that comparison with an `incompatible_knots` reason. Degenerate dose ranges and rank-deficient designs are handled by the comparison-specific screen below.
 
-`predict()` must evaluate the fitted basis without recalculating knots or boundaries from the requested doses. In particular, a prediction at dose 8 must be identical whether requested alone or alongside other doses. Because event selection uses a fixed isolation window and the outcome panel is balanced, the same cohort basis can be reused across its horizons; coefficients and control means remain specific to each comparison.
+`predict()` must evaluate the fitted basis without recalculating knots or boundaries from the requested doses. In particular, a prediction at dose 8 must be identical whether requested alone or alongside other doses. Save a separate basis definition for each `(cohort, event_time)` because missing endpoints can change its treated sample and dose support. Do not assume that one cohort has the same basis at every horizon.
 
-To stay close to the parametric routine, allow polynomial continuation outside a cohort's observed dose range, issue an extrapolation warning, and flag those rows. Do not clip doses, discard cohorts at particular doses, or renormalize weights because of extrapolation. Such values rely on the fitted functional form beyond observed support.
+To stay close to the parametric routine, allow polynomial continuation outside a comparison's observed dose range, issue an extrapolation warning, and flag those rows. Do not clip doses, discard cohorts at particular doses, or renormalize weights because of extrapolation. Such values rely on the fitted functional form beyond observed support.
 
-**Small-cohort screening and dropping.** The proposed configurable default is `min_cohort_size=10` distinct stores. This is an implementation choice, not a threshold supplied by the article or a guarantee of precision. Let $n_{\mathrm{user}}$ denote the configured `min_cohort_size`. The effective minimum is
+**Small-sample screening and dropping.** The configurable default `min_cohort_size=10` now means ten distinct treated stores in a specific `(cohort, event_time)` comparison after endpoint selection. This is an implementation choice, not an article threshold or a guarantee of precision. With $n_{\mathrm{user}}$ denoting that parameter and $p$ the design dimension, require
 
 $$
-n_{\min}=\max(n_{\mathrm{user}},p+1),
+n_{\min}=\max(n_{\mathrm{user}},p+1).
 $$
 
-which also requires positive residual degrees of freedom. Count distinct treated stores after the isolation screen, not employee records or daily rows. This equals the number of eligible events in that cohort; a store may still contribute separate events to other cohorts. A cohort is retained only if its sample size meets that minimum, it has at least $p$ distinct dose values, and its actual regression matrix has full column rank. Use the least-squares solver's documented numerical rank tolerance consistently. The actual rank check is necessary even when the distinct-dose check passes.
+Count each observed treated pair once; the isolation rule makes this the distinct-store count within the comparison. Require at least $p$ distinct doses and full column rank under a consistent documented numerical tolerance. The rank check is necessary even if the distinct-dose check passes.
 
-For every dropped target cohort, emit one warning identifying its date, number of stores, number of distinct doses, required design dimension, and reason. Record the same information in `cohort_diagnostics_`. Never silently lower the degree, remove knots, or pool adjacent calendar cohorts to rescue a fit.
+For each nonempty treated comparison failing sample size, dose support, rank, or knot compatibility, warn with its cohort date, event day, store count, distinct-dose count, design dimension, and reason. Record the failure in `cell_diagnostics_`. Drop that cohort only at the affected horizon. This replaces the previous rule that dropped a cohort at every horizon: missing endpoints can make one comparison fail while another remains estimable. Do not reduce degree, remove knots, or pool cohorts to rescue a fit.
 
-Screening depends on the cohort's dose design, so drop that cohort from target estimation at every event day. **Keep all its events in the complete termination history and all its stores in the outcome panel.** Those stores may still serve as controls in other clean windows. Dropping an event or cohort must never erase a termination from control screening or make its store appear untreated during that termination.
+Keep every excluded pair in the full termination history. Its store can still be a control in other clean comparisons with observed endpoints. Exclusion must never erase a termination from history screening.
 
-Ordinary horizon exclusions, $g+e>T$, are not small-cohort failures. If a retained in-window cohort-time comparison has zero controls, warn and record `no_controls` in `cell_diagnostics_`; no model is fitted for that cell. `evaluate_theta()` must raise a clear error for an affected requested horizon rather than silently remove that comparison and renormalize. A singleton control group is computable for point estimation; its count is reported.
+Distinguish availability exclusions from estimation failures. An endpoint outside the overall outcome range is `outside_outcome_period`. If an in-range comparison has no treated pairs with both endpoints, mark `no_observed_treated`; it has no events in that horizon's observed-endpoint population. Record per-pair `missing_baseline` and `missing_endpoint` reasons in the availability diagnostics. If a nonempty treated design passes screening but has zero endpoint-observed clean controls, warn and mark `no_controls`; do not fit that cell. `evaluate_theta()` must error for an affected requested horizon rather than drop the cell and renormalize silently. A singleton control group is computable for point estimation and its count is reported.
 
-If all target cohorts fail screening, or no requested comparison can be fitted, `fit()` raises an error after recording the reasons. These failure rules are deliberately explicit; predictions from failed cells are not filled with zero.
+If no requested comparison can be fitted, `fit()` raises an error after recording reasons. Never fill a failed cell with a zero effect.
 
-**Stored state and unpooled output.** Keep only the information needed for prediction, weights, and diagnostics:
+**Stored state and unpooled output.** Keep the information needed for prediction, weights, and diagnostics:
 
-- `events_`: one row per original termination, with original identifiers, date, dose, and a `design_eligible` flag; includes excluded events and dropped cohorts.
-- `event_diagnostics_`: eligibility and reasons such as `outside_outcome_period`, `incomplete_history`, and `overlapping_termination`, with conflicting event IDs where relevant.
-- `event_times_`, `last_day_`, `isolation_window_`, `history_window_`, `knots_`, and `retained_cohorts_`.
-- `bases_`: saved basis definitions keyed by cohort.
-- `models_`: separate coefficient vectors, control means, and sample counts keyed by `(cohort, event_time)`.
-- `cohort_diagnostics_`: retained/dropped status and design information for every cohort containing design-eligible events.
-- `cell_diagnostics_`: in-window eligibility, control counts, and fit status for every requested cohort/horizon pair, together with the contributing event IDs and unique control-store IDs.
+- `column_names_`: the seven supplied input-column mappings.
+- `events_`: canonical columns `store_id`, `employee_id`, `cohort`, `dose`, and `design_eligible`, with one row per original pair. `cohort` is a normalized `datetime64[ns]` date. Includes excluded events; these canonical names are internal/output conventions, not required names in the user's input.
+- `event_diagnostics_`: design eligibility and reasons such as `outside_outcome_period`, `incomplete_history`, and `overlapping_termination`, keyed by the pair; report conflicting pairs where relevant.
+- `availability_diagnostics_`: endpoint availability and missing-date reasons keyed by pair and event day, including the exact baseline and endpoint dates.
+- `event_times_`, `origin_date_`, `last_date_`, `last_day_`, `isolation_window_`, `history_window_`, and `knots_`.
+- `retained_cohorts_`: a mapping from event day to the cohort dates whose nonempty treated designs pass that horizon's screen. A missing control group does not remove a cohort from this set.
+- `bases_` and `models_`: saved basis definitions and separate coefficients, control means, and sample counts keyed by `(cohort, event_time)`.
+- `cohort_diagnostics_`: summary of design-eligible events and available, retained, or failed comparisons for each cohort.
+- `cell_diagnostics_`: horizon status, treated-design checks, control counts, the exact contributing treated pairs, and the unique control-store identifiers.
 
-`ATT.predict()` returns one row for each available `(cohort, event_time, dose)` combination, with columns `cohort`, `day`, `event_time`, `dose`, `att`, `n_treated`, `n_controls`, and `extrapolated`. Sort deterministically by cohort, event time, and dose. If unavailable in-window cells exist, warn that the returned table is incomplete and direct the caller to `cell_diagnostics_`. Out-of-window combinations are simply absent.
+`ATT.predict()` returns one row per available `(cohort, event_time, dose)`, with `cohort`, `day`, `event_time`, `dose`, `att`, `n_treated`, `n_controls`, and `extrapolated`. Both `cohort` and endpoint `day` are normalized `datetime64[ns]` dates, not internal integer indices. Sort by cohort, event time, and dose. Warn when requested comparisons were dropped or have no controls, directing the caller to diagnostics. Ordinary outcome-availability exclusions are recorded separately; do not manufacture predictions for them.
 
 **Separate kernel-weight function.** This function is independent of fitted outcomes and of `ATT` internals:
 
@@ -244,14 +280,14 @@ estimate_pi(
     events,
     doses,
     *,
-    eligible_event_ids,
+    eligible_pairs,
     bandwidth,
 ) -> pandas.DataFrame
 ```
 
-`events` must have one row per termination with unique `event_id` and valid cohort/dose labels. Repeated `store_id` values are permitted. `eligible_event_ids` is an explicit nonempty collection of unique IDs, all present in `events`. The caller must supply only events eligible for the intended target and horizon; the function does not decide isolation or fit regressions. Validate IDs and filter to that precise set before any kernel normalization. A cohort-only argument is insufficient because the isolation screen can exclude individual events within a retained cohort.
+`events` uses the canonical metadata schema above: `store_id`, `employee_id`, normalized datetime `cohort`, and positive `dose`. It is independent of the fitted model and can be constructed directly; custom input columns are mapped to this schema by `ATT.fit()`. Require unique store–employee pairs. `eligible_pairs` is an explicit nonempty collection of unique two-element tuples, all present in `events`. Repeated stores with different employees are permitted. The caller supplies only pairs with observed endpoints in retained comparisons at the intended horizon; the function does not decide availability, isolation, or fit regressions. Validate pairs and filter to that exact set before normalization. A cohort-only argument is insufficient because the isolation screen can exclude individual events within a retained cohort.
 
-Let $\mathcal I_e$ be the supplied set of event IDs and $\mathcal R_e$ the represented cohorts. For a common bandwidth $h>0$, use
+Let $\mathcal I_e$ be the supplied set of store–employee pairs and $\mathcal R_e$ the represented cohorts. For a common bandwidth $h>0$, use
 
 $$
 q_g(d;h)=\sum_{i\in\mathcal I_e:G_i=g}
@@ -261,9 +297,9 @@ q_g(d;h)=\sum_{i\in\mathcal I_e:G_i=g}
 =\frac{q_g(d;h)}{\sum_{k\in\mathcal R_e}q_k(d;h)}.
 $$
 
-Each supplied event contributes exactly once. Do not count daily rows, duplicate sales by workforce size, deduplicate stores across different events, or average kernel contributions within each cohort. Summing event contributions preserves cohort sizes and the event-weighted target. The Gaussian normalization constant and common $1/h$ cancel. All weights are nonnegative and sum to one at each requested dose. Compute normalization with log-sum-exp; invalid bandwidths or nonfinite intermediate results raise errors rather than triggering uniform weights.
+Each supplied pair contributes exactly once. Do not count daily rows, duplicate sales by workforce size, deduplicate stores across different events, or average kernel contributions within each cohort. Summing event contributions preserves cohort sizes and the event-weighted target. The Gaussian normalization constant and common $1/h$ cancel. All weights are nonnegative and sum to one at each requested dose. Compute normalization with log-sum-exp; invalid bandwidths or nonfinite intermediate results raise errors rather than triggering uniform weights.
 
-Return `cohort`, `dose`, and `weight`, sorted by cohort and dose. No event-time argument is needed: supplying a different eligible-event set supplies the horizon dependence. The function can also inspect sensitivity to dose and bandwidth.
+Return `cohort`, `dose`, and `weight`, sorted by normalized cohort date and dose. No event-time argument is needed: supplying a different eligible-event set supplies the horizon dependence. The function can also inspect sensitivity to dose and bandwidth.
 
 This is a custom estimator of conditional cohort probabilities. The article does not prescribe this kernel or bandwidth, and the package's existing dose aggregation does not supply these conditional weights. A positive bandwidth smooths cohort composition over nearby doses; consistency for exact conditional probabilities requires suitable smoothness, bandwidth, and sample-size conditions. Repeated events from one store do not create independent information. Automatic bandwidth selection is outside the first version.
 
@@ -281,10 +317,10 @@ evaluate_theta(
 
 For each requested fitted horizon $e$:
 
-1. Select all design-eligible events with $G_i+e\le T$. Their represented cohorts form $\mathcal G_e$.
-2. Let $\mathcal R$ be `retained_cohorts_`. Retain only events in those cohorts, obtaining $\mathcal I_e$ and $\mathcal R_e=\mathcal G_e\cap\mathcal R$. If empty, raise an error.
+1. Select all design-eligible pairs with both exact outcome endpoints observed, $A_i(e)=1$. Their represented cohorts form $\mathcal G_e$.
+2. Retrieve $\mathcal R_e$ from `retained_cohorts_[e]`, then keep only those observed pairs in those cohorts to form $\mathcal I_e$. If empty, raise an error.
 3. Require a fitted cell for every cohort in $\mathcal R_e$. A missing control group is an error here, not an additional implicit selection rule.
-4. Obtain unpooled predictions from `ATT.predict()` and weights from `estimate_pi(model.events_, ..., eligible_event_ids=I_e)`.
+4. Obtain unpooled predictions from `ATT.predict()` and weights from `estimate_pi(model.events_, ..., eligible_pairs=I_e)`.
 5. Join by exact cohort and dose labels. Require a complete one-to-one match and weights summing to one; do not let an inner join discard unmatched components.
 6. Calculate
 
@@ -292,17 +328,17 @@ $$
 \widehat\theta_{\mathcal E,\mathcal R}(d,e)
 =\sum_{g\in\mathcal R_e}
 \widehat\pi_g(e,d)\thinspace{}
-\widehat{ATT}_{\mathcal E}(g,g+e,d\mid g,d).
+\widehat{ATT}_{\mathcal E_e}(g,g+e,d\mid g,d).
 $$
 
-The function only aggregates existing estimates. It neither refits the curves nor changes the window or screening. Changing bandwidth changes the weights, not the underlying ATT models.
+The function only aggregates existing estimates. It neither refits the curves nor changes the window, endpoint samples, or screening. Changing bandwidth changes the weights, not the underlying ATT models.
 
-Return `event_time`, `dose`, `theta`, `n_cohorts_eligible`, `n_cohorts_used`, `n_events_eligible`, `n_events_used`, `n_stores_eligible`, `n_stores_used`, `restricted_target`, and `extrapolated`. Eligible counts refer to the design-eligible population at that horizon before the cohort screen; used counts refer to the retained population. Store counts deduplicate across events for reporting only, not weighting. `restricted_target` is true whenever any cohort-screen rule excludes an eligible cohort, including small samples, rank failures, and incompatible knots. This flag does not negate the isolation restriction, which always defines the target and is recorded in the model's window and event diagnostics. `extrapolated` is true if any contributing prediction lies outside its cohort's observed dose range. Sort by event time and dose. Component estimates and weights remain inspectable through the separate APIs.
+Return `event_time`, `dose`, `theta`, `n_cohorts_eligible`, `n_cohorts_used`, `n_events_design`, `n_events_eligible`, `n_events_used`, `n_stores_eligible`, `n_stores_used`, `availability_restricted`, `restricted_target`, and `extrapolated`. `n_events_design` counts all design-eligible pairs, including pairs without observed endpoints at this horizon. Eligible counts refer to the endpoint-observed population before comparison screening; used counts refer to retained comparisons. Store counts deduplicate across pairs for reporting only. `availability_restricted` is true when some design-eligible pairs lack either endpoint, including endpoints beyond the study range. `restricted_target` is true when any nonempty eligible cohort is excluded at this horizon by a sample-size, rank, dose-support, or knot screen. Isolation restrictions always define the target and are recorded separately. `extrapolated` is true if any contributing prediction is outside that comparison's observed dose range. Sort by event time and dose; component estimates and weights remain separately inspectable.
 
-**Dropping events or cohorts changes the target.** Isolation and history coverage first restrict the population to $S_i=1$. After the cohort screen, weights estimate
+**Observation availability and screening change the target.** The isolation design first restricts the population to $S_i=1$. Outcome availability then restricts it to $A_i(e)=1$ at each horizon. After comparison screening, weights estimate
 
 $$
-P(G_i=g\mid D_i=d,S_i=1,G_i\in\mathcal R_e).
+P(G_i=g\mid D_i=d,S_i=1,A_i(e)=1,G_i\in\mathcal R_e).
 $$
 
 For a given retained set, the population counterpart is
@@ -310,24 +346,27 @@ For a given retained set, the population counterpart is
 $$
 \theta_{\mathcal E,\mathcal R}(d,e)
 =\sum_{g\in\mathcal R_e}
-P(G_i=g\mid D_i=d,S_i=1,G_i\in\mathcal R_e)
-ATT_{\mathcal E}(g,g+e,d\mid g,d).
+P(G_i=g\mid D_i=d,S_i=1,A_i(e)=1,G_i\in\mathcal R_e)
+ATT_{\mathcal E_e}(g,g+e,d\mid g,d).
 $$
 
-This equals the pre-cohort-screen target only if every eligible cohort is retained or under additional special conditions. It is not generally the effect over all terminations or an equal-store average. The short output name `theta` must retain this interpretation in documentation and diagnostics. Warn when the cohort screen restricts an aggregation, listing affected horizons. Never retain excluded events in the kernel denominator, replace unknown effects with zero, or imply that renormalization recovers excluded effects.
+This equals the pre-screen observed-endpoint target only when every eligible cohort is retained or under additional special conditions. It does not generally equal the effect over all isolated events, all terminations, or an equal-store average. Keep this interpretation despite the short output name `theta`. Warn when comparison screening restricts an aggregation, listing affected horizons. Availability exclusions are separately visible through counts, flags, and missing-date diagnostics. Never retain excluded pairs in the kernel denominator, replace unknown effects with zero, or imply that renormalization recovers missing effects.
 
-The cohort screen is sample-dependent; this target description is not an inferential result about selection. Cohort composition may also change with outcome availability at each horizon. No additional common balanced cohort set is imposed across event days, although the fixed isolation window and available termination-history coverage can themselves restrict the set to cohorts observed at every fitted horizon.
+The screen is sample-dependent; this description is not an inferential result about selection. Both within-cohort event composition and retained cohorts may change across horizons. No common balanced sample is imposed. A fixed isolation window does not prevent horizon-specific loss of outcomes from inactivity or closure.
 
 **Implementation boundaries and validation plan.** Put the class, both public functions, and a few private validation, window-selection, and basis helpers in one `att.py` file. Use ordinary warning categories and small dictionaries or records for fitted cells. External R code is not a runtime dependency. No generic estimator framework, serialization layer, or extra classes are needed.
 
 When the Python implementation is written, verify these behaviors with targeted examples:
 
+- Renaming every input column through the constructor leaves results unchanged. Different store-column names across the tables map correctly.
+- Time-of-day differences do not affect estimates; same-store intraday duplicates are rejected after normalization, as are `NaT`, timezone-aware inputs, and duplicate store–employee pairs. Missing calendar days are never compressed.
+- A missing baseline or endpoint excludes that pair only from affected comparisons; missing intervening days alone do not. Present rows with missing or infinite outcomes fail validation. Temporary inactivity can cause a pair to contribute at one horizon, disappear at another, and reappear later.
 - A two-period comparison with a known polynomial dose effect and a nonzero control trend recovers the curve, subtracting the control mean once.
 - Predictions at a fixed dose are invariant to other requested doses and input row order. Where R training and prediction bases coincide, unpooled estimates on the same constructed sample agree numerically; otherwise compare against an R reference that explicitly reuses the training basis.
 - Two sufficiently separated events at one store both enter eligible cohorts and kernel weights. Coworkers never become extra control rows, and every control store contributes once per comparison.
 - Simultaneous and overlapping events are excluded using the original complete history. An excluded event or a dropped cohort still disqualifies its store from controls in every conflicting window.
 - Incomplete screening coverage excludes an event without silently assuming no future termination. Complete extended history permits late events to contribute at observed shorter horizons. Changing only the prediction horizons leaves the fitted isolation screen unchanged.
-- Small, rank-deficient, and incompatible-knot cohorts warn, have diagnostics, and disappear from target predictions and kernel denominators while remaining in the termination history.
+- Small, rank-deficient, and incompatible-knot comparisons warn and disappear from the corresponding horizon only, while retaining the complete history. Verify that an estimable short horizon survives a sparse later horizon, with separate fitted bases and matching pair-specific kernel inputs.
 - Weights count each selected event once, sum to one, reflect unequal cohort sizes, and match the explicit formula. A within-cohort excluded event cannot leak back into the weights.
 - Aggregation equals a manual weighted sum, reports distinct event and store counts, identifies the retained population, and rejects a horizon with a missing required cell.
 
