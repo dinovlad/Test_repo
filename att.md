@@ -35,7 +35,7 @@ The `eligible_cohorts` argument in the standalone example must contain retained 
 **Statistical target and treatment coding.** For store $i$, let $G_i$ be the focal worker's termination day and $D_i>0$ the worker's previous daily hours. Realized exposure is the permanent hours reduction
 
 $$
-W_{it}=D_i\,1\{t\ge G_i\}.
+W_{it}=D_i\thinspace{}1\lbrace t\ge G_i\rbrace.
 $$
 
 The dose is a fixed store-level label, including on pretreatment rows. Zero exposure means that the focal termination has not occurred. The outcome is daily store sales; the counterfactual is continued employment at the original hours. Other staffing responses are included in the total effect of the focal termination.
@@ -50,7 +50,7 @@ $$
 For a nonnegative event day $e=t-g$, define
 
 $$
-\mathcal G_e=\{g:\ g\text{ is an observed treated cohort},\ g+e\le T\}.
+\mathcal G_e=\lbrace g:\ g\text{ is an observed treated cohort},\ g+e\le T\rbrace.
 $$
 
 With every treated cohort having an observed baseline, the requested aggregation is
@@ -78,7 +78,7 @@ Three differences are intentional: retaining the fitted basis at prediction, war
 | `cohort` | Termination day; 0 for stores untreated throughout the observed window |
 | `dose` | Positive fixed hours reduction for treated stores; 0 for never-treated stores |
 
-The panel must contain one row per store per day, with no missing outcomes or duplicate `(id, day)` pairs. `cohort` and `dose` must be constant within each store. A positive cohort must lie in $\{2,\ldots,T\}$, ensuring an observed pretreatment day. Calendar dates can be converted to integer offsets before calling the module; missing calendar days must not be compressed into adjacent indices. The input panel is validated rather than silently balanced or imputed.
+The panel must contain one row per store per day, with no missing outcomes or duplicate `(id, day)` pairs. `cohort` and `dose` must be constant within each store. A positive cohort must lie in $\lbrace 2,\ldots,T\rbrace$, ensuring an observed pretreatment day. Calendar dates can be converted to integer offsets before calling the module; missing calendar days must not be compressed into adjacent indices. The input panel is validated rather than silently balanced or imputed.
 
 This specification uses the theoretical convention $G=\infty$ for never-treated units in formulas and `cohort=0` in data. Code must explicitly handle that sentinel. Requested `event_times` are distinct nonnegative integers; requested doses are distinct, finite, positive numbers. Inputs are copied as needed; fitting must not alter the caller's DataFrame.
 
@@ -106,8 +106,8 @@ For a cohort $g$ and an in-window horizon $e$, set $t=g+e$ and form the comparis
 $$
 \mathcal C_{gt}=
 \begin{cases}
-\{j:G_j=\infty\text{ or }G_j>t\},&\texttt{notyettreated},\\
-\{j:G_j=\infty\},&\texttt{nevertreated}.
+\lbrace j:G_j=\infty\text{ or }G_j>t\rbrace,&\texttt{notyettreated},\\
+\lbrace j:G_j=\infty\rbrace,&\texttt{nevertreated}.
 \end{cases}
 $$
 
@@ -150,10 +150,10 @@ Reject duplicate global internal knots with a configuration error; do not silent
 
 To stay close to the parametric routine, allow polynomial continuation outside a cohort's observed dose range, issue an extrapolation warning, and flag those rows. Do not clip doses, discard cohorts at particular doses, or renormalize weights because of extrapolation. Such values rely on the fitted functional form beyond observed support.
 
-**Small-cohort screening and dropping.** The proposed configurable default is `min_cohort_size=10` distinct stores. This is an implementation choice, not a threshold supplied by the article or a guarantee of precision. The effective minimum is
+**Small-cohort screening and dropping.** The proposed configurable default is `min_cohort_size=10` distinct stores. This is an implementation choice, not a threshold supplied by the article or a guarantee of precision. Let $n_{\mathrm{user}}$ denote the configured `min_cohort_size`. The effective minimum is
 
 $$
-n_{\min}=\max(\texttt{min\_cohort\_size},p+1),
+n_{\min}=\max(n_{\mathrm{user}},p+1),
 $$
 
 which also requires positive residual degrees of freedom. Count stores once, not daily rows. A cohort is retained only if its sample size meets that minimum, it has at least $p$ distinct dose values, and its actual regression matrix has full column rank. Use the least-squares solver's documented numerical rank tolerance consistently. The actual rank check is necessary even when the distinct-dose check passes.
@@ -222,7 +222,7 @@ evaluate_theta(
 For each requested fitted horizon $e$:
 
 1. Construct $\mathcal G_e$ from all original treated cohorts with an observed endpoint.
-2. Set $\mathcal R_e=\mathcal G_e\cap\texttt{retained\_cohorts\_}$. If empty, raise an error.
+2. Let $\mathcal R$ be the set stored in `retained_cohorts_`, and set $\mathcal R_e=\mathcal G_e\cap\mathcal R$. If empty, raise an error.
 3. Require every cohort in $\mathcal R_e$ to have a fitted cell at this horizon. A missing control group is an error here, not an additional implicit cohort-selection rule.
 4. Obtain unpooled predictions from `ATT.predict()` and weights from `estimate_pi(model.units_, ..., eligible_cohorts=R_e)`.
 5. Join them by the exact cohort and dose labels. Validate a complete one-to-one match and weights summing to one; do not let an inner join silently discard unmatched components.
@@ -231,7 +231,7 @@ For each requested fitted horizon $e$:
 $$
 \widehat\theta_{\mathcal R}(d,e)
 =\sum_{g\in\mathcal R_e}
-\widehat\pi_g(e,d)\,
+\widehat\pi_g(e,d)\thinspace{}
 \widehat{ATT}(g,g+e,d\mid g,d).
 $$
 
