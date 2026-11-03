@@ -1,0 +1,21 @@
+[project]
+name = "cgbs-att"
+version = "0.1.0"
+description = "Continuous-dose ATT estimation and dose-specific event studies."
+# pandas 1.5.3 provides wheels through Python 3.11.
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "numpy==1.26.4",
+    "pandas==1.5.3",
+    "pyfixest==0.60.0",
+    "scipy==1.15.2",
+]
+
+[dependency-groups]
+dev = [
+    "codespell",
+    "mypy>=1.19.0",
+    "nbqa>=1.9.0",
+    "pre-commit",
+    "ruff>=0.15.0",
+]
