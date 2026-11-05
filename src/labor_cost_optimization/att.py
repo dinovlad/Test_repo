@@ -1,4 +1,4 @@
-"""Estimate unpooled continuous-dose ATT curves with one stacked PyFixest model.
+"""Estimate unpooled continuous-dose ATT curves with separate polynomial models.
 
 Periods have a fixed daily frequency. The estimator reports point estimates;
 negative horizons are placebo contrasts and horizon -1 is a zero reference.
@@ -16,7 +16,6 @@ import numpy as np
 import pandas as pd
 import pyfixest as pf
 from numpy.typing import NDArray
-from scipy.interpolate import BSpline
 from scipy.special import logsumexp
 
 
@@ -117,23 +116,23 @@ def _estimate_type(event_time: int) -> str:
 
 
 class ATT:
-    """Fit separate cohort-horizon dose curves in one stacked OLS model.
+    """Fit a separate polynomial OLS model for each cohort-horizon dose curve.
 
-    The only fixed effect is the comparison cell. Control means are absorbed
-    by those fixed effects, so predictions use the treatment coefficients
-    directly. No covariates or inference are implemented.
+    Each model's intercept absorbs its control mean, so predictions use the
+    treatment coefficients directly. Saved dose scaling is reused at prediction.
+    No covariates or inference are implemented.
 
     Attributes:
-        model_:
-            The single fitted PyFixest model, available after successful fit.
+        models_:
+            Fitted PyFixest models keyed by non-reference cohort-horizon cells.
         events_:
             First-event metadata with firm_id, cohort, dose, design_eligible.
         termination_history_:
             Complete firm-period termination counts, including excluded events.
         bases_:
-            Saved spline definitions keyed by (cohort, event_time).
+            Saved polynomial degrees and dose bounds keyed by (cohort, event_time).
         cell_coefficients_:
-            Treatment coefficients from model_, with exact zeros for references.
+            Treatment coefficients from models_, with exact zeros for references.
         retained_cohorts_:
             Cohorts passing treated-design screening at each horizon, including
             those with missing controls that must cause aggregation to fail.
@@ -165,8 +164,6 @@ class ATT:
             Inclusive elapsed-period index of last_period_ from origin_period_.
         isolation_window_:
             Signed lower and upper screening offsets.
-        knots_:
-            Shared internal knots selected before cell screening.
         cell_keys_:
             Mapping from internal comparison labels to cohort-horizon keys.
         effect_columns_:
@@ -181,7 +178,6 @@ class ATT:
         outcome_col: str,
         dose_col: str,
         degree: int = 3,
-        num_knots: int = 0,
         min_cohort_size: int | None = None,
     ) -> None:
         """Configure the estimator and its required input-column mappings.
@@ -196,12 +192,10 @@ class ATT:
             dose_col:
                 Positive finite dose column in the event table.
             degree:
-                Positive spline degree.
-            num_knots:
-                Nonnegative number of shared internal quantile knots.
+                Positive polynomial degree.
             min_cohort_size:
                 Optional treated-sample minimum. None resolves to degree plus
-                num_knots plus two; a smaller explicit minimum cannot override it.
+                two; a smaller explicit minimum cannot override it.
 
         Raises:
             ValueError:
@@ -218,7 +212,6 @@ class ATT:
         self.outcome_col = outcome_col
         self.dose_col = dose_col
         self.degree = _integer(degree, "degree", 1)
-        self.num_knots = _integer(num_knots, "num_knots", 0)
         self.min_cohort_size = None if min_cohort_size is None else _integer(min_cohort_size, "min_cohort_size", 1)
         self._reset()
 
@@ -228,7 +221,7 @@ class ATT:
             if name.endswith("_"):
                 delattr(self, name)
         self._is_fitted = False
-        self.model_: Any = None
+        self.models_: dict[Cell, Any] = {}
         self.column_names_ = {
             "firm_col": self.firm_col,
             "period_col": self.period_col,
@@ -236,7 +229,7 @@ class ATT:
             "dose_col": self.dose_col,
         }
         self.min_cohort_size_ = max(
-            self.degree + self.num_knots + 2,
+            self.degree + 2,
             self.min_cohort_size or 0,
         )
         self.event_times_: list[int] = []
@@ -252,7 +245,6 @@ class ATT:
         self.retained_cohorts_: dict[int, list[pd.Timestamp]] = {}
         self.cell_keys_: dict[int, Cell] = {}
         self.effect_columns_: dict[Cell, list[str]] = {}
-        self.knots_: FloatArray = np.empty(0)
         self.drop_summary_: dict[str, Any] = {}
 
     def _inputs(
@@ -361,42 +353,25 @@ class ATT:
         eligible = self.events_.loc[self.events_["design_eligible"], "dose"]
         if eligible.empty:
             raise ValueError("No first events have a complete, isolated panel window.")
-        if self.num_knots:
-            self.knots_ = np.quantile(
-                eligible.to_numpy(dtype=float),
-                np.arange(1, self.num_knots + 1) / (self.num_knots + 1),
-                method="linear",
-            )
-            if len(np.unique(self.knots_)) != self.num_knots:
-                raise ValueError(
-                    "Global internal knots are duplicated; change the configuration.",
-                )
 
     def _basis(self, doses: FloatArray) -> tuple[str, dict[str, Any], FloatArray]:
-        """Screen a treated design and construct its saved spline basis.
+        """Screen a treated polynomial design and save its degree and dose bounds.
 
         Rank uses NumPy's SVD tolerance: largest singular value multiplied by
         max(number of observations, number of columns) and machine precision.
         """
-        p = self.degree + self.num_knots + 1
+        p = self.degree + 1
         empty = np.empty((0, p))
         if len(doses) < self.min_cohort_size_:
             return "small_sample", {}, empty
         if len(np.unique(doses)) < p:
             return "insufficient_doses", {}, empty
         lower, upper = float(doses.min()), float(doses.max())
-        if np.any(self.knots_ <= lower) or np.any(self.knots_ >= upper):
-            return "incompatible_knots", {}, empty
-        knots = np.r_[
-            np.repeat(lower, self.degree + 1),
-            self.knots_,
-            np.repeat(upper, self.degree + 1),
-        ]
-        spline = BSpline(knots, np.eye(p), self.degree, extrapolate=True)
-        design = np.column_stack([np.ones(len(doses)), spline(doses)[:, 1:]])
+        scaled_doses = (doses - lower) / (upper - lower)
+        design = np.polynomial.polynomial.polyvander(scaled_doses, self.degree)
         if not np.isfinite(design).all() or np.linalg.matrix_rank(design) < p:
             return "rank_deficient", {}, empty
-        return "ready", {"spline": spline, "lower": lower, "upper": upper}, design
+        return "ready", {"degree": self.degree, "lower": lower, "upper": upper}, design
 
     def fit(
         self,
@@ -405,7 +380,7 @@ class ATT:
         *,
         isolation_window: tuple[int, int],
     ) -> Self:
-        """Fit one stacked regression for every eligible non-reference horizon.
+        """Fit separate polynomial regressions for eligible non-reference cells.
 
         Args:
             outcomes:
@@ -425,7 +400,7 @@ class ATT:
 
         Raises:
             ValueError:
-                Input values, periods, mappings, or knots are invalid, or no
+                Input values, periods, or mappings are invalid, or no
                 non-reference comparison passes the design checks.
             RuntimeError:
                 PyFixest fitting fails or omits a required finite coefficient.
@@ -463,7 +438,7 @@ class ATT:
 
         Only treated availability uses a firm-by-horizon array. Control lookups
         process one horizon at a time over observed baseline rows. Each cell
-        retains its own spline and rank check, with no cross-cell pooling.
+        retains its own polynomial scaling and rank check, with no pooling.
 
         Args:
             outcome:
@@ -572,7 +547,7 @@ class ATT:
                     "control_firms": control_firms,
                     "estimate_type": _estimate_type(e),
                     "n_distinct_doses": len(np.unique(doses)),
-                    "design_dimension": self.degree + self.num_knots + 1,
+                    "design_dimension": self.degree + 1,
                 }
                 self.cell_diagnostics_[key] = diagnostic
                 if not len(treated):
@@ -599,6 +574,7 @@ class ATT:
                         "event_time": e,
                         "delta_y": np.r_[treated_changes[start:stop], changes[controls]],
                         "treated": np.r_[np.ones(len(treated), dtype=int), np.zeros(len(controls), dtype=int)],
+                        "scaled_dose": np.r_[design[:, 1], np.zeros(len(controls))],
                     },
                 )
                 blocks.append((key, block, design))
@@ -654,42 +630,41 @@ class ATT:
             )
 
     def _fit_model(self, blocks: list[tuple[Cell, pd.DataFrame, FloatArray]]) -> None:
-        """Fit every prepared cell in one model and extract treatment coefficients."""
-        stacked = pd.concat([block for _, block, _ in blocks], ignore_index=True)
-        p = self.degree + self.num_knots + 1
-        effects = np.zeros((len(stacked), p * len(blocks)))
-        names: list[str] = []
-        offset = 0
-        for cell, (key, block, design) in enumerate(blocks):
-            cell_names = [f"effect_{cell}_{k}" for k in range(p)]
-            self.cell_keys_[cell] = key
-            self.effect_columns_[key] = cell_names
-            names.extend(cell_names)
-            effects[offset : offset + len(design), cell * p : (cell + 1) * p] = design
-            offset += len(block)
-        stacked = pd.concat([stacked, pd.DataFrame(effects, columns=names)], axis=1)
+        """Fit narrow cell models without constructing a global interaction matrix."""
+        polynomial = f"poly(scaled_dose, degree={self.degree}, raw=True)"
+        formula = f"delta_y ~ treated + treated:{polynomial}"
+        # Formulaic labels raw ndarray columns from zero; column k is power k+1.
+        names = ["treated", *[f"treated:{polynomial}[{k}]" for k in range(self.degree)]]
+        required = ["Intercept", *names]
         try:
-            model = pf.feols("delta_y ~ " + " + ".join(names) + " | cell", data=stacked)
-            coefficients = model.coef()
-            if any(name not in coefficients.index for name in names):
-                raise RuntimeError("PyFixest omitted a required treatment coefficient.")
-            if not np.isfinite(coefficients.loc[names].to_numpy()).all():
-                raise RuntimeError(
-                    "PyFixest returned a nonfinite treatment coefficient.",
+            for cell, (key, block, _) in enumerate(blocks):
+                self.cell_keys_[cell] = key
+                model = pf.feols(
+                    formula,
+                    data=block,
+                    lean=True,
+                    store_data=False,
+                    copy_data=False,
                 )
+                coefficients = model.coef()
+                if any(name not in coefficients.index for name in required):
+                    raise RuntimeError("PyFixest omitted a required regression coefficient.")
+                if not np.isfinite(coefficients.loc[required].to_numpy()).all():
+                    raise RuntimeError("PyFixest returned a nonfinite regression coefficient.")
+                self.models_[key] = model
+                self.effect_columns_[key] = names.copy()
+                self.cell_coefficients_[key] = coefficients.loc[names].to_numpy(dtype=float)
+                self.cell_diagnostics_[key]["status"] = "fitted"
         except Exception as exc:
             for key, _, _ in blocks:
                 self.cell_diagnostics_[key]["status"] = "model_failed"
+                self.cell_coefficients_.pop(key, None)
+            self.models_.clear()
+            self.effect_columns_.clear()
             self._summarize_cohorts()
             raise RuntimeError(
-                "The single PyFixest model could not be fitted completely.",
+                "The polynomial cell models could not be fitted completely.",
             ) from exc
-        self.model_ = model
-        for key, names_for_cell in self.effect_columns_.items():
-            self.cell_coefficients_[key] = coefficients.loc[names_for_cell].to_numpy(
-                dtype=float,
-            )
-            self.cell_diagnostics_[key]["status"] = "fitted"
 
     def _summarize_cohorts(self) -> None:
         """Summarize design eligibility and horizon statuses without dropping history."""
@@ -760,7 +735,7 @@ class ATT:
             RuntimeError:
                 There is no successful current fit.
             ValueError:
-                Doses or horizons are invalid, or spline prediction is nonfinite.
+                Doses or horizons are invalid, or polynomial prediction is nonfinite.
         """
         self._require_fitted()
         dose_values = np.sort(_validate_doses(doses))
@@ -798,7 +773,7 @@ class ATT:
 
         Raises:
             ValueError:
-                A spline prediction is nonfinite.
+                A polynomial prediction is nonfinite.
         """
         records = []
         for key, coefficients in sorted(self.cell_coefficients_.items()):
@@ -812,10 +787,11 @@ class ATT:
                 outside = np.zeros(len(dose_values), dtype=bool)
             else:
                 with np.errstate(over="ignore", invalid="ignore"):
-                    predictions = coefficients[0] + basis["spline"](dose_values)[:, 1:] @ coefficients[1:]
+                    scaled_doses = (dose_values - basis["lower"]) / (basis["upper"] - basis["lower"])
+                    predictions = np.polynomial.polynomial.polyval(scaled_doses, coefficients)
                 if not np.isfinite(predictions).all():
                     raise ValueError(
-                        "Spline predictions are nonfinite at the requested doses.",
+                        "Polynomial predictions are nonfinite at the requested doses.",
                     )
                 outside = (dose_values < basis["lower"]) | (dose_values > basis["upper"])
             for dose, prediction, extrapolated in zip(

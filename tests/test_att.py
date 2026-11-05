@@ -120,9 +120,8 @@ def independent_att(
     control_firms: tuple[str, ...],
     doses: FloatArray,
     degree: int = 3,
-    knots: tuple[float, ...] = (),
 ) -> FloatArray:
-    """Compute a separate treated regression and clean-control contrast.
+    """Compute a no-knot B-spline regression and clean-control contrast.
 
     Args:
         outcomes:
@@ -140,9 +139,7 @@ def independent_att(
         doses:
             Doses at which to evaluate the independently fitted curve.
         degree:
-            Spline polynomial degree.
-        knots:
-            Shared internal knot positions.
+            Polynomial degree represented by the independent B-spline basis.
 
     Returns:
         Predicted treated changes minus the arithmetic control change.
@@ -157,7 +154,6 @@ def independent_att(
     observed_doses = doses_by_firm.loc[list(treated_firms)].to_numpy(dtype=float)
     knot_vector = np.r_[
         np.repeat(observed_doses.min(), degree + 1),
-        knots,
         np.repeat(observed_doses.max(), degree + 1),
     ]
     dimension = len(knot_vector) - degree - 1
@@ -175,16 +171,18 @@ def independent_att(
     return np.asarray(prediction_design @ coefficients - control_mean, dtype=float)
 
 
-def test_one_model_excludes_reference_and_matches_independent_fits(
+@pytest.mark.parametrize("degree", [1, 2, 3, 4])
+def test_separate_models_match_independent_spline_estimates(
     panel: Panel,
     caplog: pytest.LogCaptureFixture,
+    degree: int,
 ) -> None:
-    """Compare every non-reference cell to an independent numerical oracle."""
+    """Preserve ATT and theta while fitting each cell with a narrow formula."""
     outcomes, events = panel
     original_outcomes = outcomes.copy(deep=True)
     original_events = events.copy(deep=True)
     with patch.object(att.pf, "feols", wraps=att.pf.feols) as solver:
-        fitted = ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
+        fitted = ATT(**MAPPINGS, degree=degree).fit(outcomes, events, isolation_window=WINDOW)
     assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
     assert fitted.drop_summary_ == {
         "duplicate_event_rows": 0,
@@ -195,17 +193,36 @@ def test_one_model_excludes_reference_and_matches_independent_fits(
         "dropped_cells": {},
         "dropped_cohorts": 0,
     }
-    solver.assert_called_once()
-    assert type(fitted.model_).__name__ == "Feols"
-    assert solver.call_args is not None
-    assert "split" not in solver.call_args.kwargs
-    assert "fsplit" not in solver.call_args.kwargs
-    stack = solver.call_args.kwargs["data"]
-    assert -1 not in stack["event_time"].unique()
-    assert not stack.duplicated(["firm_id", "cell"]).any()
+    expected_cells = [(cohort, e) for cohort in (FIRST, SECOND) for e in range(-2, 4) if e != -1]
+    assert solver.call_count == len(expected_cells)
+    assert list(fitted.models_) == expected_cells
+    assert len({id(regression) for regression in fitted.models_.values()}) == len(expected_cells)
+    for key, call in zip(expected_cells, solver.call_args_list, strict=True):
+        assert type(fitted.models_[key]).__name__ == "Feols"
+        assert call.args[0] == f"delta_y ~ treated + treated:poly(scaled_dose, degree={degree}, raw=True)"
+        assert call.kwargs["lean"]
+        assert not call.kwargs["store_data"]
+        assert not call.kwargs["copy_data"]
+        assert "split" not in call.kwargs
+        assert "fsplit" not in call.kwargs
+        block = call.kwargs["data"]
+        assert block["cohort"].eq(key[0]).all()
+        assert block["event_time"].unique().tolist() == [key[1]]
+        assert not block["firm_id"].duplicated().any()
+        assert len(block) <= 8
+        assert not any(column.startswith("effect_") for column in block.columns)
+        treated = block["treated"] == 1
+        cell_doses = events.set_index("firm")["hours"].loc[block.loc[treated, "firm_id"]].to_numpy(dtype=float)
+        expected_scaled = (cell_doses - cell_doses.min()) / (cell_doses.max() - cell_doses.min())
+        assert_allclose(block.loc[treated, "scaled_dose"], expected_scaled, atol=0.0, rtol=0.0)
+        assert (block.loc[~treated, "scaled_dose"] == 0.0).all()
+        assert fitted.bases_[key] == {"degree": degree, "lower": cell_doses.min(), "upper": cell_doses.max()}
     assert fitted.event_times_ == list(range(-2, 4))
-    assert fitted.min_cohort_size_ == 5
-    results = fitted.predict([5.5, 7.0, 8.5])
+    assert fitted.min_cohort_size_ == degree + 2
+    assert not hasattr(fitted, "knots_")
+    doses = np.array([2.0, 7.0, 14.0])
+    results = fitted.predict(doses)
+    independent_components = {}
     for key, group in results.groupby(["cohort", "event_time"]):
         cohort, event_time = cast(tuple[pd.Timestamp, int], key)
         cell = fitted.cell_diagnostics_[(cohort, event_time)]
@@ -219,8 +236,25 @@ def test_one_model_excludes_reference_and_matches_independent_fits(
             cell["treated_firms"],
             cell["control_firms"],
             group["dose"].to_numpy(dtype=float),
+            degree=degree,
         )
         assert_allclose(group["att"], expected, atol=1e-8, rtol=1e-8)
+        independent_components[(cohort, event_time)] = expected
+    theta = evaluate_theta(fitted, doses, bandwidth=1.3)
+    for event_time in range(-2, 4):
+        expected_theta = []
+        for dose_index, dose in enumerate(doses):
+            gaussian = np.exp(-0.5 * ((events["hours"] - dose) / 1.3) ** 2)
+            masses = gaussian.groupby(events["period"]).sum()
+            weights = masses / masses.sum()
+            expected_theta.append(
+                sum(
+                    weights[cohort] * independent_components[(cohort, event_time)][dose_index]
+                    for cohort in (FIRST, SECOND)
+                ),
+            )
+        actual = theta.loc[theta["event_time"] == event_time, "theta"]
+        assert_allclose(actual, expected_theta, atol=1e-8, rtol=1e-8)
     assert_frame_equal(outcomes, original_outcomes)
     assert_frame_equal(events, original_events)
 
@@ -366,6 +400,7 @@ def test_placebo_sign_and_reference_normalization(model: ATT) -> None:
     for cohort in (FIRST, SECOND):
         key = (cohort, -1)
         assert key not in model.effect_columns_
+        assert key not in model.models_
         assert (model.cell_coefficients_[key] == 0.0).all()
     assert str(results["cohort"].dtype) == "datetime64[ns]"
     assert str(results["period"].dtype) == "datetime64[ns]"
@@ -387,7 +422,7 @@ def test_constant_and_zero_changes_have_zero_treatment_effects(
     assert_allclose(theta["theta"], 0.0, atol=1e-10)
 
 
-@pytest.mark.parametrize("failure", ["missing", "nonfinite"])
+@pytest.mark.parametrize("failure", ["missing", "nonfinite", "nonfinite_intercept"])
 def test_incomplete_or_nonfinite_solver_coefficients_fail_the_entire_fit(
     panel: Panel,
     model: ATT,
@@ -395,31 +430,39 @@ def test_incomplete_or_nonfinite_solver_coefficients_fail_the_entire_fit(
 ) -> None:
     """Never accept a backend's missing term or silently reduce a fitted curve."""
     outcomes, events = panel
-    coefficients = model.model_.coef()
+    first_key, second_key = list(model.models_)[:2]
+    coefficients = model.models_[second_key].coef()
+    term = model.effect_columns_[second_key][-1]
     if failure == "missing":
-        malformed = coefficients.drop(coefficients.index[0])
+        malformed = coefficients.drop(term)
     else:
         malformed = coefficients.copy()
-        malformed.iloc[0] = np.nan
+        malformed.loc["Intercept" if failure == "nonfinite_intercept" else term] = np.nan
     backend_model = Mock()
     backend_model.coef.return_value = malformed
     failed = ATT(**MAPPINGS)
     with (
-        patch.object(att.pf, "feols", return_value=backend_model) as solver,
+        patch.object(att.pf, "feols", side_effect=[model.models_[first_key], backend_model]) as solver,
         pytest.raises(RuntimeError, match="could not be fitted"),
     ):
         failed.fit(outcomes, events, isolation_window=WINDOW)
-    solver.assert_called_once()
+    assert solver.call_count == 2
+    assert not failed.models_
+    assert all(event_time == -1 for _, event_time in failed.cell_coefficients_)
+    assert failed.cell_diagnostics_[first_key]["status"] == "model_failed"
+    assert failed.cell_diagnostics_[second_key]["status"] == "model_failed"
     with pytest.raises(RuntimeError, match="successfully fitted"):
         failed.predict([7.0])
 
 
 def test_prediction_grid_cannot_redefine_the_fitted_basis(model: ATT) -> None:
     """Keep predictions unchanged when other requested doses change."""
+    saved = {key: basis.copy() for key, basis in model.bases_.items()}
     single = model.predict([7.0])
     expanded = model.predict([5.5, 7.0, 8.5])
     expanded = expanded.loc[expanded["dose"] == 7.0].reset_index(drop=True)
     assert_frame_equal(single, expanded)
+    assert model.bases_ == saved
     with pytest.raises(ValueError, match="outside the fitted isolation window"):
         model.predict([7.0], event_times=[4])
 
@@ -528,31 +571,12 @@ def test_reference_aggregation_outside_support_does_not_warn(
     assert not theta["availability_restricted"].any()
 
 
-def test_internal_knots_also_use_the_saved_cell_basis(panel: Panel) -> None:
-    """Check an actual piecewise polynomial rather than only knot-free fits."""
-    outcomes, events = panel
-    fitted = ATT(**MAPPINGS, degree=2, num_knots=1).fit(
-        outcomes,
-        events,
-        isolation_window=WINDOW,
-    )
-    assert_allclose(fitted.knots_, [np.quantile(events["hours"], 0.5)])
-    results = fitted.predict([5.5, 7.5, 8.5], event_times=[-2, 2])
-    for key, group in results.groupby(["cohort", "event_time"]):
-        cohort, event_time = cast(tuple[pd.Timestamp, int], key)
-        cell = fitted.cell_diagnostics_[(cohort, event_time)]
-        expected = independent_att(
-            outcomes,
-            events,
-            cohort,
-            event_time,
-            cell["treated_firms"],
-            cell["control_firms"],
-            group["dose"].to_numpy(dtype=float),
-            degree=2,
-            knots=tuple(float(knot) for knot in fitted.knots_),
-        )
-        assert_allclose(group["att"], expected, atol=1e-8, rtol=1e-8)
+@pytest.mark.parametrize("num_knots", [0, 1])
+def test_polynomial_api_rejects_internal_knots(num_knots: int) -> None:
+    """Reject the removed spline option instead of silently changing its model."""
+    constructor: Callable[..., ATT] = ATT
+    with pytest.raises(TypeError, match="num_knots"):
+        constructor(**MAPPINGS, num_knots=num_knots)
 
 
 def test_unused_categorical_firms_do_not_create_phantom_terminations(
@@ -909,14 +933,16 @@ def test_failed_refit_invalidates_prior_predictions(panel: Panel) -> None:
     outcomes, events = panel
     fitted = ATT(**MAPPINGS)
     assert fitted.fit(outcomes, events, isolation_window=WINDOW) is fitted
-    previous_regression = fitted.model_
+    previous_regressions = fitted.models_.copy()
     fitted.fit(outcomes, events, isolation_window=(-1, 0))
     assert fitted.event_times_ == [-1, 0]
-    assert fitted.model_ is not previous_regression
+    assert set(fitted.models_) == {(FIRST, 0), (SECOND, 0)}
+    assert all(regression is not previous_regressions[key] for key, regression in fitted.models_.items())
     with pytest.raises(ValueError, match="outside the fitted isolation window"):
         fitted.predict([7.0], event_times=[3])
     with pytest.raises(ValueError, match="missing required columns"):
         fitted.fit(outcomes.drop(columns="sales"), events, isolation_window=WINDOW)
+    assert not fitted.models_
     with pytest.raises(RuntimeError, match="successfully fitted"):
         fitted.predict([7.0])
 
