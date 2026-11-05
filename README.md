@@ -40,7 +40,11 @@ per `fit()` call. Inspect `model.drop_summary_` for additional event rows,
 excluded first events, unavailable treated rows, and rejected comparisons;
 detailed reasons remain in the event, availability, and cell diagnostics. Treated
 row counts refer to firm–horizon pairs, so one firm can count at several horizons.
-A fit with no exclusions emits no selection warning.
+A fit with no exclusions emits no selection warning. `evaluate_theta()` also
+emits at most one summary warning per call, covering omitted comparisons,
+excluded treated firm–horizon rows, restricted horizons, and extrapolated
+component predictions across the requested grid. Its returned flags remain
+available, and evaluation does not change `model.drop_summary_`.
 Horizon -1 is an exact zero reference; earlier horizons are placebo contrasts.
 Estimates have no standard errors or confidence intervals. The identifying
 assumptions, selected populations, diagnostics, and API are described in

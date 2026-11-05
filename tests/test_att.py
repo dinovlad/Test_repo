@@ -427,6 +427,7 @@ def test_prediction_grid_cannot_redefine_the_fitted_basis(model: ATT) -> None:
 def test_aggregation_matches_manual_kernel_weighted_curves(
     panel: Panel,
     model: ATT,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Preserve cohort size and dose composition at every requested horizon."""
     _, events = panel
@@ -438,6 +439,7 @@ def test_aggregation_matches_manual_kernel_weighted_curves(
         bandwidth=bandwidth,
         event_times=[-2, -1, 0, 3],
     )
+    assert not caplog.records
     components = model.predict(doses, event_times=[-2, -1, 0, 3])
     for row in theta.to_dict("records"):
         eligible = events.copy()
@@ -454,6 +456,76 @@ def test_aggregation_matches_manual_kernel_weighted_curves(
         assert row["n_firms_used"] == 13
         assert not row["restricted_target"]
         assert not row["availability_restricted"]
+
+
+def test_aggregation_summarizes_all_horizons_without_silencing_prediction(
+    panel: Panel,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Count dropped comparisons and extrapolated components in one message."""
+    outcomes, events = panel
+    fitted = ATT(**MAPPINGS, min_cohort_size=7).fit(outcomes, events, isolation_window=WINDOW)
+    fit_summary = fitted.drop_summary_.copy()
+    caplog.clear()
+    doses = [14.0, 2.0, 7.0]
+    horizons = [3, -1, 0, -2]
+    with caplog.at_level(logging.WARNING):
+        theta = evaluate_theta(fitted, doses, bandwidth=1.3, event_times=horizons)
+    assert len(caplog.records) == 1
+    assert caplog.records[0].getMessage().startswith("Aggregation summary:")
+    assert caplog.records[0].args == (4, 24, 4, 6)
+    assert fitted.drop_summary_ == fit_summary
+    assert theta["event_time"].tolist() == [-2] * 3 + [-1] * 3 + [0] * 3 + [3] * 3
+    assert theta["dose"].tolist() == [2.0, 7.0, 14.0] * 4
+    assert (theta["n_cohorts_eligible"] == 2).all()
+    assert (theta["n_cohorts_used"] == 1).all()
+    assert (theta["n_firms_design"] == 13).all()
+    assert (theta["n_firms_eligible"] == 13).all()
+    assert (theta["n_firms_used"] == 7).all()
+    assert theta["restricted_target"].all()
+    assert not theta["availability_restricted"].any()
+    expected_extrapolation = [row.event_time != -1 and row.dose != 7.0 for row in theta.itertuples(index=False)]
+    assert theta["extrapolated"].tolist() == expected_extrapolation
+    for event_time_key, group in theta.groupby("event_time", sort=False):
+        event_time = cast(int, event_time_key)
+        cell = fitted.cell_diagnostics_[(SECOND, event_time)]
+        expected = independent_att(
+            outcomes,
+            events,
+            SECOND,
+            event_time,
+            cell["treated_firms"],
+            cell["control_firms"],
+            group["dose"].to_numpy(dtype=float),
+        )
+        assert_allclose(group["theta"], expected, atol=1e-8, rtol=1e-8)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        predictions = fitted.predict(doses, event_times=horizons)
+    assert len(caplog.records) == 2
+    assert "unavailable comparisons" in caplog.records[0].getMessage()
+    assert caplog.records[0].args == (4,)
+    assert "Extrapolating" in caplog.records[1].getMessage()
+    assert caplog.records[1].args == (6,)
+    assert_allclose(predictions["att"], theta["theta"], atol=1e-12, rtol=0.0)
+
+
+def test_reference_aggregation_outside_support_does_not_warn(
+    model: ATT,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep reference zeros free of extrapolation flags and warning counts."""
+    with caplog.at_level(logging.WARNING):
+        theta = evaluate_theta(model, [2.0, 14.0], bandwidth=1.3, event_times=[-1])
+    assert not caplog.records
+    assert (theta["theta"] == 0.0).all()
+    assert (theta["estimate_type"] == "reference").all()
+    assert (theta["n_cohorts_used"] == 2).all()
+    assert (theta["n_firms_used"] == 13).all()
+    assert not theta["extrapolated"].any()
+    assert not theta["restricted_target"].any()
+    assert not theta["availability_restricted"].any()
 
 
 def test_internal_knots_also_use_the_saved_cell_basis(panel: Panel) -> None:
@@ -534,6 +606,12 @@ def test_missing_endpoints_drop_only_the_affected_comparison(
     assert (FIRST, 1) not in fitted.cell_coefficients_
     assert "A0" in fitted.cell_diagnostics_[(FIRST, 2)]["treated_firms"]
     assert "A1" not in fitted.cell_diagnostics_[(FIRST, 2)]["treated_firms"]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        observed_target = evaluate_theta(fitted, [7.0], bandwidth=1.0, event_times=[0])
+    assert not caplog.records
+    assert observed_target["availability_restricted"].all()
+    assert not observed_target["restricted_target"].any()
     caplog.clear()
     with caplog.at_level(logging.WARNING):
         theta = evaluate_theta(fitted, [7.0], bandwidth=1.0, event_times=[1])
