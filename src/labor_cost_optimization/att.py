@@ -148,6 +148,9 @@ class ATT:
             Design-eligible firm counts and cell statuses by cohort.
         duplicate_diagnostics_:
             Counts of additional event rows and affected firms.
+        drop_summary_:
+            Aggregate exclusion counts, distinguishing event rows from treated
+            firm-horizon rows and rejected comparisons. Logged once per fit.
         column_names_:
             The four explicit input-column mappings.
         min_cohort_size_:
@@ -250,6 +253,7 @@ class ATT:
         self.cell_keys_: dict[int, Cell] = {}
         self.effect_columns_: dict[Cell, list[str]] = {}
         self.knots_: FloatArray = np.empty(0)
+        self.drop_summary_: dict[str, Any] = {}
 
     def _inputs(
         self,
@@ -293,13 +297,6 @@ class ATT:
             "n_dropped_events": len(event) - len(counts),
             "n_affected_firms": int((counts > 1).sum()),
         }
-        if self.duplicate_diagnostics_["n_dropped_events"]:
-            logging.warning(
-                "Dropped %d additional termination rows from the target table for %d "
-                "firms; kept the first event by period for each firm.",
-                self.duplicate_diagnostics_["n_dropped_events"],
-                self.duplicate_diagnostics_["n_affected_firms"],
-            )
         self.termination_history_ = (
             event.groupby(["firm_id", "cohort"], sort=False, observed=True)
             .size()
@@ -424,6 +421,7 @@ class ATT:
         Returns:
             This estimator with fitted coefficients, saved bases, and diagnostics.
             Fitting clears any earlier fitted state, even if the new fit fails.
+            Exclusions are recorded in drop_summary_ and logged once per fit.
 
         Raises:
             ValueError:
@@ -447,58 +445,129 @@ class ATT:
         self.event_times_ = list(range(lower, upper + 1))
         self.retained_cohorts_ = {e: [] for e in self.event_times_}
         outcome, event = self._inputs(outcomes, events)
-        self._prepare_events(outcome, event)
-        by_period = {
-            period: group.set_index("firm_id")["outcome"]
-            for period, group in outcome.groupby("period", sort=False)
-        }
-        empty = pd.Series(dtype=float)
-        availability: list[dict[str, Any]] = []
-        blocks: list[tuple[Cell, pd.DataFrame, FloatArray]] = []
+        try:
+            self._prepare_events(outcome, event)
+            blocks = self._prepare_comparisons(outcome)
+            self._summarize_cohorts()
+            if not blocks:
+                raise ValueError("No non-reference comparison passes the required checks.")
+            self._fit_model(blocks)
+            self._summarize_cohorts()
+            self._is_fitted = True
+            return self
+        finally:
+            self._log_fit_exclusions()
+
+    def _prepare_comparisons(self, outcome: pd.DataFrame) -> list[tuple[Cell, pd.DataFrame, FloatArray]]:
+        """Build comparison samples with shared indexes and batched horizon lookups.
+
+        Only treated availability uses a firm-by-horizon array. Control lookups
+        process one horizon at a time over observed baseline rows. Each cell
+        retains its own spline and rank check, with no cross-cell pooling.
+
+        Args:
+            outcome:
+                Validated canonical firm-period outcome rows in input order.
+
+        Returns:
+            Cohort-horizon blocks and treated basis matrices, ordered by cohort
+            then horizon. Also records availability, selection, and saved bases.
+
+        Raises:
+            ValueError:
+                An observed outcome difference is nonfinite.
+        """
+        # First-event metadata is already stably sorted by cohort.
         eligible = self.events_.loc[self.events_["design_eligible"]]
         history = self.termination_history_
-        for cohort_key, targets in eligible.groupby("cohort", sort=True):
-            # Input validation guarantees normalized datetime64[ns] group keys.
-            cohort = cast(pd.Timestamp, cohort_key)
-            baseline = cohort - _PERIOD
-            base = by_period.get(baseline, empty)
-            conflict = history["cohort"].between(
-                cohort + lower * _PERIOD,
-                cohort + upper * _PERIOD,
-            )
-            blocked = set(history.loc[conflict, "firm_id"])
-            for e in self.event_times_:
+        firm_index = pd.Index(outcome["firm_id"].drop_duplicates(), tupleize_cols=False)
+        firm_values = firm_index.to_numpy(dtype=object)
+        outcome_firms = firm_index.get_indexer(outcome["firm_id"])
+        outcome_periods = outcome["period"].to_numpy(dtype="datetime64[ns]").astype(np.int64) // _PERIOD_NS
+        outcome_values = outcome["outcome"].to_numpy(dtype=float)
+        history_periods = history["cohort"].to_numpy(dtype="datetime64[ns]").astype(np.int64) // _PERIOD_NS
+        history_firms = firm_index.get_indexer(history["firm_id"])
+        origin = min(int(outcome_periods.min()), int(history_periods.min()))
+        span = max(int(outcome_periods.max()), int(history_periods.max())) - origin + 1
+        outcome_keys = pd.Index(outcome_firms * span + outcome_periods - origin)
+        history_keys = np.sort(history_firms * span + history_periods - origin)
+
+        cohort_periods = pd.DatetimeIndex(eligible["cohort"].drop_duplicates().sort_values())
+        cohort_days = cohort_periods.to_numpy(dtype="datetime64[ns]").astype(np.int64) // _PERIOD_NS
+        n_cohorts = len(cohort_periods)
+        target_cohorts = cohort_periods.get_indexer(eligible["cohort"])
+        target_firms = firm_index.get_indexer(eligible["firm_id"])
+        target_doses = eligible["dose"].to_numpy(dtype=float)
+        target_periods = eligible["cohort"].to_numpy(dtype="datetime64[ns]")
+        target_keys = target_firms * span + cohort_days[target_cohorts] - origin
+        target_baselines = outcome_keys.get_indexer(target_keys - 1)
+        horizons = np.asarray(self.event_times_, dtype=np.int64)
+        target_endpoints = outcome_keys.get_indexer((target_keys[:, None] + horizons).ravel()).reshape(
+            len(eligible),
+            len(horizons),
+        )
+        missing_baseline = np.broadcast_to(target_baselines[:, None] < 0, target_endpoints.shape)
+        missing_endpoint = target_endpoints < 0
+        available = ~(missing_baseline | missing_endpoint)
+        self.availability_diagnostics_ = pd.DataFrame(
+            {
+                "firm_id": np.repeat(eligible["firm_id"].to_numpy(), len(horizons)),
+                "cohort": np.repeat(target_periods, len(horizons)),
+                "event_time": np.tile(horizons, len(eligible)),
+                "baseline": np.repeat(target_periods - np.timedelta64(1, "D"), len(horizons)),
+                "period": (target_periods[:, None] + horizons.astype("timedelta64[D]")).ravel(),
+                "missing_baseline": missing_baseline.ravel(),
+                "missing_endpoint": missing_endpoint.ravel(),
+                "available": available.ravel(),
+            },
+        ).sort_values(["cohort", "event_time"], kind="stable", ignore_index=True)
+
+        # Group only observed baseline rows, preserving their input order within g.
+        baseline_cohorts = pd.Index(cohort_days).get_indexer(outcome_periods + 1)
+        baseline_rows = np.flatnonzero(baseline_cohorts >= 0)
+        baseline_rows = baseline_rows[np.argsort(baseline_cohorts[baseline_rows], kind="stable")]
+        baseline_cohorts = baseline_cohorts[baseline_rows]
+        baseline_firms = outcome_firms[baseline_rows]
+        baseline_keys = baseline_firms * span + outcome_periods[baseline_rows] - origin
+        lower, upper = self.isolation_window_
+        lower_keys = baseline_firms * span + cohort_days[baseline_cohorts] + lower - origin
+        upper_keys = baseline_firms * span + cohort_days[baseline_cohorts] + upper - origin
+        clean = np.searchsorted(history_keys, lower_keys, side="left") == np.searchsorted(
+            history_keys,
+            upper_keys,
+            side="right",
+        )
+        blocks: list[tuple[Cell, pd.DataFrame, FloatArray]] = []
+        for horizon_index, e in enumerate(self.event_times_):
+            endpoints = outcome_keys.get_indexer(baseline_keys + e + 1)
+            common = endpoints >= 0
+            changes = np.empty(len(baseline_rows), dtype=float)
+            with np.errstate(over="ignore", invalid="ignore"):
+                changes[common] = outcome_values[endpoints[common]] - outcome_values[baseline_rows[common]]
+            if not np.isfinite(changes[common]).all():
+                raise ValueError("Outcome differences must be finite.")
+            control_rows = np.flatnonzero(common & clean)
+            control_bounds = np.r_[0, np.cumsum(np.bincount(baseline_cohorts[control_rows], minlength=n_cohorts))]
+            treated_rows = np.flatnonzero(available[:, horizon_index])
+            treated_bounds = np.r_[0, np.cumsum(np.bincount(target_cohorts[treated_rows], minlength=n_cohorts))]
+            with np.errstate(over="ignore", invalid="ignore"):
+                treated_changes = (
+                    outcome_values[target_endpoints[treated_rows, horizon_index]]
+                    - outcome_values[target_baselines[treated_rows]]
+                )
+            for cohort_index, cohort_value in enumerate(cohort_periods):
+                cohort = cast(pd.Timestamp, cohort_value)
+                start, stop = treated_bounds[cohort_index : cohort_index + 2]
+                treated = treated_rows[start:stop]
+                controls = control_rows[control_bounds[cohort_index] : control_bounds[cohort_index + 1]]
+                treated_firms = tuple(firm_values[target_firms[treated]])
+                control_firms = tuple(firm_values[baseline_firms[controls]])
+                doses = target_doses[treated]
                 key = (cohort, e)
-                period = cohort + e * _PERIOD
-                endpoint = by_period.get(period, empty)
-                for row in targets.itertuples(index=False):
-                    missing_base = row.firm_id not in base.index
-                    missing_end = row.firm_id not in endpoint.index
-                    availability.append(
-                        {
-                            "firm_id": row.firm_id,
-                            "cohort": cohort,
-                            "event_time": e,
-                            "baseline": baseline,
-                            "period": period,
-                            "missing_baseline": missing_base,
-                            "missing_endpoint": missing_end,
-                            "available": not (missing_base or missing_end),
-                        },
-                    )
-                common = base.index.intersection(endpoint.index, sort=False)
-                with np.errstate(over="ignore", invalid="ignore"):
-                    changes = endpoint.reindex(common) - base.reindex(common)
-                if not np.isfinite(changes.to_numpy()).all():
-                    raise ValueError("Outcome differences must be finite.")
-                treated = targets.loc[targets["firm_id"].isin(common)]
-                treated_firms = tuple(treated["firm_id"])
-                control_firms = tuple(firm for firm in common if firm not in blocked)
-                doses = treated["dose"].to_numpy(dtype=float)
                 diagnostic = {
                     "status": "no_observed_treated",
-                    "n_treated": len(treated_firms),
-                    "n_controls": len(control_firms),
+                    "n_treated": len(treated),
+                    "n_controls": len(controls),
                     "treated_firms": treated_firms,
                     "control_firms": control_firms,
                     "estimate_type": _estimate_type(e),
@@ -506,57 +575,83 @@ class ATT:
                     "design_dimension": self.degree + self.num_knots + 1,
                 }
                 self.cell_diagnostics_[key] = diagnostic
-                if not treated_firms:
+                if not len(treated):
                     continue
                 status, basis, design = self._basis(doses)
                 diagnostic["status"] = status
                 if status != "ready":
-                    logging.warning(
-                        "Dropped cohort %s, event period %d: %s; %d treated firms, "
-                        "%d distinct doses, design dimension %d.",
-                        cohort,
-                        e,
-                        status,
-                        len(treated_firms),
-                        len(np.unique(doses)),
-                        self.degree + self.num_knots + 1,
-                    )
                     continue
                 self.retained_cohorts_[e].append(cohort)
-                if not control_firms:
+                if not len(controls):
                     diagnostic["status"] = "no_controls"
-                    logging.warning(
-                        "No clean controls for cohort %s, event period %d.",
-                        cohort,
-                        e,
-                    )
                     continue
                 self.bases_[key] = basis
                 if e == -1:
                     diagnostic["status"] = "reference"
                     self.cell_coefficients_[key] = np.zeros(design.shape[1])
                     continue
-                firms = [*treated_firms, *control_firms]
                 block = pd.DataFrame(
                     {
-                        "firm_id": firms,
-                        "cell": len(blocks),
+                        "firm_id": [*treated_firms, *control_firms],
+                        "cell": 0,
                         "cohort": cohort,
-                        "period": period,
+                        "period": cohort + e * _PERIOD,
                         "event_time": e,
-                        "delta_y": changes.reindex(firms).to_numpy(),
-                        "treated": [1] * len(treated_firms) + [0] * len(control_firms),
+                        "delta_y": np.r_[treated_changes[start:stop], changes[controls]],
+                        "treated": np.r_[np.ones(len(treated), dtype=int), np.zeros(len(controls), dtype=int)],
                     },
                 )
                 blocks.append((key, block, design))
-        self.availability_diagnostics_ = pd.DataFrame(availability)
-        self._summarize_cohorts()
-        if not blocks:
-            raise ValueError("No non-reference comparison passes the required checks.")
-        self._fit_model(blocks)
-        self._summarize_cohorts()
-        self._is_fitted = True
-        return self
+        blocks.sort(key=lambda item: item[0])
+        for cell, (_, block, _) in enumerate(blocks):
+            block["cell"] = cell
+        self.cell_diagnostics_ = dict(sorted(self.cell_diagnostics_.items()))
+        self.bases_ = dict(sorted(self.bases_.items()))
+        self.cell_coefficients_ = dict(sorted(self.cell_coefficients_.items()))
+        return blocks
+
+    def _log_fit_exclusions(self) -> None:
+        """Record separate exclusion counts and emit at most one warning per fit."""
+        excluded_events: dict[str, int] = {}
+        if not self.event_diagnostics_.empty:
+            reasons = self.event_diagnostics_.loc[~self.event_diagnostics_["design_eligible"], "reason"]
+            excluded_events = {str(reason): int(count) for reason, count in reasons.value_counts().items()}
+        unavailable = 0
+        if not self.availability_diagnostics_.empty:
+            unavailable = int((~self.availability_diagnostics_["available"]).sum())
+        dropped_cells: dict[str, int] = {}
+        dropped_rows = 0
+        dropped_cohorts: set[pd.Timestamp] = set()
+        for (cohort, _), cell in self.cell_diagnostics_.items():
+            status = cell["status"]
+            if status in {"ready", "fitted", "reference", "model_failed"}:
+                continue
+            dropped_cells[status] = dropped_cells.get(status, 0) + 1
+            dropped_rows += cell["n_treated"]
+            dropped_cohorts.add(cohort)
+        self.drop_summary_ = {
+            "duplicate_event_rows": self.duplicate_diagnostics_["n_dropped_events"],
+            "duplicate_event_firms": self.duplicate_diagnostics_["n_affected_firms"],
+            "excluded_first_events": excluded_events,
+            "unavailable_treated_rows": unavailable,
+            "dropped_treated_rows": dropped_rows,
+            "dropped_cells": dict(sorted(dropped_cells.items())),
+            "dropped_cohorts": len(dropped_cohorts),
+        }
+        if self.drop_summary_["duplicate_event_rows"] or excluded_events or unavailable or dropped_cells:
+            logging.warning(
+                "Fit exclusions: %d duplicate event rows (%d firms); excluded first events=%s; "
+                "%d unavailable treated firm-horizon rows; %d observed treated firm-horizon rows "
+                "in %d rejected comparisons across %d cohorts (reasons=%s). See drop_summary_ and cell_diagnostics_.",
+                self.drop_summary_["duplicate_event_rows"],
+                self.drop_summary_["duplicate_event_firms"],
+                excluded_events,
+                unavailable,
+                dropped_rows,
+                sum(dropped_cells.values()),
+                len(dropped_cohorts),
+                self.drop_summary_["dropped_cells"],
+            )
 
     def _fit_model(self, blocks: list[tuple[Cell, pd.DataFrame, FloatArray]]) -> None:
         """Fit every prepared cell in one model and extract treatment coefficients."""
@@ -599,8 +694,12 @@ class ATT:
     def _summarize_cohorts(self) -> None:
         """Summarize design eligibility and horizon statuses without dropping history."""
         records = []
-        for cohort, events in self.events_.groupby("cohort", sort=True):
-            cells = {e: cell for (g, e), cell in self.cell_diagnostics_.items() if g == cohort}
+        by_cohort: dict[pd.Timestamp, dict[int, dict[str, Any]]] = {}
+        for (cohort, e), cell in self.cell_diagnostics_.items():
+            by_cohort.setdefault(cohort, {})[e] = cell
+        for cohort_key, events in self.events_.groupby("cohort", sort=True):
+            cohort = cast(pd.Timestamp, cohort_key)
+            cells = by_cohort.get(cohort, {})
             records.append(
                 {
                     "cohort": cohort,

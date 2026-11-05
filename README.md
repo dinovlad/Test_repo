@@ -35,11 +35,22 @@ allowed; outcomes on present rows must be finite. The event table must contain
 the complete termination history used for isolation and control selection.
 
 The implementation keeps each firm's first termination as its only target,
-retains later terminations for screening, and reports small-cell exclusions.
+retains later terminations for screening, and reports exclusions in one warning
+per `fit()` call. Inspect `model.drop_summary_` for additional event rows,
+excluded first events, unavailable treated rows, and rejected comparisons;
+detailed reasons remain in the event, availability, and cell diagnostics. Treated
+row counts refer to firm–horizon pairs, so one firm can count at several horizons.
+A fit with no exclusions emits no selection warning.
 Horizon -1 is an exact zero reference; earlier horizons are placebo contrasts.
 Estimates have no standard errors or confidence intervals. The identifying
 assumptions, selected populations, diagnostics, and API are described in
 [att.md](att.md).
+
+Fitting reuses indexed baseline observations and batches endpoint and termination
+history lookups across cohorts at each horizon. Each comparison still has its
+own spline and rank checks. The single PyFixest regression retains a dense
+design whose memory use grows with the stacked rows and number of comparisons;
+vectorized selection does not remove that constraint.
 
 Run validation from the repository root and share `validation.log` here:
 

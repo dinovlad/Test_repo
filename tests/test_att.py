@@ -177,6 +177,7 @@ def independent_att(
 
 def test_one_model_excludes_reference_and_matches_independent_fits(
     panel: Panel,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Compare every non-reference cell to an independent numerical oracle."""
     outcomes, events = panel
@@ -184,6 +185,16 @@ def test_one_model_excludes_reference_and_matches_independent_fits(
     original_events = events.copy(deep=True)
     with patch.object(att.pf, "feols", wraps=att.pf.feols) as solver:
         fitted = ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert fitted.drop_summary_ == {
+        "duplicate_event_rows": 0,
+        "duplicate_event_firms": 0,
+        "excluded_first_events": {},
+        "unavailable_treated_rows": 0,
+        "dropped_treated_rows": 0,
+        "dropped_cells": {},
+        "dropped_cohorts": 0,
+    }
     solver.assert_called_once()
     assert type(fitted.model_).__name__ == "Feols"
     assert solver.call_args is not None
@@ -212,6 +223,133 @@ def test_one_model_excludes_reference_and_matches_independent_fits(
         assert_allclose(group["att"], expected, atol=1e-8, rtol=1e-8)
     assert_frame_equal(outcomes, original_outcomes)
     assert_frame_equal(events, original_events)
+
+
+@pytest.mark.parametrize("identifier_kind", ["strings", "categorical", "mixed"])
+def test_prepared_comparisons_match_direct_row_lookup(
+    panel: Panel,
+    caplog: pytest.LogCaptureFixture,
+    identifier_kind: str,
+) -> None:
+    """Check missing-period and history selection before invoking the solver."""
+    outcomes, events = panel
+    clean = outcomes.loc[outcomes["firm"] == "C0"].copy()
+    clean["firm"] = "C1"
+    outcomes = pd.concat([outcomes, clean], ignore_index=True)
+    history = pd.DataFrame(
+        [("C0", pd.Timestamp("2024-01-02"), 2.0), ("C0", pd.Timestamp("2024-01-09"), 3.0)],
+        columns=events.columns,
+    )
+    events = pd.concat([events, history], ignore_index=True)
+    omitted = {
+        ("A1", pd.Timestamp("2024-01-07")),
+        ("A0", pd.Timestamp("2024-01-09")),
+        ("B6", pd.Timestamp("2024-01-11")),
+        ("C1", pd.Timestamp("2024-01-10")),
+    }
+    keep = [
+        (row.firm, row.period) not in omitted and row.period != pd.Timestamp("2024-01-06")
+        for row in outcomes.itertuples(index=False)
+    ]
+    outcomes = outcomes.loc[keep].sample(frac=1.0, random_state=17)
+    events = events.sample(frac=1.0, random_state=23)
+    outcomes.index = np.zeros(len(outcomes), dtype=int)
+    events.index = np.zeros(len(events), dtype=int)
+    if identifier_kind == "categorical":
+        categories = [*outcomes["firm"].unique(), "unused_firm"]
+        outcomes["firm"] = pd.Categorical(outcomes["firm"], categories=categories)
+        events["firm"] = pd.Categorical(events["firm"], categories=categories)
+    elif identifier_kind == "mixed":
+        identifiers = {
+            firm: index if index % 3 == 0 else ("firm", firm) if index % 3 == 1 else firm
+            for index, firm in enumerate(outcomes["firm"].unique())
+        }
+        outcomes["firm"] = outcomes["firm"].map(identifiers)
+        events["firm"] = events["firm"].map(identifiers)
+
+    fitted = ATT(**MAPPINGS)
+    with patch.object(fitted, "_fit_model") as solver, caplog.at_level(logging.WARNING):
+        fitted.fit(outcomes, events, isolation_window=WINDOW)
+    solver.assert_called_once()
+    assert solver.call_args is not None
+    blocks = solver.call_args.args[0]
+    by_cell = {key: (block, design) for key, block, design in blocks}
+    failed = {
+        (FIRST, -2): "no_observed_treated",
+        (FIRST, 1): "small_sample",
+        (FIRST, 2): "no_controls",
+        (SECOND, 0): "no_controls",
+    }
+    expected_cells = [
+        (cohort, event_time)
+        for cohort in (FIRST, SECOND)
+        for event_time in range(-2, 4)
+        if event_time != -1 and (cohort, event_time) not in failed
+    ]
+    assert list(by_cell) == expected_cells
+    values = {(row.firm, row.period): float(row.sales) for row in outcomes.itertuples(index=False)}
+    expected_availability = {}
+    for cohort in (FIRST, SECOND):
+        baseline = cohort - pd.Timedelta(days=1)
+        targets = [row for row in events.itertuples(index=False) if row.period == cohort]
+        baseline_firms = [row.firm for row in outcomes.itertuples(index=False) if row.period == baseline]
+        blocked = {
+            row.firm
+            for row in events.itertuples(index=False)
+            if cohort + pd.Timedelta(days=WINDOW[0]) <= row.period <= cohort + pd.Timedelta(days=WINDOW[1])
+        }
+        for event_time in range(-2, 4):
+            key = (cohort, event_time)
+            endpoint = cohort + pd.Timedelta(days=event_time)
+            common = [firm for firm in baseline_firms if (firm, endpoint) in values]
+            treated = [row.firm for row in targets if row.firm in common]
+            controls = [firm for firm in common if firm not in blocked]
+            for row in targets:
+                missing_base = (row.firm, baseline) not in values
+                missing_end = (row.firm, endpoint) not in values
+                expected_availability[(row.firm, cohort, event_time)] = (
+                    baseline,
+                    endpoint,
+                    missing_base,
+                    missing_end,
+                    not (missing_base or missing_end),
+                )
+            cell = fitted.cell_diagnostics_[key]
+            assert cell["treated_firms"] == tuple(treated)
+            assert cell["control_firms"] == tuple(controls)
+            assert cell["n_treated"] == len(treated)
+            assert cell["n_controls"] == len(controls)
+            assert cell["status"] == failed.get(key, "reference" if event_time == -1 else "ready")
+            if key in by_cell:
+                block, design = by_cell[key]
+                firms = [*treated, *controls]
+                assert block["firm_id"].tolist() == firms
+                expected_changes = [values[(firm, endpoint)] - values[(firm, baseline)] for firm in firms]
+                assert_allclose(block["delta_y"], expected_changes, atol=0.0, rtol=0.0)
+                assert block["treated"].tolist() == [1] * len(treated) + [0] * len(controls)
+                assert design.shape == (len(treated), 4)
+    actual_availability = {
+        (row.firm_id, row.cohort, row.event_time): (
+            row.baseline,
+            row.period,
+            row.missing_baseline,
+            row.missing_endpoint,
+            row.available,
+        )
+        for row in fitted.availability_diagnostics_.itertuples(index=False)
+    }
+    assert actual_availability == expected_availability
+    assert len(caplog.records) == 1
+    assert "drop_summary_" in caplog.text
+    assert fitted.drop_summary_ == {
+        "duplicate_event_rows": 1,
+        "duplicate_event_firms": 1,
+        "excluded_first_events": {"isolation_outside_panel": 1},
+        "unavailable_treated_rows": 13,
+        "dropped_treated_rows": 16,
+        "dropped_cells": {"no_observed_treated": 1, "small_sample": 1, "no_controls": 2},
+        "dropped_cohorts": 2,
+    }
 
 
 def test_placebo_sign_and_reference_normalization(model: ATT) -> None:
@@ -386,7 +524,11 @@ def test_missing_endpoints_drop_only_the_affected_comparison(
     outcomes = outcomes.loc[keep].reset_index(drop=True)
     with caplog.at_level(logging.WARNING):
         fitted = ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
+    assert len(caplog.records) == 1
     assert "small_sample" in caplog.text
+    assert fitted.drop_summary_["unavailable_treated_rows"] == 8
+    assert fitted.drop_summary_["dropped_treated_rows"] == 4
+    assert fitted.drop_summary_["dropped_cells"] == {"small_sample": 1}
     assert fitted.cell_diagnostics_[(FIRST, 0)]["n_treated"] == 5
     assert fitted.cell_diagnostics_[(FIRST, 1)]["n_treated"] == 4
     assert (FIRST, 1) not in fitted.cell_coefficients_
@@ -447,7 +589,11 @@ def test_same_period_ties_are_not_promoted_to_later_events(
         fitted = ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
     assert fitted.duplicate_diagnostics_["n_dropped_events"] == 3
     assert fitted.duplicate_diagnostics_["n_affected_firms"] == 2
-    assert caplog.records
+    assert len(caplog.records) == 1
+    assert fitted.drop_summary_["duplicate_event_rows"] == 3
+    assert fitted.drop_summary_["duplicate_event_firms"] == 2
+    assert fitted.drop_summary_["excluded_first_events"] == {"overlapping_termination": 1}
+    assert fitted.drop_summary_["dropped_cells"] == {}
     selected = fitted.events_.set_index("firm_id")
     assert selected.loc["A0", "cohort"] == FIRST
     assert selected.loc["A0", "dose"] == 9.0
@@ -504,14 +650,20 @@ def test_missing_controls_cannot_be_hidden_by_aggregation(
             events,
             isolation_window=WINDOW,
         )
-    assert "No clean controls" in caplog.text
+    assert len(caplog.records) == 1
+    assert "no_controls" in caplog.text
+    assert fitted.drop_summary_["dropped_cells"] == {"no_controls": 6}
+    assert fitted.drop_summary_["dropped_treated_rows"] == 36
     assert fitted.cell_diagnostics_[(FIRST, event_time)]["status"] == "no_controls"
     assert FIRST in fitted.retained_cohorts_[event_time]
     with pytest.raises(ValueError, match="Required comparison is unavailable"):
         evaluate_theta(fitted, [7.0], bandwidth=1.0, event_times=[event_time])
 
 
-def test_reference_only_success_is_not_a_fitted_model(panel: Panel) -> None:
+def test_reference_only_success_is_not_a_fitted_model(
+    panel: Panel,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Do not invoke the regression solver when only reference zeros survive."""
     outcomes, events = panel
     chosen = outcomes["firm"].str.startswith("A") | (outcomes["firm"] == "C0")
@@ -525,6 +677,10 @@ def test_reference_only_success_is_not_a_fitted_model(panel: Panel) -> None:
     ):
         failed.fit(outcomes.loc[~missing], events, isolation_window=(-1, 0))
     solver.assert_not_called()
+    assert len(caplog.records) == 1
+    assert failed.drop_summary_["unavailable_treated_rows"] == 6
+    assert failed.drop_summary_["dropped_treated_rows"] == 0
+    assert failed.drop_summary_["dropped_cells"] == {"no_observed_treated": 1}
     with pytest.raises(RuntimeError, match="successfully fitted"):
         failed.predict([7.0])
 
@@ -541,7 +697,11 @@ def test_explicit_minimum_cannot_be_bypassed_by_other_cells(
             events,
             isolation_window=WINDOW,
         )
+    assert len(caplog.records) == 1
     assert "small_sample" in caplog.text
+    assert fitted.drop_summary_["dropped_cells"] == {"small_sample": 6}
+    assert fitted.drop_summary_["dropped_treated_rows"] == 36
+    assert fitted.drop_summary_["dropped_cohorts"] == 1
     assert fitted.min_cohort_size_ == 7
     assert FIRST not in fitted.retained_cohorts_[0]
     assert SECOND in fitted.retained_cohorts_[0]
