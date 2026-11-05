@@ -4,17 +4,17 @@ This document specifies a future self-contained Python module, `att.py`. It does
 
 **Period naming and current frequency.** The frequency remains hardcoded to one calendar day. A period means one step at that fixed frequency; the naming change introduces no frequency parameter or support for monthly or annual inputs. Input and output period labels remain timezone-naive `datetime64[ns]` values normalized to the start of each period. All event-time offsets, isolation bounds, baseline comparisons, and dose units retain their existing daily interpretation.
 
-The public API consists of one class and two functions:
+The public API consists of one class and two functions. In this example, `firm_col`, `period_col`, `outcome_col`, and `dose_col` are caller-supplied strings naming columns in the input tables; all four must be provided:
 
 ```python
 model = ATT(
+    firm_col=firm_col,
+    period_col=period_col,
+    outcome_col=outcome_col,
+    dose_col=dose_col,
     degree=3,
     num_knots=0,
     min_cohort_size=None,
-    firm_col="firm_id",
-    period_col="period",
-    outcome_col="sales",
-    dose_col="dose",
 )
 model.fit(
     outcomes,
@@ -154,7 +154,7 @@ The separate input tables, first-event selection, isolation screen, and explicit
 
 Other intentional implementation differences are retaining the fitted basis at prediction, warning and dropping small or unidentifiable cohort–event-period comparisons, and adding dose-conditional kernel aggregation. Thus compatibility refers to the regression calculation on the same comparison sample with a consistent fitted basis. The inspected R prediction path rebuilds its basis on the prediction grid. Sources were inspected on 2026-11-03; implementation validation should record the R version or source revision actually used.
 
-**Input contract and configurable columns.** `ATT.fit()` accepts two pandas DataFrames. All four input-column parameters are required keyword-only constructor arguments with no defaults. The names supplied in the introductory example are explicit caller choices. The outcome table uses:
+**Input contract and configurable columns.** `ATT.fit()` accepts two pandas DataFrames. All four input-column parameters are required keyword-only constructor arguments with no defaults. Omitting any one raises `TypeError` at construction. No input-column names are inferred or supplied as fallbacks. The outcome table uses:
 
 | `ATT` parameter | Meaning |
 | --- | --- |
@@ -172,7 +172,7 @@ The event table must record all terminations within the overall outcome panel pe
 
 The shared `firm_col` and `period_col` parameters name columns present in both input tables. Their labels must match across the tables; `period_col` identifies outcome periods in the outcome table and termination periods in the event table. If the source tables use different labels, rename them before fitting. Store identifier values must refer to the same stores across tables. Each parameter must be a nonempty string naming an existing column. Require distinct mapped columns within each table and unique DataFrame column labels. `outcome_col` and `dose_col` may have the same name because they belong to different tables. Extra columns are ignored. Use the supplied store identifier directly as the estimation key. No employee, spell, or event identifier column is required or generated.
 
-Validate both period columns as timezone-naive `datetime64[ns]` with no `NaT`. Do not silently parse strings, accept columns with object dtype, or convert timezone-aware datetimes. Normalize copies with `.dt.normalize()` under the fixed daily frequency, ignoring within-period time components while retaining `datetime64[ns]`. Do not infer frequency from observed gaps or convert inputs to pandas Period dtype. Validate uniqueness of `(firm_id, normalized period)` in the outcome table after normalization. Two within-period rows that collapse to the same store-period are an error, not an instruction to sum or select one. Multiple event rows per store are allowed and processed by the first-event and same-period rules below.
+Validate both period columns as timezone-naive `datetime64[ns]` with no `NaT`. Do not silently parse strings, accept columns with object dtype, or convert timezone-aware datetimes. Normalize copies with `.dt.normalize()` under the fixed daily frequency, ignoring within-period time components while retaining `datetime64[ns]`. Do not infer frequency from observed gaps or convert inputs to pandas Period dtype. Validate uniqueness using the column named by `firm_col` and the normalized column named by `period_col` in the outcome table. Two within-period rows that collapse to the same store-period are an error, not an instruction to sum or select one. Multiple event rows per store are allowed and processed by the first-event and same-period rules below.
 
 **First-event selection and duplicate-event logging.** Validate required input values and normalize periods before selection. Group only by the column named by `firm_col`, sort by the normalized `period_col` using a stable sort, and retain that entire first row for each store. If several rows share the earliest period, retain the first in original input order as the candidate. Ignore within-period time components and retain that row's dose without averaging or summing across rows.
 
@@ -191,7 +191,7 @@ logging.warning(
 
 For example, three rows for one store and two for another mean three dropped rows for two affected stores. Include both same-period and later-period records in the count. With no repeated stores, do not emit this message. Record both counts in `duplicate_diagnostics_`.
 
-Only first-event rows populate `events_`, fitted targets, global knot selection, and kernel inputs. Build `termination_history_` separately from all input records, grouped by `(firm_id, normalized termination period)` with the number of records in that period. Later periods remain solely for isolation and control-exposure screening. No employee or new event identifier is stored.
+Only first-event rows populate `events_`, fitted targets, global knot selection, and kernel inputs. Build `termination_history_` separately from all input records, grouped by the column named by `firm_col` and the normalized column named by `period_col`, with the number of records in that period. Later periods remain solely for isolation and control-exposure screening. No employee or new event identifier is stored.
 
 **Same-period records.** Treat each supplied event row as one actual termination. Without employee identifiers, multiple rows at the same store and normalized period cannot be distinguished automatically from duplicate copies of one record. The working convention is that they are simultaneous terminations, including when their doses match. Preserve their count in `termination_history_`. If the first termination period has more than one record, mark its candidate `overlapping_termination` and exclude it; do not promote a later period or interpret the first row's dose as the combined reduction. Duplicate copies of the same underlying termination must be removed upstream if that is how the source data are recorded.
 
@@ -422,7 +422,7 @@ The screen is sample-dependent; this description is not an inferential result ab
 
 When the Python implementation is written, verify these behaviors with targeted examples:
 
-- All four column-name arguments are required; omitting one fails construction. Renaming every input column through the constructor leaves results unchanged, using the same `firm_col` and `period_col` labels in both tables. Inputs missing either shared column fail validation; `outcome_col` and `dose_col` may share a label across the two tables.
+- All four column-name arguments are required; omitting any one raises `TypeError` at construction. No conventional input labels or internal schema names supply defaults. Renaming every input column through the constructor leaves results unchanged, using the same `firm_col` and `period_col` labels in both tables. Inputs missing either shared column fail validation; `outcome_col` and `dose_col` may share a label across the two tables.
 - `fit()` has no `event_times` argument and generates `list(range(-7, 15))` for `(-7, 14)`. Default prediction and aggregation include all 22 horizons; explicit subsets may include negative periods, and out-of-window requests fail.
 - The signed window `(-7, 14)` screens exactly from $g-7$ through $g+14$, including both boundaries; `(7, 14)` is rejected. Check the panel-bound conditions $g+L\ge1$ and $g+H\le T$.
 - `min_cohort_size=None` resolves to $p+1$ for the configured degree and knot count; a smaller explicit minimum cannot bypass that floor, while a larger one is enforced. The default cubic design resolves to five.
