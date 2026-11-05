@@ -775,8 +775,32 @@ class ATT:
                 "Predictions omit %d unavailable comparisons; inspect cell_diagnostics_.",
                 len(failed),
             )
+        result = self._prediction_rows(dose_values, horizons)
+        extrapolated_count = int(result["extrapolated"].sum())
+        if extrapolated_count:
+            logging.warning(
+                "Extrapolating %d predictions beyond fitted dose support.",
+                extrapolated_count,
+            )
+        return result
+
+    def _prediction_rows(self, dose_values: FloatArray, horizons: list[int]) -> pd.DataFrame:
+        """Evaluate validated requests without emitting intermediate warnings.
+
+        Args:
+            dose_values:
+                Validated, sorted positive finite doses.
+            horizons:
+                Validated fitted horizons to evaluate.
+
+        Returns:
+            Component prediction rows with the same schema as predict().
+
+        Raises:
+            ValueError:
+                A spline prediction is nonfinite.
+        """
         records = []
-        extrapolated_count = 0
         for key, coefficients in sorted(self.cell_coefficients_.items()):
             cohort, e = key
             if e not in horizons:
@@ -794,7 +818,6 @@ class ATT:
                         "Spline predictions are nonfinite at the requested doses.",
                     )
                 outside = (dose_values < basis["lower"]) | (dose_values > basis["upper"])
-            extrapolated_count += int(outside.sum())
             for dose, prediction, extrapolated in zip(
                 dose_values,
                 predictions,
@@ -813,11 +836,6 @@ class ATT:
                         "extrapolated": bool(extrapolated),
                     },
                 )
-        if extrapolated_count:
-            logging.warning(
-                "Extrapolating %d predictions beyond fitted dose support.",
-                extrapolated_count,
-            )
         return pd.DataFrame(records, columns=_PREDICTION_COLUMNS).astype(
             {
                 "cohort": "datetime64[ns]",
@@ -999,7 +1017,9 @@ def evaluate_theta(
         A DataFrame sorted by event_time and dose, with theta, estimate_type,
         n_cohorts_eligible, n_cohorts_used, n_firms_design, n_firms_eligible,
         n_firms_used, availability_restricted, restricted_target, and
-        extrapolated columns in addition to those two identifiers.
+        extrapolated columns in addition to those two identifiers. Any omitted
+        comparisons, restricted horizons, and extrapolation are reported in one
+        aggregate warning for the complete successful evaluation.
 
     Raises:
         ValueError:
@@ -1016,7 +1036,10 @@ def evaluate_theta(
     design_events = model.events_.loc[model.events_["design_eligible"]]
     n_firms_design = len(design_events)
     rows: list[dict[str, Any]] = []
-    restricted_event_times = []
+    restricted_horizons = 0
+    excluded_treated_rows = 0
+    extrapolated_predictions = 0
+    prediction_doses = np.sort(dose_values)
     for event_time in resolved_event_times:
         availability = model.availability_diagnostics_
         observed = availability.loc[(availability["event_time"] == event_time) & availability["available"]]
@@ -1055,7 +1078,7 @@ def evaluate_theta(
             eligible_firms=used_events["firm_id"],
             bandwidth=bandwidth,
         )
-        predictions = model.predict(dose_values, event_times=[event_time])
+        predictions = model._prediction_rows(prediction_doses, [event_time])
         components = weights.merge(
             predictions,
             on=["cohort", "dose"],
@@ -1074,7 +1097,9 @@ def evaluate_theta(
             )
         restricted_target = retained_cohorts != eligible_cohorts
         if restricted_target:
-            restricted_event_times.append(event_time)
+            restricted_horizons += 1
+        excluded_treated_rows += len(eligible_events) - len(used_events)
+        extrapolated_predictions += int(predictions["extrapolated"].sum())
         for dose_key, component in components.groupby("dose", sort=True):
             # The dose column comes from the validated floating-point grid.
             dose = cast(float, dose_key)
@@ -1106,9 +1131,19 @@ def evaluate_theta(
                     "extrapolated": False if event_time == -1 else bool(component["extrapolated"].any()),
                 },
             )
-    if restricted_event_times:
+    requested_horizons = set(resolved_event_times)
+    omitted_comparisons = sum(
+        event_time in requested_horizons and cell["status"] not in {"fitted", "reference", "no_observed_treated"}
+        for (_, event_time), cell in model.cell_diagnostics_.items()
+    )
+    if omitted_comparisons or restricted_horizons or extrapolated_predictions:
         logging.warning(
-            "Aggregation is restricted to retained cohorts at event periods %s.",
-            sorted(restricted_event_times),
+            "Aggregation summary: %d unavailable cohort-horizon comparisons; "
+            "%d excluded treated firm-horizon rows across %d restricted horizons; "
+            "%d extrapolated cohort-horizon-dose predictions. Inspect returned flags and cell_diagnostics_.",
+            omitted_comparisons,
+            excluded_treated_rows,
+            restricted_horizons,
+            extrapolated_predictions,
         )
     return pd.DataFrame(rows).sort_values(["event_time", "dose"]).reset_index(drop=True)
