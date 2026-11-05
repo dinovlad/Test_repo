@@ -1,7 +1,7 @@
 """Check continuous-dose estimates against independent numerical comparisons."""
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -9,8 +9,8 @@ from numpy.testing import assert_allclose
 from pandas.testing import assert_frame_equal
 from scipy.interpolate import BSpline
 
-import att
-from att import ATT, estimate_pi, evaluate_theta
+from labor_cost_optimization import att
+from labor_cost_optimization.att import ATT, estimate_pi, evaluate_theta
 
 
 MAPPINGS = {
@@ -186,6 +186,43 @@ class EstimationTests(unittest.TestCase):
             self.assertTrue((self.model.cell_coefficients_[key] == 0.0).all())
         self.assertEqual(str(results["cohort"].dtype), "datetime64[ns]")
         self.assertEqual(str(results["period"].dtype), "datetime64[ns]")
+
+    def test_constant_and_zero_changes_have_zero_treatment_effects(self):
+        """Allow zero changes and calendar changes shared by every firm."""
+        for slope in (0.0, 2.0):
+            with self.subTest(calendar_slope=slope):
+                outcomes = self.outcomes.copy()
+                periods = (outcomes["period"] - outcomes["period"].min()).dt.days
+                outcomes["sales"] = 200.0 + slope * periods
+                model = ATT(**MAPPINGS).fit(
+                    outcomes, self.events, isolation_window=WINDOW
+                )
+                result = model.predict([6.0, 8.0])
+                assert_allclose(result["att"], 0.0, atol=1e-10)
+                theta = evaluate_theta(model, [6.0, 8.0], bandwidth=1.0)
+                assert_allclose(theta["theta"], 0.0, atol=1e-10)
+
+    def test_incomplete_or_nonfinite_solver_coefficients_fail_the_entire_fit(self):
+        """Never accept a backend's missing term or silently reduce a fitted curve."""
+        coefficients = self.model.model_.coef()
+        missing = coefficients.drop(coefficients.index[0])
+        nonfinite = coefficients.copy()
+        nonfinite.iloc[0] = np.nan
+        for malformed in (missing, nonfinite):
+            with self.subTest(coefficient_count=len(malformed)):
+                backend_model = Mock()
+                backend_model.coef.return_value = malformed
+                model = ATT(**MAPPINGS)
+                with patch.object(
+                    att.pf, "feols", return_value=backend_model
+                ) as solver:
+                    with self.assertRaises(RuntimeError):
+                        model.fit(
+                            self.outcomes, self.events, isolation_window=WINDOW
+                        )
+                solver.assert_called_once()
+                with self.assertRaises((ValueError, RuntimeError)):
+                    model.predict([7.0])
 
     def test_prediction_grid_cannot_redefine_the_fitted_basis(self):
         """Keep predictions unchanged when other requested doses change."""
