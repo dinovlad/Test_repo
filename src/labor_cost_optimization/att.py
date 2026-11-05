@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from numbers import Integral
-from typing import Any, Self
+from typing import Any, Self, cast
 
 import numpy as np
 import pandas as pd
@@ -26,8 +26,15 @@ Cell = tuple[pd.Timestamp, int]
 _PERIOD = pd.Timedelta(days=1)
 _PERIOD_NS = 86_400_000_000_000
 _PREDICTION_COLUMNS = [
-    "cohort", "period", "event_time", "dose", "att", "estimate_type",
-    "n_treated", "n_controls", "extrapolated",
+    "cohort",
+    "period",
+    "event_time",
+    "dose",
+    "att",
+    "estimate_type",
+    "n_treated",
+    "n_controls",
+    "extrapolated",
 ]
 
 
@@ -209,7 +216,8 @@ class ATT:
         self.degree = _integer(degree, "degree", 1)
         self.num_knots = _integer(num_knots, "num_knots", 0)
         self.min_cohort_size = (
-            None if min_cohort_size is None
+            None
+            if min_cohort_size is None
             else _integer(min_cohort_size, "min_cohort_size", 1)
         )
         self._reset()
@@ -222,11 +230,14 @@ class ATT:
         self._is_fitted = False
         self.model_: Any = None
         self.column_names_ = {
-            "firm_col": self.firm_col, "period_col": self.period_col,
-            "outcome_col": self.outcome_col, "dose_col": self.dose_col,
+            "firm_col": self.firm_col,
+            "period_col": self.period_col,
+            "outcome_col": self.outcome_col,
+            "dose_col": self.dose_col,
         }
         self.min_cohort_size_ = max(
-            self.degree + self.num_knots + 2, self.min_cohort_size or 0
+            self.degree + self.num_knots + 2,
+            self.min_cohort_size or 0,
         )
         self.event_times_: list[int] = []
         self.events_ = pd.DataFrame()
@@ -244,7 +255,9 @@ class ATT:
         self.knots_: FloatArray = np.empty(0)
 
     def _inputs(
-        self, outcomes: pd.DataFrame, events: pd.DataFrame
+        self,
+        outcomes: pd.DataFrame,
+        events: pd.DataFrame,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Validate and copy the two tables into internal column conventions."""
         outcome_columns = [self.firm_col, self.period_col, self.outcome_col]
@@ -264,7 +277,9 @@ class ATT:
         outcome["outcome"] = _numeric(outcome["outcome"], "Outcomes")
         event["dose"] = _numeric(event["dose"], "Doses", positive=True)
         if outcome.duplicated(["firm_id", "period"]).any():
-            raise ValueError("Outcome rows must be unique by firm and normalized period.")
+            raise ValueError(
+                "Outcome rows must be unique by firm and normalized period.",
+            )
         if not event["firm_id"].isin(outcome["firm_id"]).all():
             raise ValueError("Every event firm must be present in the outcome panel.")
         return outcome, event
@@ -290,11 +305,17 @@ class ATT:
             )
         self.termination_history_ = (
             event.groupby(["firm_id", "cohort"], sort=False, observed=True)
-            .size().rename("n_terminations").reset_index()
+            .size()
+            .rename("n_terminations")
+            .reset_index()
         )
         history = {
-            firm: group for firm, group in
-            self.termination_history_.groupby("firm_id", sort=False, observed=True)
+            firm: group
+            for firm, group in self.termination_history_.groupby(
+                "firm_id",
+                sort=False,
+                observed=True,
+            )
         }
         first = event.sort_values("cohort", kind="stable").drop_duplicates("firm_id")
         diagnostics = []
@@ -302,8 +323,13 @@ class ATT:
         for row in first.itertuples(index=False):
             g = row.cohort.value // _PERIOD_NS
             firm_history = history[row.firm_id]
-            indices = firm_history["cohort"].array.asi8 // _PERIOD_NS
-            conflicts = firm_history.loc[(indices >= g + lower) & (indices <= g + upper)]
+            indices = (
+                firm_history["cohort"].to_numpy(dtype="datetime64[ns]").astype(np.int64)
+                // _PERIOD_NS
+            )
+            conflicts = firm_history.loc[
+                (indices >= g + lower) & (indices <= g + upper)
+            ]
             n_conflicts = int(conflicts["n_terminations"].sum()) - 1
             if not origin <= g <= last:
                 reason = "outside_outcome_period"
@@ -313,19 +339,33 @@ class ATT:
                 reason = "overlapping_termination"
             else:
                 reason = "eligible"
-            diagnostics.append({
-                "firm_id": row.firm_id, "cohort": row.cohort, "dose": row.dose,
-                "design_eligible": reason == "eligible", "reason": reason,
-                "n_conflicting_terminations": n_conflicts,
-                "conflicting_periods": tuple(
-                    item.cohort for item in conflicts.itertuples(index=False)
-                    if item.cohort != row.cohort or item.n_terminations > 1
-                ),
-            })
-        self.event_diagnostics_ = pd.DataFrame(diagnostics, columns=[
-            "firm_id", "cohort", "dose", "design_eligible", "reason",
-            "n_conflicting_terminations", "conflicting_periods",
-        ])
+            diagnostics.append(
+                {
+                    "firm_id": row.firm_id,
+                    "cohort": row.cohort,
+                    "dose": row.dose,
+                    "design_eligible": reason == "eligible",
+                    "reason": reason,
+                    "n_conflicting_terminations": n_conflicts,
+                    "conflicting_periods": tuple(
+                        item.cohort
+                        for item in conflicts.itertuples(index=False)
+                        if item.cohort != row.cohort or item.n_terminations > 1
+                    ),
+                },
+            )
+        self.event_diagnostics_ = pd.DataFrame(
+            diagnostics,
+            columns=[
+                "firm_id",
+                "cohort",
+                "dose",
+                "design_eligible",
+                "reason",
+                "n_conflicting_terminations",
+                "conflicting_periods",
+            ],
+        )
         self.events_ = self.event_diagnostics_[
             ["firm_id", "cohort", "dose", "design_eligible"]
         ].copy()
@@ -341,7 +381,9 @@ class ATT:
                 method="linear",
             )
             if len(np.unique(self.knots_)) != self.num_knots:
-                raise ValueError("Global internal knots are duplicated; change the configuration.")
+                raise ValueError(
+                    "Global internal knots are duplicated; change the configuration.",
+                )
 
     def _basis(self, doses: FloatArray) -> tuple[str, dict[str, Any], FloatArray]:
         """Screen a treated design and construct its saved spline basis.
@@ -359,7 +401,8 @@ class ATT:
         if np.any(self.knots_ <= lower) or np.any(self.knots_ >= upper):
             return "incompatible_knots", {}, empty
         knots = np.r_[
-            np.repeat(lower, self.degree + 1), self.knots_,
+            np.repeat(lower, self.degree + 1),
+            self.knots_,
             np.repeat(upper, self.degree + 1),
         ]
         spline = BSpline(knots, np.eye(p), self.degree, extrapolate=True)
@@ -403,7 +446,9 @@ class ATT:
         try:
             lower, upper = isolation_window
         except (TypeError, ValueError) as exc:
-            raise ValueError("isolation_window must contain two signed integer offsets.") from exc
+            raise ValueError(
+                "isolation_window must contain two signed integer offsets.",
+            ) from exc
         lower = _integer(lower, "lower isolation offset")
         upper = _integer(upper, "upper isolation offset")
         if lower > -1 or upper < 0:
@@ -422,10 +467,15 @@ class ATT:
         blocks: list[tuple[Cell, pd.DataFrame, FloatArray]] = []
         eligible = self.events_.loc[self.events_["design_eligible"]]
         history = self.termination_history_
-        for cohort, targets in eligible.groupby("cohort", sort=True):
+        for cohort_key, targets in eligible.groupby("cohort", sort=True):
+            # Input validation guarantees normalized datetime64[ns] group keys.
+            cohort = cast(pd.Timestamp, cohort_key)
             baseline = cohort - _PERIOD
             base = by_period.get(baseline, empty)
-            conflict = history["cohort"].between(cohort + lower * _PERIOD, cohort + upper * _PERIOD)
+            conflict = history["cohort"].between(
+                cohort + lower * _PERIOD,
+                cohort + upper * _PERIOD,
+            )
             blocked = set(history.loc[conflict, "firm_id"])
             for e in self.event_times_:
                 key = (cohort, e)
@@ -434,12 +484,18 @@ class ATT:
                 for row in targets.itertuples(index=False):
                     missing_base = row.firm_id not in base.index
                     missing_end = row.firm_id not in endpoint.index
-                    availability.append({
-                        "firm_id": row.firm_id, "cohort": cohort, "event_time": e,
-                        "baseline": baseline, "period": period,
-                        "missing_baseline": missing_base, "missing_endpoint": missing_end,
-                        "available": not (missing_base or missing_end),
-                    })
+                    availability.append(
+                        {
+                            "firm_id": row.firm_id,
+                            "cohort": cohort,
+                            "event_time": e,
+                            "baseline": baseline,
+                            "period": period,
+                            "missing_baseline": missing_base,
+                            "missing_endpoint": missing_end,
+                            "available": not (missing_base or missing_end),
+                        },
+                    )
                 common = base.index.intersection(endpoint.index, sort=False)
                 with np.errstate(over="ignore", invalid="ignore"):
                     changes = endpoint.reindex(common) - base.reindex(common)
@@ -450,9 +506,12 @@ class ATT:
                 control_firms = tuple(firm for firm in common if firm not in blocked)
                 doses = treated["dose"].to_numpy(dtype=float)
                 diagnostic = {
-                    "status": "no_observed_treated", "n_treated": len(treated_firms),
-                    "n_controls": len(control_firms), "treated_firms": treated_firms,
-                    "control_firms": control_firms, "estimate_type": _estimate_type(e),
+                    "status": "no_observed_treated",
+                    "n_treated": len(treated_firms),
+                    "n_controls": len(control_firms),
+                    "treated_firms": treated_firms,
+                    "control_firms": control_firms,
+                    "estimate_type": _estimate_type(e),
                     "n_distinct_doses": len(np.unique(doses)),
                     "design_dimension": self.degree + self.num_knots + 1,
                 }
@@ -465,14 +524,22 @@ class ATT:
                     logging.warning(
                         "Dropped cohort %s, event period %d: %s; %d treated firms, "
                         "%d distinct doses, design dimension %d.",
-                        cohort, e, status, len(treated_firms), len(np.unique(doses)),
+                        cohort,
+                        e,
+                        status,
+                        len(treated_firms),
+                        len(np.unique(doses)),
                         self.degree + self.num_knots + 1,
                     )
                     continue
                 self.retained_cohorts_[e].append(cohort)
                 if not control_firms:
                     diagnostic["status"] = "no_controls"
-                    logging.warning("No clean controls for cohort %s, event period %d.", cohort, e)
+                    logging.warning(
+                        "No clean controls for cohort %s, event period %d.",
+                        cohort,
+                        e,
+                    )
                     continue
                 self.bases_[key] = basis
                 if e == -1:
@@ -480,12 +547,17 @@ class ATT:
                     self.cell_coefficients_[key] = np.zeros(design.shape[1])
                     continue
                 firms = [*treated_firms, *control_firms]
-                block = pd.DataFrame({
-                    "firm_id": firms, "cell": len(blocks), "cohort": cohort,
-                    "period": period, "event_time": e,
-                    "delta_y": changes.reindex(firms).to_numpy(),
-                    "treated": [1] * len(treated_firms) + [0] * len(control_firms),
-                })
+                block = pd.DataFrame(
+                    {
+                        "firm_id": firms,
+                        "cell": len(blocks),
+                        "cohort": cohort,
+                        "period": period,
+                        "event_time": e,
+                        "delta_y": changes.reindex(firms).to_numpy(),
+                        "treated": [1] * len(treated_firms) + [0] * len(control_firms),
+                    },
+                )
                 blocks.append((key, block, design))
         self.availability_diagnostics_ = pd.DataFrame(availability)
         self._summarize_cohorts()
@@ -508,7 +580,7 @@ class ATT:
             self.cell_keys_[cell] = key
             self.effect_columns_[key] = cell_names
             names.extend(cell_names)
-            effects[offset:offset + len(design), cell * p:(cell + 1) * p] = design
+            effects[offset : offset + len(design), cell * p : (cell + 1) * p] = design
             offset += len(block)
         stacked = pd.concat([stacked, pd.DataFrame(effects, columns=names)], axis=1)
         try:
@@ -517,28 +589,46 @@ class ATT:
             if any(name not in coefficients.index for name in names):
                 raise RuntimeError("PyFixest omitted a required treatment coefficient.")
             if not np.isfinite(coefficients.loc[names].to_numpy()).all():
-                raise RuntimeError("PyFixest returned a nonfinite treatment coefficient.")
+                raise RuntimeError(
+                    "PyFixest returned a nonfinite treatment coefficient.",
+                )
         except Exception as exc:
             for key, _, _ in blocks:
                 self.cell_diagnostics_[key]["status"] = "model_failed"
             self._summarize_cohorts()
-            raise RuntimeError("The single PyFixest model could not be fitted completely.") from exc
+            raise RuntimeError(
+                "The single PyFixest model could not be fitted completely.",
+            ) from exc
         self.model_ = model
         for key, names_for_cell in self.effect_columns_.items():
-            self.cell_coefficients_[key] = coefficients.loc[names_for_cell].to_numpy(dtype=float)
+            self.cell_coefficients_[key] = coefficients.loc[names_for_cell].to_numpy(
+                dtype=float,
+            )
             self.cell_diagnostics_[key]["status"] = "fitted"
 
     def _summarize_cohorts(self) -> None:
         """Summarize design eligibility and horizon statuses without dropping history."""
         records = []
         for cohort, events in self.events_.groupby("cohort", sort=True):
-            cells = {e: cell for (g, e), cell in self.cell_diagnostics_.items() if g == cohort}
-            records.append({
-                "cohort": cohort, "n_firms_design": int(events["design_eligible"].sum()),
-                "n_cells_available": sum(cell["n_treated"] > 0 for cell in cells.values()),
-                "n_cells_used": sum(cell["status"] in {"fitted", "reference"} for cell in cells.values()),
-                "statuses": {e: cell["status"] for e, cell in cells.items()},
-            })
+            cells = {
+                e: cell
+                for (g, e), cell in self.cell_diagnostics_.items()
+                if g == cohort
+            }
+            records.append(
+                {
+                    "cohort": cohort,
+                    "n_firms_design": int(events["design_eligible"].sum()),
+                    "n_cells_available": sum(
+                        cell["n_treated"] > 0 for cell in cells.values()
+                    ),
+                    "n_cells_used": sum(
+                        cell["status"] in {"fitted", "reference"}
+                        for cell in cells.values()
+                    ),
+                    "statuses": {e: cell["status"] for e, cell in cells.items()},
+                },
+            )
         self.cohort_diagnostics_ = pd.DataFrame(records)
 
     def _require_fitted(self) -> None:
@@ -553,15 +643,22 @@ class ATT:
         try:
             values = [_integer(e, "event_time") for e in event_times]
         except TypeError as exc:
-            raise ValueError("event_times must be a nonempty collection of integers.") from exc
+            raise ValueError(
+                "event_times must be a nonempty collection of integers.",
+            ) from exc
         if not values or len(set(values)) != len(values):
             raise ValueError("event_times must be nonempty and distinct.")
         if not set(values).issubset(self.event_times_):
-            raise ValueError("Requested event_times lie outside the fitted isolation window.")
+            raise ValueError(
+                "Requested event_times lie outside the fitted isolation window.",
+            )
         return sorted(values)
 
     def predict(
-        self, doses: Iterable[float], *, event_times: Iterable[int] | None = None
+        self,
+        doses: Iterable[float],
+        *,
+        event_times: Iterable[int] | None = None,
     ) -> pd.DataFrame:
         """Evaluate unpooled dose curves using the saved cell bases.
 
@@ -588,12 +685,16 @@ class ATT:
         self._require_fitted()
         dose_values = np.sort(_validate_doses(doses))
         horizons = self._resolve_event_times(event_times)
-        failed = [key for key, cell in self.cell_diagnostics_.items()
-                  if key[1] in horizons and cell["status"] not in
-                  {"fitted", "reference", "no_observed_treated"}]
+        failed = [
+            key
+            for key, cell in self.cell_diagnostics_.items()
+            if key[1] in horizons
+            and cell["status"] not in {"fitted", "reference", "no_observed_treated"}
+        ]
         if failed:
             logging.warning(
-                "Predictions omit %d unavailable comparisons; inspect cell_diagnostics_.", len(failed)
+                "Predictions omit %d unavailable comparisons; inspect cell_diagnostics_.",
+                len(failed),
             )
         records = []
         extrapolated_count = 0
@@ -608,27 +709,53 @@ class ATT:
                 outside = np.zeros(len(dose_values), dtype=bool)
             else:
                 with np.errstate(over="ignore", invalid="ignore"):
-                    predictions = coefficients[0] + basis["spline"](dose_values)[:, 1:] @ coefficients[1:]
+                    predictions = (
+                        coefficients[0]
+                        + basis["spline"](dose_values)[:, 1:] @ coefficients[1:]
+                    )
                 if not np.isfinite(predictions).all():
-                    raise ValueError("Spline predictions are nonfinite at the requested doses.")
-                outside = (dose_values < basis["lower"]) | (dose_values > basis["upper"])
+                    raise ValueError(
+                        "Spline predictions are nonfinite at the requested doses.",
+                    )
+                outside = (dose_values < basis["lower"]) | (
+                    dose_values > basis["upper"]
+                )
             extrapolated_count += int(outside.sum())
-            for dose, prediction, extrapolated in zip(dose_values, predictions, outside):
-                records.append({
-                    "cohort": cohort, "period": cohort + e * _PERIOD,
-                    "event_time": e, "dose": dose, "att": prediction,
-                    "estimate_type": cell["estimate_type"], "n_treated": cell["n_treated"],
-                    "n_controls": cell["n_controls"], "extrapolated": bool(extrapolated),
-                })
+            for dose, prediction, extrapolated in zip(
+                dose_values,
+                predictions,
+                outside,
+            ):
+                records.append(
+                    {
+                        "cohort": cohort,
+                        "period": cohort + e * _PERIOD,
+                        "event_time": e,
+                        "dose": dose,
+                        "att": prediction,
+                        "estimate_type": cell["estimate_type"],
+                        "n_treated": cell["n_treated"],
+                        "n_controls": cell["n_controls"],
+                        "extrapolated": bool(extrapolated),
+                    },
+                )
         if extrapolated_count:
             logging.warning(
-                "Extrapolating %d predictions beyond fitted dose support.", extrapolated_count
+                "Extrapolating %d predictions beyond fitted dose support.",
+                extrapolated_count,
             )
-        return pd.DataFrame(records, columns=_PREDICTION_COLUMNS).astype({
-            "cohort": "datetime64[ns]", "period": "datetime64[ns]",
-            "event_time": "int64", "dose": "float64", "att": "float64",
-            "n_treated": "int64", "n_controls": "int64", "extrapolated": "bool",
-        })
+        return pd.DataFrame(records, columns=_PREDICTION_COLUMNS).astype(
+            {
+                "cohort": "datetime64[ns]",
+                "period": "datetime64[ns]",
+                "event_time": "int64",
+                "dose": "float64",
+                "att": "float64",
+                "n_treated": "int64",
+                "n_controls": "int64",
+                "extrapolated": "bool",
+            },
+        )
 
 
 def _validate_aggregation_firms(firms: Iterable[object], name: str) -> list[object]:
@@ -726,18 +853,20 @@ def estimate_pi(
         or cohorts.isna().any()
         or not cohorts.equals(cohorts.dt.normalize())
     ):
-        raise ValueError("events.cohort must contain normalized timezone-naive periods.")
+        raise ValueError(
+            "events.cohort must contain normalized timezone-naive periods.",
+        )
     event_doses = _numeric(events["dose"], "events.dose", positive=True)
 
     selected = events["firm_id"].isin(eligible).to_numpy()
     selected_doses = event_doses[selected]
     cohort_codes, cohort_periods = pd.factorize(cohorts[selected], sort=True)
-    rows = []
+    rows: list[dict[str, Any]] = []
     for dose in dose_values:
         try:
             with np.errstate(over="raise", invalid="raise", divide="raise"):
                 log_kernel = -0.5 * np.square(
-                    (selected_doses - dose) / kernel_bandwidth
+                    (selected_doses - dose) / kernel_bandwidth,
                 )
         except FloatingPointError as exc:
             raise ValueError("Gaussian-kernel calculations overflowed.") from exc
@@ -746,15 +875,19 @@ def estimate_pi(
         # Removing the common offset first preserves cohort counts even when
         # all unshifted log-kernel values have a very large magnitude.
         log_kernel -= np.max(log_kernel)
-        log_mass = np.array(
+        log_mass: FloatArray = np.asarray(
             [
-                logsumexp(log_kernel[cohort_codes == code])
+                logsumexp(log_kernel[cohort_codes == code], axis=0)
                 for code in range(len(cohort_periods))
-            ]
+            ],
+            dtype=np.float64,
         )
-        weights = np.exp(log_mass - logsumexp(log_mass))
+        weights = np.exp(log_mass - logsumexp(log_mass, axis=0))
         if not np.isfinite(weights).all() or not np.isclose(
-            weights.sum(), 1.0, rtol=1e-12, atol=1e-12
+            weights.sum(),
+            1.0,
+            rtol=1e-12,
+            atol=1e-12,
         ):
             raise ValueError("Cohort weights must be finite and sum to one.")
         rows.extend(
@@ -808,7 +941,7 @@ def evaluate_theta(
     resolved_event_times = model._resolve_event_times(event_times)
     design_events = model.events_.loc[model.events_["design_eligible"]]
     n_firms_design = len(design_events)
-    rows = []
+    rows: list[dict[str, Any]] = []
     restricted_event_times = []
     for event_time in resolved_event_times:
         availability = model.availability_diagnostics_
@@ -822,7 +955,7 @@ def evaluate_theta(
         retained = model.retained_cohorts_[event_time]
         retained_cohorts = set(retained)
         if len(retained_cohorts) != len(retained) or not retained_cohorts.issubset(
-            eligible_cohorts
+            eligible_cohorts,
         ):
             raise ValueError(f"Invalid retained cohorts at event period {event_time}.")
         used_events = eligible_events.loc[
@@ -843,15 +976,15 @@ def evaluate_theta(
             ):
                 raise ValueError(
                     f"Required comparison is unavailable for cohort {cohort} "
-                    f"at event period {event_time}."
+                    f"at event period {event_time}.",
                 )
             expected_firms = set(
-                used_events.loc[used_events["cohort"] == cohort, "firm_id"]
+                used_events.loc[used_events["cohort"] == cohort, "firm_id"],
             )
             if set(cell["treated_firms"]) != expected_firms:
                 raise ValueError(
                     f"Fitted firms and aggregation firms differ for cohort {cohort} "
-                    f"at event period {event_time}."
+                    f"at event period {event_time}.",
                 )
 
         weights = estimate_pi(
@@ -875,14 +1008,19 @@ def evaluate_theta(
             or not np.isfinite(components["att"].to_numpy(dtype=float)).all()
         ):
             raise ValueError(
-                f"Incomplete or invalid component predictions at event period {event_time}."
+                f"Incomplete or invalid component predictions at event period {event_time}.",
             )
         restricted_target = retained_cohorts != eligible_cohorts
         if restricted_target:
             restricted_event_times.append(event_time)
-        for dose, component in components.groupby("dose", sort=True):
+        for dose_key, component in components.groupby("dose", sort=True):
+            # The dose column comes from the validated floating-point grid.
+            dose = cast(float, dose_key)
             if not np.isclose(
-                component["weight"].sum(), 1.0, rtol=1e-12, atol=1e-12
+                component["weight"].sum(),
+                1.0,
+                rtol=1e-12,
+                atol=1e-12,
             ):
                 raise ValueError("Matched cohort weights must sum to one.")
             theta = float(np.dot(component["weight"], component["att"]))
@@ -904,9 +1042,11 @@ def evaluate_theta(
                     "availability_restricted": len(eligible_events) < n_firms_design,
                     "restricted_target": restricted_target,
                     "extrapolated": (
-                        False if event_time == -1 else bool(component["extrapolated"].any())
+                        False
+                        if event_time == -1
+                        else bool(component["extrapolated"].any())
                     ),
-                }
+                },
             )
     if restricted_event_times:
         logging.warning(
