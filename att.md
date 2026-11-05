@@ -1,6 +1,6 @@
 **Implementation specification: unpooled continuous-dose ATT and dose-specific event-study aggregation.**
 
-This document specifies a future self-contained Python module, `att.py`. It does not implement that module. The design uses independent cohort-time regressions following the parametric `contdid` calculation, retains each fitted spline basis for prediction, and estimates conditional cohort weights with a separate Gaussian-kernel function. It estimates the effect of each store's first recorded termination, with at most one target event per store. Event selection and control selection are extensions to the article's design; the regression calculation remains the reference calculation. The module evaluates every integer horizon in the isolation window: post-treatment effects, pre-treatment placebo contrasts, and the reference period. All estimates are point estimates.
+This document specifies a future self-contained Python module, `att.py`. It does not implement that module. The design uses one fully interacted PyFixest OLS model on stacked cohort-time comparisons, with separate coefficients and a saved spline basis for every comparison. Its point estimates reproduce the parametric `contdid` calculation on the same samples and bases, and a separate Gaussian-kernel function estimates conditional cohort weights. It estimates the effect of each store's first recorded termination, with at most one target event per store. Event selection and control selection are extensions to the article's design; the stacked regression is an algebraically equivalent parameterization of the reference point-estimation calculation. The module evaluates every integer horizon in the isolation window: post-treatment effects, pre-treatment placebo contrasts, and the reference period. All estimates are point estimates.
 
 **Periods and frequency.** The frequency is hardcoded to one calendar day. A period means one step at that fixed frequency. There is no frequency parameter or support for monthly or annual inputs. Input and output period labels are timezone-naive `datetime64[ns]` values normalized to the start of each period. All event-time offsets, isolation bounds, baseline comparisons, and dose units have a daily interpretation.
 
@@ -148,7 +148,7 @@ The reported `estimate_type` is `att` for $e\ge0$, `placebo` for $e\le-2$, and `
 
 The article's dose-specific event-study aggregation on printed page 41 is unnumbered; it is the source of the aggregation structure, not an equation establishing identification for these selected store comparisons. Remark C.1 on page 42 discusses estimating components and aggregating them. [Callaway et. al. (2025), Appendix C](https://psantanna.com/files/CGBS_v4.pdf#page=40)
 
-**Relationship to the R implementation.** The reference calculation is the parametric level-effect part of `contdid::cont_did_acrt`: regress raw outcome changes on an intercept and dose B-splines among the focal treated cohort, then subtract the comparison group's mean change. Use baseline $g-1$ and reproduce that calculation for each constructed non-reference comparison. Extending this fixed baseline to pre-treatment horizons is an explicit convention of this plan; numerical comparisons with the package must use the same pre-treatment baseline convention rather than assuming its defaults match. [Estimator and subset source](https://github.com/bcallaway11/contdid/blob/main/R/cont_did.R)
+**Relationship to the R implementation.** The reference calculation is the parametric level-effect part of `contdid::cont_did_acrt`: regress raw outcome changes on an intercept and dose B-splines among the focal treated cohort, then subtract the comparison group's mean change. Use baseline $g-1$ and reproduce those point estimates through one stacked PyFixest regression, with a cell fixed effect and cell-specific treatment-basis coefficients. The equivalence below holds for the same samples and fitted bases without additional covariates. Extending this fixed baseline to pre-treatment horizons is an explicit convention of this plan; numerical comparisons with the package must use the same pre-treatment baseline convention rather than assuming its defaults match. [Estimator and subset source](https://github.com/bcallaway11/contdid/blob/main/R/cont_did.R)
 
 The separate input tables, first-event selection, isolation screen, and explicit handling of missing store-periods are custom additions. The clean-window control rule can include stores whose first termination occurred earlier, provided their history and counterfactual trends satisfy the stated assumption. Keeping one target event per store does not make such stores untreated in the article's absorbing-treatment sense; this control rule remains an extension to its comparison design.
 
@@ -205,7 +205,7 @@ A design-eligible target event has $1-L\le G_i\le T-H$; actual endpoint observat
 
 The inferred coverage interval runs from the earliest to the latest normalized outcome period over the entire panel. Assume the event table is complete for every outcome store throughout that interval, including stores with no recorded terminations and periods when a store is closed or inactive. Completeness cannot be verified from the outcome panel or the presence of individual event records. Preserve all supplied terminations for first-event selection and history screening, including those during missing outcome periods, outside the panel, overlapping other events, or excluded from estimation. Extra event records do not relax the requirement that the full isolation interval lies inside the outcome panel bounds.
 
-Runtime dependencies are NumPy, pandas, PyFixest, SciPy, and the Python standard library. Exact runtime pins and development-tool requirements are declared in [pyproject.toml](pyproject.toml). The project requires Python 3.11; [.python-version](.python-version) selects that interpreter for tools such as uv. The module covers outcomes per period with missing store-periods allowed, equal treated-event weights within each regression, equal control-store weights, no anticipation, post-treatment level estimates, and pre-treatment placebo diagnostics. Covariates, inference, plotting, treatment slopes, and changing the dose within an event are outside this scope.
+Runtime dependencies are NumPy, pandas, PyFixest, SciPy, and the Python standard library. Exact runtime pins and development-tool requirements are declared in [pyproject.toml](pyproject.toml). The project requires Python 3.11; [.python-version](.python-version) selects that interpreter for tools such as uv. The module covers outcomes per period with missing store-periods allowed, equal weights for treated and control rows within each stacked comparison, no anticipation, post-treatment level estimates, and pre-treatment placebo diagnostics. Covariates, inference, plotting, treatment slopes, and changing the dose within an event are outside this scope.
 
 Use the supplied [.pre-commit-config.yaml](.pre-commit-config.yaml) for spelling, formatting, lint, and type checks on Python, Markdown, and notebooks. The hooks use system executables, so activate the development environment before installing or running them:
 
@@ -216,7 +216,7 @@ pre-commit install
 pre-commit run --all-files
 ```
 
-**`ATT` owns independent cohort-time fits.** The class manages the two tables but never pools regression coefficients across cohorts. Its signatures are:
+**`ATT` owns one fully interacted PyFixest model.** The class manages the two tables, constructs all eligible cohort-time comparisons, and estimates one `pyfixest.feols()` model. Every comparison has its own coefficients; none are shared across cohorts or horizons. The formula construction provides a place for future covariate extensions, but this specification adds no covariates or control-column parameters. Its signatures are:
 
 ```python
 ATT(
@@ -242,7 +242,7 @@ ATT.predict(doses, *, event_times=None) -> pandas.DataFrame
 
 Construction requires all four column-name arguments, a positive integer `degree`, a nonnegative integer `num_knots`, and `min_cohort_size` either `None` or a positive integer. Require a two-element `isolation_window` of integer signed offsets with $L\le-1$ and $H\ge0$, and generate all integer horizons in that interval. Set `event_times_ = list(range(L, H + 1))` internally; callers do not choose fitted horizons separately. The lower bound must include the baseline at event period $-1$; reject a positive lower offset rather than converting its sign implicitly. Dose requests must be distinct, finite, and positive. An explicit `event_times` request to `predict()` or `evaluate_theta()` must be a nonempty collection of distinct integers in the fitted interval, including negative values when requested. Dose requests must be nonempty.
 
-`fit()` returns `self` and replaces any previously fitted state; a failed refit must not leave an earlier model available for prediction. `predict()` before successful fitting raises an error. Omitting `event_times` in either prediction or aggregation requests the complete fitted interval, including negative periods and the reference period. An out-of-window request raises an error rather than fitting additional models implicitly. `fit()` attempts every non-reference `(cohort, event_time)` comparison; unavailable or screened cells remain explicitly recorded in diagnostics.
+`fit()` returns `self` and replaces any previously fitted state; a failed refit must not leave an earlier model available for prediction. `predict()` before successful fitting raises an error. Omitting `event_times` in either prediction or aggregation requests the complete fitted interval, including negative periods and the reference period. An out-of-window request raises an error rather than fitting additional models implicitly. `fit()` constructs and screens every `(cohort, event_time)` comparison, then stacks all eligible non-reference comparisons for one `feols()` call. Unavailable or screened cells remain explicitly recorded in diagnostics.
 
 For a cohort $g$ and each horizon $e=L,\ldots,H$, set $t=g+e$. Use one treated row per store with a design-eligible first termination at $g$ and $A_i(e)=1$. Assert uniqueness of the store identifier. The baseline is always $g-1$, the period immediately before termination, even when the comparison endpoint precedes it or the store was inactive on that baseline period. Select controls using the complete termination history and exact endpoint availability:
 
@@ -254,40 +254,77 @@ $$
 
 Count each control store once, regardless of workforce size. A treated store cannot also be its own control. A store may control for another event outside its own termination window, including after an earlier termination, only under the stated PT and carryover conditions. The history screen remains fixed through $g+H$ at all horizons; the observed-endpoint restriction can change both treated and control samples across horizons.
 
-For $e\ne-1$, compute $\Delta Y_s^{g,t}=Y_{s,t}-Y_{s,g-1}$ and run the same regression for post-treatment and pre-treatment comparisons. Keep this order of subtraction for negative horizons. Let $b_{g,e}(d)$ denote the saved B-spline columns for this comparison, excluding the first full-basis column. The fitted design includes a separate intercept:
+**Single stacked regression.** After the cell-specific checks below, let $\mathcal J$ contain the non-reference cells $c=(g,e)$ with $e\ne-1$ that pass both treated-design and clean-control availability checks. For each cell, stack one row per eligible treated store and one row per clean control store. The row outcome is
 
 $$
-x_{g,e}(d)=(1,b_{g,e}(d)')',\qquad
-\widehat\gamma_{g,e}
-=\arg\min_\gamma\sum_{i:G_i=g,S_i=1,A_i(e)=1}
-\left(\Delta Y_i^{g,t}-x_{g,e}(D_i)'\gamma\right)^2.
+\Delta Y_{ic}=Y_{i,g+e}-Y_{i,g-1}.
 $$
 
-Store the control correction separately:
+Keep this order of subtraction at negative horizons. Let $Z_{ic}=1$ for the cell's eligible termination cohort and $Z_{ic}=0$ for its clean controls. At negative horizons, $Z_{ic}$ still identifies the future termination cohort. A store can appear in multiple cells and can have different roles across cells, but it appears at most once within any cell. Keep every such comparison row with weight one; reuse does not create another target event or another contribution to the kernel weights.
+
+Let $p=q+K+1$ be the per-cell treatment-curve dimension defined by the degree and knot count below. Let $B_{ck}(d)$, $k=1,\ldots,p-1$, be the saved B-spline columns for cell $c$, excluding the first full-basis column. Each cell has a separate treatment intercept and $p-1$ spline coefficients. Estimate the following equation by unweighted OLS in one PyFixest model:
 
 $$
-\widehat m_{0,g,e}
-=\frac{1}{|\mathcal C_{g,e}|}\sum_{s\in\mathcal C_{g,e}}\Delta Y_s^{g,t}.
+\Delta Y_{ic}
+=\alpha_c
++Z_{ic}\left[
+\beta_{c0}+\sum_{k=1}^{p-1}\beta_{ck}B_{ck}(D_i)
+\right]
++\varepsilon_{ic},
+\qquad c=(g,e)\in\mathcal J.
 $$
 
-The reported component prediction is
+Here, $\alpha_c$ is a cell fixed effect. Every $\beta_{ck}$ is specific to the cell, including $\beta_{c0}$. For control rows, all treatment terms are defined as zero; their dose need not be defined or evaluated. There are no additional covariates, shared treatment coefficients, or regression weights. The kernel probabilities are used only in subsequent aggregation. One model does not borrow information across cells or resolve small treated cohorts.
+
+Construct the stacked DataFrame with internal `firm_id`, `cell`, `cohort`, `period`, `event_time`, `delta_y`, and `treated` columns, where `period` is the endpoint and `cell` is an internal label for `(cohort, event_time)`. Assert uniqueness of `(firm_id, cell)`. For every cell, precompute $p$ uniquely named numeric effect columns: its treated indicator and that indicator times each of its saved spline columns. Fill them with zero for control rows and rows belonging to other cells. Evaluate the basis only on that cell's treated doses. Use deterministic safe column names and retain their ordered mapping to the cell and basis coefficients; do not generate a spline from all stacked doses or from the prediction grid.
+
+With `effect_columns` containing all those precomputed column names, the estimation call is:
+
+```python
+import pyfixest as pf
+
+self.model_ = pf.feols(
+    "delta_y ~ " + " + ".join(effect_columns) + " | cell",
+    data=stacked,
+)
+```
+
+Call `feols()` exactly once after constructing and screening the stack, returning one `Feols` object. Do not use `split`, `fsplit`, multiple-model syntax, or separate per-cell estimation calls. The fixed-effect part is only `cell`. The absolute endpoint period $g+e$ and baseline period $g-1$ are fixed within each cell, so a common calendar effect contributes $\lambda_{g+e}-\lambda_{g-1}$ and is absorbed by $\alpha_c$. No separate calendar-period fixed effect is included. Use PyFixest's regression solver without constructing an explicit matrix inverse. [PyFixest 0.60.0 API and formula syntax](https://github.com/py-econometrics/pyfixest/blob/v0.60.0/pyfixest/estimation/api/feols.py)
+
+**Equivalence and component prediction.** Let $\mathcal C_c=\mathcal C_{g,e}$ and define the clean-control mean change as $\widehat m_{0,c}$. Let $\widehat\gamma_{c0},\ldots,\widehat\gamma_{c,p-1}$ denote the coefficients from the reference treated-only regression on an intercept and the same cell basis. For identical samples and bases, the stacked OLS estimates satisfy, up to numerical precision,
+
+$$
+\widehat\alpha_c
+=\widehat m_{0,c}
+=\frac{1}{|\mathcal C_c|}\sum_{i\in\mathcal C_c}\Delta Y_{ic},
+\qquad
+\widehat\beta_{c0}
+=\widehat\gamma_{c0}-\widehat m_{0,c},
+\qquad
+\widehat\beta_{ck}=\widehat\gamma_{ck},\quad k=1,\ldots,p-1.
+$$
+
+The identities follow by writing the treated intercept as $\gamma_{c0}=\alpha_c+\beta_{c0}$: each cell's OLS objective separates into a control intercept fit and a treated spline fit. These reference coefficients and control means establish equivalence; implementation obtains the treatment coefficients from the single PyFixest model.
+
+For $c=(g,e)$, the reported component prediction is
 
 $$
 \widehat\tau_{g,e}(d)
-=x_{g,e}(d)'\widehat\gamma_{g,e}-\widehat m_{0,g,e}.
+=\widehat\beta_{c0}
++\sum_{k=1}^{p-1}\widehat\beta_{ck}B_{ck}(d).
 $$
 
-For $e\ge0$ this predicts ATT; for $e\le-2$ it predicts the placebo contrast. The intercept belongs to the raw treated-outcome regression. Subtract the stored control mean exactly once. Neither controls nor kernel weights enter the treated OLS fit. Use a numerically stable least-squares solver, not an explicit inverse of $X'X$.
+For $e\ge0$ this predicts ATT; for $e\le-2$ it predicts the placebo contrast. `ATT.predict()` evaluates the saved cell basis and this treatment component. It does not add $\widehat\alpha_c$ or subtract $\widehat m_{0,c}$ again. PyFixest's full outcome prediction includes the cell fixed effect and must not be returned directly as ATT. Separate control-mean estimation, fixed-effect extraction, and reference treated-only regression fits are not needed for prediction.
 
 **Reference-cell handling.** At $e=-1$, availability requires only the observed baseline row: $A_i(-1)=O_{i,G_i-1}$. Apply the same treated-sample minimum, dose-support, rank, knot-compatibility, and clean-control availability checks as at other horizons. These are bookkeeping rules for a consistent reported population; they are not needed to identify the zero normalization itself.
 
-For a reference cell passing those checks, save its fitted basis definition, sample counts, a coefficient vector of exact zeros, and a zero control correction. Do not solve a regression of zero changes on the basis. Record the cell status as `reference`, and return `att=0` with `estimate_type="reference"` for every requested dose. Reference rows use `extrapolated=False` and do not trigger extrapolation warnings because the value is a normalization, not an estimated continuation of a dose curve. A failed reference cell follows the usual screening or missing-control rules; do not supply a zero for an unavailable comparison.
+For a reference cell passing those checks, save its basis definition, sample counts, and an ATT coefficient vector of exact zeros. Reference cells contribute no rows, effect columns, or fixed-effect levels to the PyFixest model. Record the cell status as `reference`, and return `att=0` with `estimate_type="reference"` for every requested dose. Reference rows use `extrapolated=False` and do not trigger extrapolation warnings because the value is a normalization, not an estimated continuation of a dose curve. A failed reference cell follows the usual screening or missing-control rules; do not supply a zero for an unavailable comparison.
 
-**Fitted basis and knots.** Let $q$ be the degree and $K$ the number of internal knots. The regression has $p=q+K+1$ columns, including the intercept. Defaults $q=3,K=0$ give a cubic polynomial expressed in a B-spline basis.
+**Fitted basis and knots.** Let $q$ be the degree and $K$ the number of internal knots. Each cell's treatment curve has $p=q+K+1$ coefficients, including its treatment intercept; the stacked regression also has one cell fixed effect per non-reference cell. Defaults $q=3,K=0$ give a cubic polynomial expressed in a B-spline basis.
 
 For $K>0$, choose shared internal knots once using the positive doses from one row per design-eligible store, before endpoint-availability and small-sample screening. A store contributes once even if it is observed at several requested horizons. Use quantiles at $k/(K+1)$, $k=1,\ldots,K$, with linear interpolation matching R's default quantile convention. This uses the package's global knot-selection structure, applied to the eligible event population. Keep the selected knots fixed after screening. [Setup source](https://github.com/bcallaway11/contdid/blob/main/R/setup_pte_cont.R), [quantile helper](https://github.com/bcallaway11/contdid/blob/main/R/helper_functions.R)
 
-For each `(cohort, event_time)` comparison, use the minimum and maximum doses among its endpoint-observed treated stores as boundary knots. Build and store the resulting basis definition: degree, internal knots, repeated boundary knots, and retained-column convention. A SciPy `BSpline` representation can evaluate that saved basis. Construct the full basis, omit its first column, and add an explicit intercept, consistent with the R parameterization. [B-spline conventions](https://wwenjie.org/splines2/reference/bspline)
+For each `(cohort, event_time)` comparison, use the minimum and maximum doses among its endpoint-observed treated stores as boundary knots. Build and store the resulting basis definition: degree, internal knots, repeated boundary knots, and retained-column convention. A SciPy `BSpline` representation can evaluate that saved basis. Construct the full basis, omit its first column, and use a separate treatment intercept, consistent with the R parameterization. Multiply these terms by the treated indicator and the appropriate cell indicator when constructing the stacked design. [B-spline conventions](https://wwenjie.org/splines2/reference/bspline)
 
 Reject duplicate global internal knots with a configuration error; do not silently change $K$. If a shared internal knot is not strictly inside a comparison's boundary knots, warn and drop that comparison with an `incompatible_knots` reason. Degenerate dose ranges and rank-deficient designs are handled by the comparison-specific screen below.
 
@@ -295,7 +332,7 @@ For non-reference comparisons, `predict()` must evaluate the fitted basis withou
 
 For non-reference comparisons, allow polynomial continuation outside the observed dose range, issue an extrapolation warning, and flag those rows. Do not clip doses, discard cohorts at particular doses, or renormalize weights because of extrapolation. Such values rely on the fitted functional form beyond observed support.
 
-**Small-sample screening and dropping.** `min_cohort_size=None` resolves to the minimum sample size permitted by this design. Let $p=q+K+1$ be the number of regression columns, including the intercept. The design requires positive residual degrees of freedom, so its sample-size floor is $p+1$. Full-column-rank OLS alone algebraically requires only $p$ observations; the extra observation is this module's design rule, not an identification threshold supplied by the article.
+**Small-sample screening and dropping.** `min_cohort_size=None` resolves to the minimum treated sample size permitted by this design. Let $p=q+K+1$ be the dimension of the treated-only intercept-plus-basis design within a cell. Require positive residual degrees of freedom for that treated component, giving a treated-sample floor of $p+1$. Full-column-rank estimation of that component algebraically requires only $p$ treated observations; the extra observation is this module's design rule, not an identification threshold supplied by the article. The cell fixed effect additionally requires at least one clean control. Additional control rows or observations in other cells do not relax the treated-sample floor.
 
 If the caller supplies a positive integer minimum, denote it by $n_{\mathrm{user}}$. Resolve the effective threshold as
 
@@ -309,15 +346,15 @@ $$
 
 Thus `degree=3`, `num_knots=0`, and `min_cohort_size=None` give $p=4$ and an effective minimum of five stores. A user-specified minimum below five does not override the design floor; a larger minimum increases it. Resolve this threshold once from the configured basis dimension and store it in `min_cohort_size_`. Apply it separately to each `(cohort, event_time)` treated sample after endpoint selection. `None` does not disable screening, and meeting this minimum does not guarantee precision.
 
-Count each observed treated store once; outcome rows and additional termination records do not increase the sample size. Require at least $p$ distinct doses and full column rank under a consistent documented numerical tolerance. The rank check is necessary even if the distinct-dose check passes.
+Count each observed treated store once; outcome rows and additional termination records do not increase the sample size. Require at least $p$ distinct doses and full column rank of the treated intercept-plus-basis matrix under a consistent documented numerical tolerance. The rank check is necessary even if the distinct-dose check passes.
 
 For each nonempty treated comparison failing sample size, dose support, rank, or knot compatibility, warn with its cohort period, event period, store count, distinct-dose count, design dimension, and reason. Record the failure in `cell_diagnostics_`. Drop that cohort only at the affected horizon. Missing endpoints can make one comparison fail while another remains estimable. Do not reduce degree, remove knots, or pool cohorts to rescue a fit.
 
 Keep every distinct termination period of every excluded store in `termination_history_`. That store can still be a control in other clean comparisons with observed endpoints. Exclusion must never erase a termination from history screening.
 
-Distinguish design and availability exclusions from estimation failures. Mark an event whose period lies outside the overall outcome range as `outside_outcome_period`, and an otherwise in-range event whose isolation interval crosses a panel boundary as `isolation_outside_panel`. For every design-eligible event, all generated endpoints and the baseline lie within the overall panel range because $L\le e\le H$ and $L\le-1$. Store-specific rows may still be missing. If a comparison has no treated stores with both endpoints, mark `no_observed_treated`; it has no events in that horizon's observed-endpoint population. Record per-store `missing_baseline` and `missing_endpoint` reasons in the availability diagnostics. If a nonempty treated design passes screening but has zero endpoint-observed clean controls, warn and mark `no_controls`; do not fit that cell. `evaluate_theta()` must error for an affected requested horizon rather than drop the cell and renormalize silently. A singleton control group is computable for point estimation and its count is reported.
+Distinguish design and availability exclusions from estimation failures. Mark an event whose period lies outside the overall outcome range as `outside_outcome_period`, and an otherwise in-range event whose isolation interval crosses a panel boundary as `isolation_outside_panel`. For every design-eligible event, all generated endpoints and the baseline lie within the overall panel range because $L\le e\le H$ and $L\le-1$. Store-specific rows may still be missing. If a comparison has no treated stores with both endpoints, mark `no_observed_treated`; it has no events in that horizon's observed-endpoint population. Record per-store `missing_baseline` and `missing_endpoint` reasons in the availability diagnostics. If a nonempty treated design passes screening but has zero endpoint-observed clean controls, warn and mark `no_controls`; do not include that cell in the stacked regression. `evaluate_theta()` must error for an affected requested horizon rather than drop the cell and renormalize silently. A singleton control group is computable for point estimation and its count is reported.
 
-If no non-reference comparison can be fitted, `fit()` raises an error after recording reasons; reference zeros alone do not constitute a successful fit. At least one post-treatment or placebo cell must be fitted. Never fill a failed cell with a zero effect.
+If no non-reference comparison passes the required checks, `fit()` raises an error after recording reasons and does not call `feols()`; reference zeros alone do not constitute a successful fit. Otherwise, fit all cells in $\mathcal J$ in one model and verify that every expected treatment coefficient is present and finite. A model-fitting error, nonfinite coefficient, or unexpected coefficient dropped by PyFixest makes `fit()` fail; do not silently accept a lower-dimensional curve or fall back to separate fits. At least one post-treatment or placebo cell and the single PyFixest model must be successfully fitted. Never fill a failed cell with a zero effect.
 
 **Stored state and unpooled output.** Keep the information needed for prediction, weights, and diagnostics:
 
@@ -331,7 +368,11 @@ If no non-reference comparison can be fitted, `fit()` raises an error after reco
 - `event_times_`: every integer from the fitted lower offset through the upper offset, including -1.
 - `origin_period_`, `last_period_`, `last_period_index_`, `isolation_window_`, and `knots_`. `origin_period_` and `last_period_` are the inferred screening bounds, and `last_period_index_` is $T$; no separate coverage interval is stored.
 - `retained_cohorts_`: a mapping from event period to the cohort periods whose nonempty treated designs pass that horizon's screen. A missing control group does not remove a cohort from this set.
-- `bases_` and `models_`: saved basis definitions and separate coefficients, control means, sample counts, and estimate types keyed by `(cohort, event_time)`; successful reference cells store exact zero coefficients and control means.
+- `model_`: the single fitted PyFixest `Feols` object containing all successfully estimable non-reference cells in $\mathcal J$.
+- `bases_`: saved basis definitions keyed by `(cohort, event_time)`, including successful reference cells.
+- `cell_keys_`: a mapping from internal `cell` labels to `(cohort, event_time)` keys. These labels identify comparisons, not additional estimation units or termination events.
+- `effect_columns_`: the ordered treatment-intercept and spline column names for each fitted non-reference cell, used to extract its coefficients from `model_`.
+- `cell_coefficients_`: the extracted ATT coefficient vectors keyed by `(cohort, event_time)`; successful reference cells store exact zero vectors. These are coefficients from one model, not separate model objects. Counts and estimate types are recorded in `cell_diagnostics_`.
 - `cohort_diagnostics_`: summary of design-eligible events and available, retained, or failed comparisons for each cohort.
 - `cell_diagnostics_`: horizon status, treated-design checks, control counts, the exact contributing treated stores, and the unique control-store identifiers.
 
@@ -418,7 +459,7 @@ This equals the pre-screen observed-endpoint target only when every eligible coh
 
 The screen is sample-dependent; this description is not an inferential result about selection. Both within-cohort store composition and retained cohorts may change across horizons. The fixed isolation window ensures period coverage from $L$ through $H$, including the baseline, for all design-eligible events. No common set of stores with complete outcomes is imposed across horizons; inactivity or closure can still change the observed sample.
 
-**Implementation boundaries and validation plan.** Put the class, both public functions, and a few private validation, window-selection, and basis helpers in one `att.py` file. Use `firm` and `period` consistently in all Python identifiers, canonical column names, docstrings, and error/log messages, including private helpers. Use `period_col`, `origin_period_`, `last_period_`, `last_period_index_`, and output column `period`; preserve literal third-party API/type names such as `datetime64[ns]` and `.dt.normalize()`. This plan keeps the application term “store” in explanatory prose; code examples and public schema names follow the general `firm` and `period` terminology. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. No generic estimator framework, serialization layer, or extra classes are needed.
+**Implementation boundaries and validation plan.** Put the class, both public functions, and a few private validation, window-selection, basis, and stacked-design helpers in one `att.py` file. Use `firm` and `period` consistently in all Python identifiers, canonical column names, docstrings, and error/log messages, including private helpers. Use `period_col`, `origin_period_`, `last_period_`, `last_period_index_`, and output column `period`; preserve literal third-party API/type names such as `datetime64[ns]` and `.dt.normalize()`. This plan keeps the application term “store” in explanatory prose; code examples and public schema names follow the general `firm` and `period` terminology. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. No generic estimator framework, serialization layer, or extra classes are needed.
 
 **Docstring convention.** Use Google-style docstrings throughout `att.py`, including the module, `ATT`, its constructor and public methods, both public functions, and private helpers. Start with a concise summary followed by a blank line before any extended description or sections. Use `Args:`, `Returns:`, and `Raises:` where applicable; omit empty or inapplicable sections. Document constructor arguments in `__init__` and fitted public attributes in the class docstring's `Attributes:` section. Simple helpers may use a one-line docstring when no further contract needs explaining.
 
@@ -465,8 +506,12 @@ When the Python implementation is written, verify these behaviors with targeted 
 - Capture warning-level log records to verify every specified warning uses `logging.warning()`; no warnings-module emissions are produced.
 - A missing baseline or endpoint excludes that store only from affected comparisons; missing intervening periods alone do not. Present rows with missing or infinite outcomes fail validation. Temporary inactivity can cause a store to contribute at one horizon, disappear at another, and reappear later.
 - Pre-treatment placebo estimates use $Y_{g+e}-Y_{g-1}$ with the correct sign and a fixed baseline. A known dose-related pre-trend is recovered without being forced to zero or labeled as a causal ATT.
-- An eligible reference cell returns exact zero coefficients, control correction, predictions, and aggregation at $e=-1$, with the correct estimate type and counts. Reference-only successes cannot hide failure of every non-reference comparison.
-- A two-period comparison with a known polynomial dose effect and a nonzero control trend recovers the curve, subtracting the control mean once.
+- An eligible reference cell returns exact zero ATT coefficients, predictions, and aggregation at $e=-1$, with the correct estimate type and counts. It contributes no regression rows or columns. Reference-only successes cannot hide failure of every non-reference comparison.
+- One `feols()` call produces one `Feols` object for all successfully estimable non-reference cells in $\mathcal J$, without `split` or `fsplit`. On a constructed sample with multiple cohorts and horizons, its ATT curves match separate treated-only spline OLS predictions minus each cell's control mean, including a cell with a single control.
+- A two-period comparison with a known polynomial dose effect and a nonzero control trend recovers the curve from the treatment coefficients. Prediction neither adds the cell fixed effect nor subtracts a control mean again.
+- Stacked design columns use each cell's saved basis and are zero for controls and rows belonging to other cells. All stacked rows receive unit weight; reused stores remain present in every eligible comparison.
+- A common calendar-period shock cancels through each cell's control comparison without a separate calendar-period fixed effect.
+- Missing or nonfinite expected treatment coefficients after `feols()` cause fitting to fail. No automatically dropped spline term may silently redefine a retained curve.
 - Predictions at a fixed dose are invariant to other requested doses and input row order. For same-period ties, the selected candidate row follows input order, but the candidate is excluded as overlapping, so its dose cannot change fitted effects. Where R training and prediction bases coincide, unpooled estimates on the same constructed sample agree numerically; otherwise compare against an R reference that explicitly reuses the training basis.
 - Two sufficiently separated termination periods at one store produce only one target event and one kernel contribution. Its later period remains in the history screen, and every control store contributes once per comparison.
 - Simultaneous and overlapping events are excluded using the original complete history. An excluded event or a dropped cohort still disqualifies its store from controls in every conflicting window.
