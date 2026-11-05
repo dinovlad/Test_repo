@@ -580,7 +580,7 @@ def test_isolation_boundaries_use_overall_outcome_coverage(
     selected = fitted.events_.set_index("firm_id")
     assert selected.loc["A0", "design_eligible"]
     assert selected.loc["B0", "design_eligible"]
-    excluded = selected.loc[["left", "right", "outside"], "design_eligible"]
+    excluded = selected["design_eligible"].loc[["left", "right", "outside"]]
     assert not excluded.any()
     assert selected.loc["outside", "cohort"] == pd.Timestamp("2023-12-30")
     assert fitted.origin_period_ == pd.Timestamp("2024-01-01")
