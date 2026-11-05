@@ -55,7 +55,10 @@ python scripts/validate.py --log validation.log
 ```
 
 The script records Python and dependency versions, the imported estimator's
-source, all numerical tests, and formatting, lint, type, and spelling checks.
+source, pytest results, and formatting, lint, type, and spelling checks.
+Quality checks target the estimator module, its two test modules, the validation
+script, and project documentation, so unrelated code in a larger project is not
+scanned.
 It reads Python and dependency constraints from your `pyproject.toml`, including
 exact pins, ranges, unversioned dependencies, extras, and environment markers.
 Version checks use `packaging` when available; missing parsing support or
@@ -65,7 +68,7 @@ nonzero if any requested check fails. It installs nothing and does not modify
 source files. The default timeout is 600 seconds per check; override it with
 `--timeout`. Use `--tests-only` to skip the code-quality checks.
 
-The tests use synthetic data and compare the real PyFixest model against
+The pytest tests use synthetic data and compare the real PyFixest model against
 independent least-squares calculations. They cover saved splines, cohort weights,
 aggregation, missing periods, isolation, duplicate events, zero effects, and
 failed-fit handling. A run that does not satisfy the configured Python or runtime
@@ -74,9 +77,14 @@ package requirements is marked as a mismatch even if its numerical tests pass.
 To run individual checks directly:
 
 ```bash
-uv run --no-sync python -m unittest discover -s tests -v
+uv run --no-sync python -m pytest tests -v
 uv run --no-sync pre-commit run --all-files
 ```
+
+With an activated environment, use `python -m pytest tests -v`. To check only
+the validation runner, use `python -m pytest tests/test_validate.py -v`.
+Ensure the development dependencies, including `pytest` and `codespell`, are
+installed in the same environment. The validation script never installs them.
 
 The pre-commit hooks apply formatting and lint fixes; the validation script's
 quality checks are read-only.

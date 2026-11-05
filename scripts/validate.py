@@ -4,6 +4,9 @@ Run from an environment containing the project and its development dependencies:
     python scripts/validate.py --log validation.log
 """
 
+# Standalone command-line script, not an importable package.
+# ruff: noqa: INP001
+
 from __future__ import annotations
 
 import argparse
@@ -11,7 +14,6 @@ import importlib
 import importlib.metadata
 import math
 import os
-from pathlib import Path
 import platform
 import re
 import shlex
@@ -20,9 +22,16 @@ import sys
 import time
 import tomllib
 import traceback
+from pathlib import Path
 from typing import TextIO
 
 ROOT = Path(__file__).resolve().parents[1]
+CHECKED_PYTHON_FILES = [
+    "src/labor_cost_optimization/att.py",
+    "tests/test_att.py",
+    "tests/test_validate.py",
+    "scripts/validate.py",
+]
 
 # Keep diagnostics runnable when even the development dependencies are missing.
 try:
@@ -35,13 +44,17 @@ except ImportError:
 
 def emit(message: str, log: TextIO) -> None:
     """Write the same message to the terminal and the validation log."""
-    print(message, flush=True)
+    sys.stdout.write(message + "\n")
+    sys.stdout.flush()
     log.write(message + "\n")
     log.flush()
 
 
 def requirement_report(
-    requirement: object, log: TextIO, *, development: bool = False
+    requirement: object,
+    log: TextIO,
+    *,
+    development: bool = False,
 ) -> bool:
     """Check a distribution against a PEP 508 dependency requirement.
 
@@ -87,7 +100,8 @@ def requirement_report(
         actual = "NOT INSTALLED"
     if parsed.url is not None:
         emit(
-            f"{prefix}{parsed.name}: {actual}; direct reference; provenance UNVERIFIED.",
+            f"{prefix}{parsed.name}: {actual}; "
+            "direct reference; provenance UNVERIFIED.",
             log,
         )
         return False
@@ -136,7 +150,10 @@ def environment_report(log: TextIO) -> bool:
     if SpecifierSet is None:
         emit("Python requirement UNVERIFIED: packaging is not installed.", log)
     elif not isinstance(required_python, str):
-        emit("Python requirement UNVERIFIED: requires-python is missing or invalid.", log)
+        emit(
+            "Python requirement UNVERIFIED: requires-python is missing or invalid.",
+            log,
+        )
     else:
         try:
             specifier = SpecifierSet(required_python)
@@ -155,10 +172,18 @@ def environment_report(log: TextIO) -> bool:
     for args in (["rev-parse", "HEAD"], ["status", "--short", "--branch"]):
         try:
             result = subprocess.run(
-                ["git", *args], cwd=ROOT, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=10,
+                ["git", *args],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
             )
-            emit(f"git {' '.join(args)}:\n{result.stdout or result.stderr}".rstrip(), log)
+            emit(
+                f"git {' '.join(args)}:\n{result.stdout or result.stderr}".rstrip(),
+                log,
+            )
         except (OSError, subprocess.TimeoutExpired) as exc:
             emit(f"Git metadata unavailable: {exc}", log)
     return matches
@@ -187,15 +212,25 @@ def run_check(label: str, command: list[str], log: TextIO, timeout: float) -> bo
     environment["PYTHONUNBUFFERED"] = "1"
     try:
         result = subprocess.run(
-            command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
             env=environment,
         )
         output = result.stdout
         exit_code = result.returncode
     except subprocess.TimeoutExpired as exc:
         captured = exc.stdout or b""
-        output = captured.decode("utf-8", errors="replace") if isinstance(captured, bytes) else captured
+        output = (
+            captured.decode("utf-8", errors="replace")
+            if isinstance(captured, bytes)
+            else captured
+        )
         output += f"\nTIMEOUT after {timeout:g} seconds."
         exit_code = 124
     except OSError as exc:
@@ -221,11 +256,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log", type=Path, default=ROOT / "validation.log")
     parser.add_argument(
-        "--tests-only", action="store_true",
-        help="Skip formatting, lint, type, and spelling checks; still verify environment and imports.",
+        "--tests-only",
+        action="store_true",
+        help=(
+            "Skip formatting, lint, type, and spelling checks; "
+            "still verify environment and imports."
+        ),
     )
     parser.add_argument(
-        "--timeout", type=float, default=600,
+        "--timeout",
+        type=float,
+        default=600,
         help="Maximum seconds per check (default: 600).",
     )
     args = parser.parse_args()
@@ -233,7 +274,9 @@ def main() -> int:
         parser.error("--timeout must be positive and finite")
     log_path = args.log.expanduser().resolve()
     if log_path.suffix.lower() != ".log":
-        parser.error("--log must have a .log suffix to protect source and configuration files")
+        parser.error(
+            "--log must have a .log suffix to protect source and configuration files",
+        )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
         emit("Labor cost optimization validation", log)
@@ -256,32 +299,51 @@ def main() -> int:
             "'Installed estimator differs from this checkout; reinstall the project')"
         )
         checks = [
-            ("Installed package and source", [
-                sys.executable, "-c", source_check,
-                str(ROOT / "src" / "labor_cost_optimization" / "att.py"),
-            ]),
-            ("Numerical and behavioral tests", [
-                sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v",
-            ]),
+            (
+                "Installed package and source",
+                [
+                    sys.executable,
+                    "-c",
+                    source_check,
+                    str(ROOT / "src" / "labor_cost_optimization" / "att.py"),
+                ],
+            ),
+            (
+                "Numerical and behavioral tests",
+                [sys.executable, "-m", "pytest", "tests", "-v"],
+            ),
         ]
         if not args.tests_only:
-            sources = ["src", "tests", "scripts"]
-            spelling_files = [
-                str(path.relative_to(ROOT))
-                for directory in sources
-                for path in sorted((ROOT / directory).rglob("*.py"))
-            ]
-            checks.extend([
-                ("Ruff formatting", [
-                    sys.executable, "-m", "ruff", "format", "--check", *sources,
-                ]),
-                ("Ruff lint", [sys.executable, "-m", "ruff", "check", *sources]),
-                ("Mypy", [sys.executable, "-m", "mypy", *sources]),
-                ("Spelling", [
-                    sys.executable, "-m", "codespell", "--ignore-words-list=ure,missings",
-                    *spelling_files, "README.md", "att.md",
-                ]),
-            ])
+            sources = CHECKED_PYTHON_FILES
+            checks.extend(
+                [
+                    (
+                        "Ruff formatting",
+                        [
+                            sys.executable,
+                            "-m",
+                            "ruff",
+                            "format",
+                            "--check",
+                            *sources,
+                        ],
+                    ),
+                    ("Ruff lint", [sys.executable, "-m", "ruff", "check", *sources]),
+                    ("Mypy", [sys.executable, "-m", "mypy", *sources]),
+                    (
+                        "Spelling",
+                        [
+                            sys.executable,
+                            "-m",
+                            "codespell",
+                            "--ignore-words-list=ure,missings",
+                            *sources,
+                            "README.md",
+                            "att.md",
+                        ],
+                    ),
+                ],
+            )
         for label, command in checks:
             results.append((label, run_check(label, command, log, args.timeout)))
         emit("\n=== Summary ===", log)
