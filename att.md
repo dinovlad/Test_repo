@@ -1,6 +1,6 @@
 **Implementation specification: unpooled continuous-dose ATT and dose-specific event-study aggregation.**
 
-This document specifies a future self-contained Python module, `att.py`. It does not implement that module. The design uses one fully interacted PyFixest OLS model on stacked cohort-time comparisons, with separate coefficients and a saved spline basis for every comparison. Its point estimates reproduce the parametric `contdid` calculation on the same samples and bases, and a separate Gaussian-kernel function estimates conditional cohort weights. It estimates the effect of each store's first recorded termination, with at most one target event per store. Event selection and control selection are extensions to the article's design; the stacked regression is an algebraically equivalent parameterization of the reference point-estimation calculation. The module evaluates every integer horizon in the isolation window: post-treatment effects, pre-treatment placebo contrasts, and the reference period. All estimates are point estimates.
+This document specifies the self-contained Python module [att.py](att.py). The design uses one fully interacted PyFixest OLS model on stacked cohort-time comparisons, with separate coefficients and a saved spline basis for every comparison. Its point estimates reproduce the parametric `contdid` calculation on the same samples and bases, and a separate Gaussian-kernel function estimates conditional cohort weights. It estimates the effect of each store's first recorded termination, with at most one target event per store. Event selection and control selection are extensions to the article's design; the stacked regression is an algebraically equivalent parameterization of the reference point-estimation calculation. The module evaluates every integer horizon in the isolation window: post-treatment effects, pre-treatment placebo contrasts, and the reference period. All estimates are point estimates.
 
 **Periods and frequency.** The frequency is hardcoded to one calendar day. A period means one step at that fixed frequency. There is no frequency parameter or support for monthly or annual inputs. Input and output period labels are timezone-naive `datetime64[ns]` values normalized to the start of each period. All event-time offsets, isolation bounds, baseline comparisons, and dose units have a daily interpretation.
 
@@ -493,7 +493,7 @@ Raises:
 """
 ```
 
-When the Python implementation is written, verify these behaviors with targeted examples:
+The validation suite in [tests/test_att.py](tests/test_att.py) checks the implementation against independent numerical calculations and targeted examples. Required behaviors include:
 
 - All four column-name arguments are required; omitting any one raises `TypeError` at construction. No conventional input labels or internal schema names supply defaults. Renaming every input column through the constructor leaves results unchanged, using the same `firm_col` and `period_col` labels in both tables. Inputs missing either shared column fail validation; `outcome_col` and `dose_col` may share a label across the two tables.
 - `fit()` has no `event_times` argument and generates `list(range(-7, 15))` for `(-7, 14)`. Default prediction and aggregation include all 22 horizons; explicit subsets may include negative periods, and out-of-window requests fail.
@@ -520,7 +520,7 @@ When the Python implementation is written, verify these behaviors with targeted 
 - Weights count each selected store once, sum to one, reflect unequal cohort sizes, and match the explicit formula. A within-cohort excluded event cannot leak back into the weights.
 - Aggregation equals a manual weighted sum for both post-treatment and placebo horizons, reports store counts and estimate types, identifies the retained population, and rejects any requested horizon with a missing required cell, including a reference cell with no controls.
 
-The deliverable is this specification. Future inference must cluster or resample by store, carrying its selected event, full termination history, and outcomes together, and account for shared controls, estimated weights, smoothing, and selection. Clustering handles dependence; it does not fix contaminated controls or justify the identifying assumption. Store-level independence and an adequate number of independent stores would still require assessment.
+The implementation provides point estimates through `ATT`, `estimate_pi()`, and `evaluate_theta()`. Future inference must cluster or resample by store, carrying its selected event, full termination history, and outcomes together, and account for shared controls, estimated weights, smoothing, and selection. Clustering handles dependence; it does not fix contaminated controls or justify the identifying assumption. Store-level independence and an adequate number of independent stores would still require assessment.
 
 ## References
 
