@@ -1,6 +1,7 @@
 # Continuous-dose ATT
 
-A self-contained Python 3.11 module for fixed-dose event studies. `ATT` fits one
+A Python 3.11 package with its estimator in the self-contained module
+`src/labor_cost_optimization/att.py`, for fixed-dose event studies. `ATT` fits one
 PyFixest model with separate coefficients for each cohort and horizon.
 `estimate_pi()` estimates dose-specific cohort weights; `evaluate_theta()`
 aggregates cohort effects at each dose and horizon.
@@ -9,13 +10,12 @@ Install the pinned environment:
 
 ```bash
 uv sync --python 3.11 --group dev
-source .venv/bin/activate
 ```
 
 Supply outcome and termination DataFrames and explicitly name their columns:
 
 ```python
-from att import ATT, evaluate_theta
+from labor_cost_optimization.att import ATT, evaluate_theta
 
 model = ATT(
     firm_col=firm_col,
@@ -41,12 +41,41 @@ Estimates have no standard errors or confidence intervals. The identifying
 assumptions, selected populations, diagnostics, and API are described in
 [att.md](att.md).
 
-Run the numerical checks and repository hooks:
+Run validation from the repository root and share `validation.log` here:
 
 ```bash
-python -m unittest discover -s tests
-pre-commit run --all-files
+uv sync --python 3.11 --group dev
+uv run --no-sync python scripts/validate.py --log validation.log
 ```
+
+If your environment is already activated and the project is installed, run:
+
+```bash
+python scripts/validate.py --log validation.log
+```
+
+The script records Python and dependency versions, the imported estimator's
+source, all numerical tests, and formatting, lint, type, and spelling checks.
+It continues after failures, saves tracebacks and command exit codes, and exits
+nonzero if any requested check fails. It installs nothing and does not modify
+source files. The default timeout is 600 seconds per check; override it with
+`--timeout`. Use `--tests-only` to skip the code-quality checks.
+
+The tests use synthetic data and compare the real PyFixest model against
+independent least-squares calculations. They cover saved splines, cohort weights,
+aggregation, missing periods, isolation, duplicate events, zero effects, and
+failed-fit handling. A run with different Python or runtime package versions is
+marked as a mismatch even if its numerical tests pass.
+
+To run individual checks directly:
+
+```bash
+uv run --no-sync python -m unittest discover -s tests -v
+uv run --no-sync pre-commit run --all-files
+```
+
+The pre-commit hooks apply formatting and lint fixes; the validation script's
+quality checks are read-only.
 
 ## Agent Rules and Skills
 
