@@ -25,6 +25,7 @@ import traceback
 from pathlib import Path
 from typing import TextIO
 
+
 ROOT = Path(__file__).resolve().parents[1]
 CHECKED_PYTHON_FILES = [
     "src/labor_cost_optimization/att.py",
@@ -226,11 +227,7 @@ def run_check(label: str, command: list[str], log: TextIO, timeout: float) -> bo
         exit_code = result.returncode
     except subprocess.TimeoutExpired as exc:
         captured = exc.stdout or b""
-        output = (
-            captured.decode("utf-8", errors="replace")
-            if isinstance(captured, bytes)
-            else captured
-        )
+        output = captured.decode("utf-8", errors="replace") if isinstance(captured, bytes) else captured
         output += f"\nTIMEOUT after {timeout:g} seconds."
         exit_code = 124
     except OSError as exc:
@@ -288,6 +285,18 @@ def main() -> int:
             emit("Environment reporting failed:\n" + traceback.format_exc(), log)
             environment_ok = False
         results = [("Runtime requirements", environment_ok)]
+        required_docs = [] if args.tests_only else ["README.md", "att.md"]
+        sources = [path for path in CHECKED_PYTHON_FILES if (ROOT / path).is_file()]
+        documents = [path for path in required_docs if (ROOT / path).is_file()]
+        missing = [path for path in [*CHECKED_PYTHON_FILES, *required_docs] if not (ROOT / path).is_file()]
+        results.append(("Required validation files", not missing))
+        if missing:
+            emit("Missing required validation files:\n" + "\n".join(missing), log)
+            emit(
+                "Copy the listed files from cgbs-att into this checkout. "
+                "Checks on available files will continue; overall validation will fail.",
+                log,
+            )
         source_check = (
             "import hashlib; from pathlib import Path; import sys; "
             "import labor_cost_optimization.att as module; "
@@ -313,8 +322,7 @@ def main() -> int:
                 [sys.executable, "-m", "pytest", "tests", "-v"],
             ),
         ]
-        if not args.tests_only:
-            sources = CHECKED_PYTHON_FILES
+        if not args.tests_only and sources:
             checks.extend(
                 [
                     (
@@ -338,11 +346,15 @@ def main() -> int:
                             "codespell",
                             "--ignore-words-list=ure,missings",
                             *sources,
-                            "README.md",
-                            "att.md",
+                            *documents,
                         ],
                     ),
                 ],
+            )
+        elif not args.tests_only:
+            emit(
+                "Quality checks skipped: no expected Python files are present.",
+                log,
             )
         for label, command in checks:
             results.append((label, run_check(label, command, log, args.timeout)))
