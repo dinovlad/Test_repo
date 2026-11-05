@@ -56,6 +56,10 @@ python scripts/validate.py --log validation.log
 
 The script records Python and dependency versions, the imported estimator's
 source, all numerical tests, and formatting, lint, type, and spelling checks.
+It reads Python and dependency constraints from your `pyproject.toml`, including
+exact pins, ranges, unversioned dependencies, extras, and environment markers.
+Version checks use `packaging` when available; missing parsing support or
+unverifiable direct references are reported without aborting the other checks.
 It continues after failures, saves tracebacks and command exit codes, and exits
 nonzero if any requested check fails. It installs nothing and does not modify
 source files. The default timeout is 600 seconds per check; override it with
@@ -64,8 +68,8 @@ source files. The default timeout is 600 seconds per check; override it with
 The tests use synthetic data and compare the real PyFixest model against
 independent least-squares calculations. They cover saved splines, cohort weights,
 aggregation, missing periods, isolation, duplicate events, zero effects, and
-failed-fit handling. A run with different Python or runtime package versions is
-marked as a mismatch even if its numerical tests pass.
+failed-fit handling. A run that does not satisfy the configured Python or runtime
+package requirements is marked as a mismatch even if its numerical tests pass.
 
 To run individual checks directly:
 

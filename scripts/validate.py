@@ -7,19 +7,30 @@ Run from an environment containing the project and its development dependencies:
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.metadata
 import math
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import subprocess
 import sys
 import time
 import tomllib
+import traceback
 from typing import TextIO
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Keep diagnostics runnable when even the development dependencies are missing.
+try:
+    Requirement = importlib.import_module("packaging.requirements").Requirement
+    SpecifierSet = importlib.import_module("packaging.specifiers").SpecifierSet
+except ImportError:
+    Requirement = None
+    SpecifierSet = None
 
 
 def emit(message: str, log: TextIO) -> None:
@@ -29,42 +40,118 @@ def emit(message: str, log: TextIO) -> None:
     log.flush()
 
 
+def requirement_report(
+    requirement: object, log: TextIO, *, development: bool = False
+) -> bool:
+    """Check a distribution against a PEP 508 dependency requirement.
+
+    Args:
+        requirement:
+            Requirement from project metadata, with optional extras and markers.
+        log:
+            Open UTF-8 output log.
+        development:
+            Whether to label the entry as a development tool.
+
+    Returns:
+        Whether an applicable requirement's installed distribution version
+        satisfies its constraint, or its marker makes it inapplicable. Extras
+        are accepted but their transitive dependencies are not checked here.
+        Invalid or unverified requirements return False without stopping checks.
+    """
+    prefix = "Development tool " if development else ""
+    if not isinstance(requirement, str):
+        emit(f"{prefix}UNVERIFIED: dependency entry is not a requirement string.", log)
+        return False
+    if Requirement is None:
+        match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
+        name = match.group(1) if match else "unknown distribution"
+        try:
+            actual = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            actual = "NOT INSTALLED"
+        emit(f"{prefix}{name}: {actual}; UNVERIFIED without packaging.", log)
+        return False
+    try:
+        parsed = Requirement(requirement)
+        if parsed.marker is not None and not parsed.marker.evaluate({"extra": ""}):
+            emit(f"{prefix}{parsed.name}: SKIP (environment marker is false).", log)
+            return True
+    except Exception:
+        # Parser exceptions can contain private URLs from the original string.
+        emit(f"{prefix}INVALID dependency requirement; continuing validation.", log)
+        return False
+    try:
+        actual = importlib.metadata.version(parsed.name)
+    except importlib.metadata.PackageNotFoundError:
+        actual = "NOT INSTALLED"
+    if parsed.url is not None:
+        emit(
+            f"{prefix}{parsed.name}: {actual}; direct reference; provenance UNVERIFIED.",
+            log,
+        )
+        return False
+    expected = str(parsed.specifier) or "any installed version"
+    if actual == "NOT INSTALLED":
+        ok = False
+    else:
+        try:
+            ok = not parsed.specifier or parsed.specifier.contains(actual)
+        except Exception:
+            emit(f"{prefix}{parsed.name}: {actual}; INVALID installed version.", log)
+            return False
+    emit(
+        f"{prefix}{parsed.name}: {actual}; required {expected}; "
+        f"{'OK' if ok else 'MISMATCH'}",
+        log,
+    )
+    return bool(ok)
+
+
 def environment_report(log: TextIO) -> bool:
-    """Report interpreter and dependency versions without importing the estimator.
+    """Report whether the configured runtime requirements are satisfied.
 
     Args:
         log:
             Open UTF-8 output log.
 
     Returns:
-        Whether Python and all pinned runtime packages match the project settings.
-        Missing development tools are reported and checked by later commands.
+        Whether Python and applicable runtime distributions satisfy the project
+        metadata. Development tools are reported separately. The optional
+        packaging library interprets ranges, markers, extras, and version rules;
+        without it, verification is marked incomplete and other checks continue.
     """
-    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     emit(f"Python: {sys.version.replace(chr(10), ' ')}", log)
     emit(f"Interpreter: {sys.executable}", log)
     emit(f"Platform: {platform.platform()}", log)
     emit(f"Repository: {ROOT}", log)
-    emit(f"Required Python: {config['project']['requires-python']}", log)
-    matches = sys.version_info[:2] == (3, 11)
-    if not matches:
-        emit("MISMATCH: this run does not use the project's Python 3.11 target.", log)
-    for requirement in config["project"]["dependencies"]:
-        name, expected = requirement.split("==", maxsplit=1)
+    try:
+        config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        emit(f"UNVERIFIED: cannot read project metadata ({type(exc).__name__}).", log)
+        return False
+    project = config.get("project", {})
+    required_python = project.get("requires-python")
+    matches = False
+    if SpecifierSet is None:
+        emit("Python requirement UNVERIFIED: packaging is not installed.", log)
+    elif not isinstance(required_python, str):
+        emit("Python requirement UNVERIFIED: requires-python is missing or invalid.", log)
+    else:
         try:
-            actual = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            actual = "NOT INSTALLED"
-        ok = actual == expected
+            specifier = SpecifierSet(required_python)
+            matches = specifier.contains(platform.python_version())
+            emit(
+                f"Required Python: {specifier}; {'OK' if matches else 'MISMATCH'}",
+                log,
+            )
+        except Exception:
+            emit("INVALID requires-python constraint; continuing validation.", log)
+    for requirement in project.get("dependencies", []):
+        ok = requirement_report(requirement, log)
         matches = matches and ok
-        emit(f"{name}: {actual}; required {expected}; {'OK' if ok else 'MISMATCH'}", log)
-    for requirement in config["dependency-groups"]["dev"]:
-        name = requirement.split(">=", maxsplit=1)[0]
-        try:
-            actual = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            actual = "NOT INSTALLED"
-        emit(f"Development tool {name}: {actual}", log)
+    for requirement in config.get("dependency-groups", {}).get("dev", []):
+        requirement_report(requirement, log, development=True)
     for args in (["rev-parse", "HEAD"], ["status", "--short", "--branch"]):
         try:
             result = subprocess.run(
@@ -128,7 +215,7 @@ def main() -> int:
     """Run environment, numerical, and optional code-quality checks.
 
     Returns:
-        Zero only when every requested check passes in the pinned environment.
+        Zero only when every requested check passes and runtime requirements match.
         Nonzero results still leave a complete diagnostic log to share.
     """
     parser = argparse.ArgumentParser(description=__doc__)
@@ -152,7 +239,12 @@ def main() -> int:
         emit("Labor cost optimization validation", log)
         emit("Each command's output is printed after it finishes or times out.", log)
         emit("No packages are installed and source files are not reformatted.", log)
-        results = [("Pinned runtime environment", environment_report(log))]
+        try:
+            environment_ok = environment_report(log)
+        except Exception:
+            emit("Environment reporting failed:\n" + traceback.format_exc(), log)
+            environment_ok = False
+        results = [("Runtime requirements", environment_ok)]
         source_check = (
             "import hashlib; from pathlib import Path; import sys; "
             "import labor_cost_optimization.att as module; "
