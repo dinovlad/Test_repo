@@ -1,8 +1,8 @@
 **Implementation specification: unpooled continuous-dose ATT and dose-specific event-study aggregation.**
 
-This document specifies a future self-contained Python module, `att.py`. It does not implement that module. The design uses independent cohort-time regressions following the parametric `contdid` calculation, retains each fitted spline basis for prediction, and estimates conditional cohort weights with a separate Gaussian-kernel function. It estimates the effect of each store's first recorded termination, with at most one target event per store. Event selection and control selection are extensions to the article's design; the regression calculation remains the reference calculation. The module evaluates every integer horizon in the isolation window: post-treatment effects, pre-treatment placebo contrasts, and the reference period. All estimates in the first version are point estimates.
+This document specifies a future self-contained Python module, `att.py`. It does not implement that module. The design uses independent cohort-time regressions following the parametric `contdid` calculation, retains each fitted spline basis for prediction, and estimates conditional cohort weights with a separate Gaussian-kernel function. It estimates the effect of each store's first recorded termination, with at most one target event per store. Event selection and control selection are extensions to the article's design; the regression calculation remains the reference calculation. The module evaluates every integer horizon in the isolation window: post-treatment effects, pre-treatment placebo contrasts, and the reference period. All estimates are point estimates.
 
-**Period naming and current frequency.** The frequency remains hardcoded to one calendar day. A period means one step at that fixed frequency; the naming change introduces no frequency parameter or support for monthly or annual inputs. Input and output period labels remain timezone-naive `datetime64[ns]` values normalized to the start of each period. All event-time offsets, isolation bounds, baseline comparisons, and dose units retain their existing daily interpretation.
+**Periods and frequency.** The frequency is hardcoded to one calendar day. A period means one step at that fixed frequency. There is no frequency parameter or support for monthly or annual inputs. Input and output period labels are timezone-naive `datetime64[ns]` values normalized to the start of each period. All event-time offsets, isolation bounds, baseline comparisons, and dose units have a daily interpretation.
 
 The public API consists of one class and two functions. In this example, `firm_col`, `period_col`, `outcome_col`, and `dose_col` are caller-supplied strings naming columns in the input tables; all four must be provided:
 
@@ -96,7 +96,7 @@ E[Y^{\mathrm{keep}}_{i,t}-Y^{\mathrm{keep}}_{i,g-1}
 =E[Y_{s,t}-Y_{s,g-1}\mid s\in\mathcal C_{g,e}].
 $$
 
-The right-hand expectation weights control stores equally. This is an assumption for the selected events and their observed comparison stores, not a result implied by distance between terminations. Earlier terminations may leave persistent level effects that difference out; changing carryover effects must still be compatible with this restriction. The first version has no covariate or treatment-history adjustment to repair a failure of that assumption.
+The right-hand expectation weights control stores equally. This is an assumption for the selected events and their observed comparison stores, not a result implied by distance between terminations. Earlier terminations may leave persistent level effects that difference out; changing carryover effects must still be compatible with this restriction. The module has no covariate or treatment-history adjustment to repair a failure of that assumption.
 
 Selection on later terminations and on observed outcomes uses post-event information and may itself be affected by the focal event. Identification is asserted only under the stated restriction for the selected population. In particular, excluding stores after closure does not recover a treatment effect that includes their subsequent sales or closure consequences. Generalizing to all isolated events requires additional assumptions or a different outcome definition. The target is not a population guaranteed to remain isolated and observed under both counterfactual regimes. Parametric estimation also requires an adequate specification of each comparison's dose curve and relevant dose support. Strong parallel trends is not assumed, and slopes across doses are not interpreted as causal marginal responses.
 
@@ -110,7 +110,7 @@ $$
 
 At every horizon, subtract sales in period $g-1$ from sales in period $g+e$. Thus $e=-7$ uses $Y_{g-7}-Y_{g-1}$. Here, the treated sample means membership in the future termination cohort; those stores have not yet experienced the focal termination.
 
-These pre-treatment contrasts are placebo diagnostics. Under no anticipation and the pre-period counterpart of the selected-sample PT restriction above, their population values are zero. Post-treatment PT alone does not establish that implication. Estimate them freely rather than forcing them to zero; finite-sample nonzero values are not themselves causal effects of a termination that has not occurred. Formal testing and inference remain outside this version.
+These pre-treatment contrasts are placebo diagnostics. Under no anticipation and the pre-period counterpart of the selected-sample PT restriction above, their population values are zero. Post-treatment PT alone does not establish that implication. Estimate them freely rather than forcing them to zero; finite-sample nonzero values are not themselves causal effects of a termination that has not occurred. Formal testing and inference are outside the scope of this module.
 
 At $e=-1$, both periods are $g-1$, so the outcome changes and their contrast are exactly zero. This is the event study's reference normalization, not an independently estimated pre-treatment effect. It must not be interpreted as evidence for PT.
 
@@ -132,9 +132,9 @@ $$
 =\sum_{g\in\mathcal G_e}\pi_g(e,d)\thinspace{}\tau_{g,e}(d).
 $$
 
-The reported `estimate_type` is `att` for $e\ge0$, `placebo` for $e\le-2$, and `reference` for $e=-1$. For negative horizons, the existing numeric column names `att` and `theta` contain these diagnostics or the zero reference, not post-treatment causal ATT estimates. Provided the reference population passes the bookkeeping checks below, its aggregation is exactly zero at every requested dose.
+The reported `estimate_type` is `att` for $e\ge0$, `placebo` for $e\le-2$, and `reference` for $e=-1$. For negative horizons, the numeric columns `att` and `theta` contain these diagnostics or the zero reference, not post-treatment causal ATT estimates. Provided the reference population passes the bookkeeping checks below, its aggregation is exactly zero at every requested dose.
 
-**Relationship to the article.** Callaway et. al. (2025) provide the starting point. With stores as units and one selected termination per store, the treatment-label structure now matches one adoption period and fixed dose per unit. The isolation screen, observed-outcome selection, and comparison-store rule still require the distinctions below.
+**Relationship to the article.** Callaway et. al. (2025) provide the starting point. With stores as units and one selected termination per store, the treatment-label structure matches one adoption period and fixed dose per unit. The isolation screen, observed-outcome selection, and comparison-store rule require the distinctions below.
 
 | Feature | Article's staggered-adoption setting | This plan |
 | --- | --- | --- |
@@ -205,7 +205,7 @@ A design-eligible target event has $1-L\le G_i\le T-H$; actual endpoint observat
 
 The inferred coverage interval runs from the earliest to the latest normalized outcome period over the entire panel. Assume the event table is complete for every outcome store throughout that interval, including stores with no recorded terminations and periods when a store is closed or inactive. Completeness cannot be verified from the outcome panel or the presence of individual event records. Preserve all supplied terminations for first-event selection and history screening, including those during missing outcome periods, outside the panel, overlapping other events, or excluded from estimation. Extra event records do not relax the requirement that the full isolation interval lies inside the outcome panel bounds.
 
-Runtime dependencies are NumPy, pandas, PyFixest, SciPy, and the Python standard library. Exact runtime pins and development-tool requirements are declared in [pyproject.toml](pyproject.toml). The project requires Python 3.11; [.python-version](.python-version) selects that interpreter for tools such as uv. The first version covers outcomes per period with missing store-periods allowed, equal treated-event weights within each regression, equal control-store weights, no anticipation, post-treatment level estimates, and pre-treatment placebo diagnostics. Covariates, inference, plotting, treatment slopes, and changing the dose within an event are outside this initial scope.
+Runtime dependencies are NumPy, pandas, PyFixest, SciPy, and the Python standard library. Exact runtime pins and development-tool requirements are declared in [pyproject.toml](pyproject.toml). The project requires Python 3.11; [.python-version](.python-version) selects that interpreter for tools such as uv. The module covers outcomes per period with missing store-periods allowed, equal treated-event weights within each regression, equal control-store weights, no anticipation, post-treatment level estimates, and pre-treatment placebo diagnostics. Covariates, inference, plotting, treatment slopes, and changing the dose within an event are outside this scope.
 
 Use the supplied [.pre-commit-config.yaml](.pre-commit-config.yaml) for spelling, formatting, lint, and type checks on Python, Markdown, and notebooks. The hooks use system executables, so activate the development environment before installing or running them:
 
@@ -285,7 +285,7 @@ For a reference cell passing those checks, save its fitted basis definition, sam
 
 **Fitted basis and knots.** Let $q$ be the degree and $K$ the number of internal knots. The regression has $p=q+K+1$ columns, including the intercept. Defaults $q=3,K=0$ give a cubic polynomial expressed in a B-spline basis.
 
-For $K>0$, choose shared internal knots once using the positive doses from one row per design-eligible store, before endpoint-availability and small-sample screening. A store contributes once even if it is observed at several requested horizons. Use quantiles at $k/(K+1)$, $k=1,\ldots,K$, with linear interpolation matching R's default quantile convention. This retains the package's global knot-selection structure, now applied to the eligible event population. Keep the selected knots fixed after screening. [Setup source](https://github.com/bcallaway11/contdid/blob/main/R/setup_pte_cont.R), [quantile helper](https://github.com/bcallaway11/contdid/blob/main/R/helper_functions.R)
+For $K>0$, choose shared internal knots once using the positive doses from one row per design-eligible store, before endpoint-availability and small-sample screening. A store contributes once even if it is observed at several requested horizons. Use quantiles at $k/(K+1)$, $k=1,\ldots,K$, with linear interpolation matching R's default quantile convention. This uses the package's global knot-selection structure, applied to the eligible event population. Keep the selected knots fixed after screening. [Setup source](https://github.com/bcallaway11/contdid/blob/main/R/setup_pte_cont.R), [quantile helper](https://github.com/bcallaway11/contdid/blob/main/R/helper_functions.R)
 
 For each `(cohort, event_time)` comparison, use the minimum and maximum doses among its endpoint-observed treated stores as boundary knots. Build and store the resulting basis definition: degree, internal knots, repeated boundary knots, and retained-column convention. A SciPy `BSpline` representation can evaluate that saved basis. Construct the full basis, omit its first column, and add an explicit intercept, consistent with the R parameterization. [B-spline conventions](https://wwenjie.org/splines2/reference/bspline)
 
@@ -295,7 +295,7 @@ For non-reference comparisons, `predict()` must evaluate the fitted basis withou
 
 For non-reference comparisons, allow polynomial continuation outside the observed dose range, issue an extrapolation warning, and flag those rows. Do not clip doses, discard cohorts at particular doses, or renormalize weights because of extrapolation. Such values rely on the fitted functional form beyond observed support.
 
-**Small-sample screening and dropping.** `min_cohort_size=None` resolves to the minimum sample size permitted by this design. Let $p=q+K+1$ be the number of regression columns, including the intercept. The design retains its requirement of positive residual degrees of freedom, so its sample-size floor is $p+1$. Full-column-rank OLS alone algebraically requires only $p$ observations; the extra observation is this module's design rule, not an identification threshold supplied by the article.
+**Small-sample screening and dropping.** `min_cohort_size=None` resolves to the minimum sample size permitted by this design. Let $p=q+K+1$ be the number of regression columns, including the intercept. The design requires positive residual degrees of freedom, so its sample-size floor is $p+1$. Full-column-rank OLS alone algebraically requires only $p$ observations; the extra observation is this module's design rule, not an identification threshold supplied by the article.
 
 If the caller supplies a positive integer minimum, denote it by $n_{\mathrm{user}}$. Resolve the effective threshold as
 
@@ -311,7 +311,7 @@ Thus `degree=3`, `num_knots=0`, and `min_cohort_size=None` give $p=4$ and an eff
 
 Count each observed treated store once; outcome rows and additional termination records do not increase the sample size. Require at least $p$ distinct doses and full column rank under a consistent documented numerical tolerance. The rank check is necessary even if the distinct-dose check passes.
 
-For each nonempty treated comparison failing sample size, dose support, rank, or knot compatibility, warn with its cohort period, event period, store count, distinct-dose count, design dimension, and reason. Record the failure in `cell_diagnostics_`. Drop that cohort only at the affected horizon. This replaces the previous rule that dropped a cohort at every horizon: missing endpoints can make one comparison fail while another remains estimable. Do not reduce degree, remove knots, or pool cohorts to rescue a fit.
+For each nonempty treated comparison failing sample size, dose support, rank, or knot compatibility, warn with its cohort period, event period, store count, distinct-dose count, design dimension, and reason. Record the failure in `cell_diagnostics_`. Drop that cohort only at the affected horizon. Missing endpoints can make one comparison fail while another remains estimable. Do not reduce degree, remove knots, or pool cohorts to rescue a fit.
 
 Keep every distinct termination period of every excluded store in `termination_history_`. That store can still be a control in other clean comparisons with observed endpoints. Exclusion must never erase a termination from history screening.
 
@@ -365,7 +365,7 @@ Each supplied store contributes exactly once. Do not count outcome rows, additio
 
 Return `cohort`, `dose`, and `weight`, sorted by normalized cohort period and dose. No event-time argument is needed: supplying a different eligible-event set supplies the horizon dependence. The function can also inspect sensitivity to dose and bandwidth.
 
-This is a custom estimator of conditional cohort probabilities. The article does not prescribe this kernel or bandwidth, and the package's existing dose aggregation does not supply these conditional weights. A positive bandwidth smooths cohort composition over nearby doses; consistency for exact conditional probabilities requires suitable smoothness, bandwidth, and sample-size conditions. Each store supplies only one dose/cohort observation to this calculation. Automatic bandwidth selection is outside the first version.
+This is a custom estimator of conditional cohort probabilities. The article does not prescribe this kernel or bandwidth, and the package's existing dose aggregation does not supply these conditional weights. A positive bandwidth smooths cohort composition over nearby doses; consistency for exact conditional probabilities requires suitable smoothness, bandwidth, and sample-size conditions. Each store supplies only one dose/cohort observation to this calculation. Automatic bandwidth selection is outside the scope of this module.
 
 **Thin extension for evaluating the event study.** A standalone function is sufficient; no second estimator class or inheritance hierarchy is needed:
 
@@ -458,7 +458,7 @@ When the Python implementation is written, verify these behaviors with targeted 
 - `fit()` has no `event_times` argument and generates `list(range(-7, 15))` for `(-7, 14)`. Default prediction and aggregation include all 22 horizons; explicit subsets may include negative periods, and out-of-window requests fail.
 - The signed window `(-7, 14)` screens exactly from $g-7$ through $g+14$, including both boundaries; `(7, 14)` is rejected. Check the panel-bound conditions $g+L\ge1$ and $g+H\le T$.
 - `min_cohort_size=None` resolves to $p+1$ for the configured degree and knot count; a smaller explicit minimum cannot bypass that floor, while a larger one is enforced. The default cubic design resolves to five.
-- The naming change preserves the hardcoded daily frequency and `datetime64[ns]` input/output types; it introduces no frequency inference, configurable frequency, or additional frequency support.
+- Frequency is hardcoded daily, with `datetime64[ns]` input/output types. There is no frequency inference, configurable frequency, or additional frequency support.
 - Within-period time differences do not affect estimates; same-store within-period duplicates in the outcome table are rejected after normalization, as are `NaT` and timezone-aware inputs. Missing periods are never compressed.
 - Multiple termination rows for a store retain only its earliest normalized-period row and its dose. Same-period ties use original row order; an ineligible first event is not replaced. Check the aggregate log counts, including three dropped rows for two stores in the example, and no duplicate warning when each store has one event row.
 - Later distinct periods dropped from targets still block conflicting controls or isolation windows. Multiple records on the first store-period retain their multiplicity in history and exclude the candidate as overlapping; no later period is promoted.
@@ -475,7 +475,7 @@ When the Python implementation is written, verify these behaviors with targeted 
 - Weights count each selected store once, sum to one, reflect unequal cohort sizes, and match the explicit formula. A within-cohort excluded event cannot leak back into the weights.
 - Aggregation equals a manual weighted sum for both post-treatment and placebo horizons, reports store counts and estimate types, identifies the retained population, and rejects any requested horizon with a missing required cell, including a reference cell with no controls.
 
-Only the specification is delivered now. Future inference must cluster or resample by store, carrying its selected event, full termination history, and outcomes together, and account for shared controls, estimated weights, smoothing, and selection. Clustering handles dependence; it does not fix contaminated controls or justify the identifying assumption. Store-level independence and an adequate number of independent stores would still require assessment.
+The deliverable is this specification. Future inference must cluster or resample by store, carrying its selected event, full termination history, and outcomes together, and account for shared controls, estimated weights, smoothing, and selection. Clustering handles dependence; it does not fix contaminated controls or justify the identifying assumption. Store-level independence and an adequate number of independent stores would still require assessment.
 
 ## References
 
