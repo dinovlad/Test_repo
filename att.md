@@ -420,6 +420,33 @@ The screen is sample-dependent; this description is not an inferential result ab
 
 **Implementation boundaries and validation plan.** Put the class, both public functions, and a few private validation, window-selection, and basis helpers in one `att.py` file. Use `firm` and `period` consistently in all Python identifiers, canonical column names, docstrings, and error/log messages, including private helpers. Use `period_col`, `origin_period_`, `last_period_`, `last_period_index_`, and output column `period`; preserve literal third-party API/type names such as `datetime64[ns]` and `.dt.normalize()`. This plan keeps the application term “store” in explanatory prose; code examples and public schema names follow the general `firm` and `period` terminology. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. No generic estimator framework, serialization layer, or extra classes are needed.
 
+**Docstring convention.** Use Google-style docstrings throughout `att.py`, including the module, `ATT`, its constructor and public methods, both public functions, and private helpers. Start with a concise summary followed by a blank line before any extended description or sections. Use `Args:`, `Returns:`, and `Raises:` where applicable; omit empty or inapplicable sections. Document constructor arguments in `__init__` and fitted public attributes in the class docstring's `Attributes:` section. Simple helpers may use a one-line docstring when no further contract needs explaining.
+
+Indent section contents four spaces relative to the section heading. Wrapped descriptions of named arguments, exceptions, or attributes use an additional four-space hanging indent; plain prose in `Returns:` stays at four spaces. Put each argument name or exception class before a colon, followed by its description. Document every argument except `self` and `cls`, using its exact signature name; type annotations belong in the signature. Explain returned objects and relevant DataFrame schemas, and describe the conditions for exceptions the caller needs to handle. Describe state changes such as `fit()` replacing earlier fitted state and when fitted attributes become available. Keep docstrings consistent with the implemented behavior and use `firm` and `period` throughout. Nonfatal diagnostics emitted by `logging.warning()` are not exceptions and do not belong in `Raises:`.
+
+For example, the `estimate_pi()` docstring follows this layout:
+
+```python
+"""Estimate dose-specific cohort weights for eligible firms.
+
+Args:
+    events: Canonical first-event metadata with firm_id, cohort, and dose
+        columns, containing one row per firm.
+    doses: Distinct positive finite doses at which to evaluate weights.
+    eligible_firms: Unique firm identifiers defining the eligible sample.
+    bandwidth: Positive finite Gaussian-kernel bandwidth in dose units.
+
+Returns:
+    A DataFrame with cohort, dose, and weight columns, sorted by cohort
+    and dose. Weights sum to one at each requested dose.
+
+Raises:
+    ValueError: If the bandwidth is nonpositive or nonfinite, the inputs
+        violate the required schema or eligibility rules, or weight
+        normalization produces nonfinite results.
+"""
+```
+
 When the Python implementation is written, verify these behaviors with targeted examples:
 
 - All four column-name arguments are required; omitting any one raises `TypeError` at construction. No conventional input labels or internal schema names supply defaults. Renaming every input column through the constructor leaves results unchanged, using the same `firm_col` and `period_col` labels in both tables. Inputs missing either shared column fail validation; `outcome_col` and `dose_col` may share a label across the two tables.
