@@ -422,7 +422,7 @@ The screen is sample-dependent; this description is not an inferential result ab
 
 **Docstring convention.** Use Google-style docstrings throughout `att.py`, including the module, `ATT`, its constructor and public methods, both public functions, and private helpers. Start with a concise summary followed by a blank line before any extended description or sections. Use `Args:`, `Returns:`, and `Raises:` where applicable; omit empty or inapplicable sections. Document constructor arguments in `__init__` and fitted public attributes in the class docstring's `Attributes:` section. Simple helpers may use a one-line docstring when no further contract needs explaining.
 
-Indent section contents four spaces relative to the section heading. Wrapped descriptions of named arguments, exceptions, or attributes use an additional four-space hanging indent; plain prose in `Returns:` stays at four spaces. Put each argument name or exception class before a colon, followed by its description. Document every argument except `self` and `cls`, using its exact signature name; type annotations belong in the signature. Explain returned objects and relevant DataFrame schemas, and describe the conditions for exceptions the caller needs to handle. Describe state changes such as `fit()` replacing earlier fitted state and when fitted attributes become available. Keep docstrings consistent with the implemented behavior and use `firm` and `period` throughout. Nonfatal diagnostics emitted by `logging.warning()` are not exceptions and do not belong in `Raises:`.
+Indent argument names, exception classes, and attribute names four spaces relative to the section heading, each followed by a colon on its own line. Start each description on the next line, indented eight spaces, and keep wrapped description lines at that indentation. Plain prose in `Returns:` stays at four spaces. Preserve blank lines between the summary and sections and between successive sections. Document every argument except `self` and `cls`, using its exact signature name; type annotations belong in the signature. Explain returned objects and relevant DataFrame schemas, and describe the conditions for exceptions the caller needs to handle. Describe state changes such as `fit()` replacing earlier fitted state and when fitted attributes become available. Keep docstrings consistent with the implemented behavior and use `firm` and `period` throughout. Nonfatal diagnostics emitted by `logging.warning()` are not exceptions and do not belong in `Raises:`.
 
 For example, the `estimate_pi()` docstring follows this layout:
 
@@ -430,18 +430,23 @@ For example, the `estimate_pi()` docstring follows this layout:
 """Estimate dose-specific cohort weights for eligible firms.
 
 Args:
-    events: Canonical first-event metadata with firm_id, cohort, and dose
+    events:
+        Canonical first-event metadata with firm_id, cohort, and dose
         columns, containing one row per firm.
-    doses: Distinct positive finite doses at which to evaluate weights.
-    eligible_firms: Unique firm identifiers defining the eligible sample.
-    bandwidth: Positive finite Gaussian-kernel bandwidth in dose units.
+    doses:
+        Distinct positive finite doses at which to evaluate weights.
+    eligible_firms:
+        Unique firm identifiers defining the eligible sample.
+    bandwidth:
+        Positive finite Gaussian-kernel bandwidth in dose units.
 
 Returns:
     A DataFrame with cohort, dose, and weight columns, sorted by cohort
     and dose. Weights sum to one at each requested dose.
 
 Raises:
-    ValueError: If the bandwidth is nonpositive or nonfinite, the inputs
+    ValueError:
+        If the bandwidth is nonpositive or nonfinite, the inputs
         violate the required schema or eligibility rules, or weight
         normalization produces nonfinite results.
 """
