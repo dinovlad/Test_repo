@@ -59,6 +59,11 @@ source, pytest results, and formatting, lint, type, and spelling checks.
 Quality checks target the estimator module, its two test modules, the validation
 script, and project documentation, so unrelated code in a larger project is not
 scanned.
+When copying these files into an existing project, include both
+[tests/test_att.py](tests/test_att.py) and
+[tests/test_validate.py](tests/test_validate.py), along with the estimator,
+runner, and documentation. Missing required files make validation fail, while
+quality checks continue on the expected files that are present.
 It reads Python and dependency constraints from your `pyproject.toml`, including
 exact pins, ranges, unversioned dependencies, extras, and environment markers.
 Version checks use `packaging` when available; missing parsing support or
@@ -88,3 +93,12 @@ installed in the same environment. The validation script never installs them.
 
 The pre-commit hooks apply formatting and lint fixes; the validation script's
 quality checks are read-only.
+
+To apply import sorting and formatting using your own project's Ruff settings,
+run these commands after restoring all required files:
+
+```bash
+python -m ruff check --select I --fix src/labor_cost_optimization/att.py tests/test_att.py tests/test_validate.py scripts/validate.py
+python -m ruff format src/labor_cost_optimization/att.py tests/test_att.py tests/test_validate.py scripts/validate.py
+python scripts/validate.py --log validation.log
+```

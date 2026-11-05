@@ -19,6 +19,7 @@ from numpy.typing import NDArray
 from scipy.interpolate import BSpline
 from scipy.special import logsumexp
 
+
 __all__ = ["ATT", "estimate_pi", "evaluate_theta"]
 
 FloatArray = NDArray[np.float64]
@@ -215,11 +216,7 @@ class ATT:
         self.dose_col = dose_col
         self.degree = _integer(degree, "degree", 1)
         self.num_knots = _integer(num_knots, "num_knots", 0)
-        self.min_cohort_size = (
-            None
-            if min_cohort_size is None
-            else _integer(min_cohort_size, "min_cohort_size", 1)
-        )
+        self.min_cohort_size = None if min_cohort_size is None else _integer(min_cohort_size, "min_cohort_size", 1)
         self._reset()
 
     def _reset(self) -> None:
@@ -323,13 +320,8 @@ class ATT:
         for row in first.itertuples(index=False):
             g = row.cohort.value // _PERIOD_NS
             firm_history = history[row.firm_id]
-            indices = (
-                firm_history["cohort"].to_numpy(dtype="datetime64[ns]").astype(np.int64)
-                // _PERIOD_NS
-            )
-            conflicts = firm_history.loc[
-                (indices >= g + lower) & (indices <= g + upper)
-            ]
+            indices = firm_history["cohort"].to_numpy(dtype="datetime64[ns]").astype(np.int64) // _PERIOD_NS
+            conflicts = firm_history.loc[(indices >= g + lower) & (indices <= g + upper)]
             n_conflicts = int(conflicts["n_terminations"].sum()) - 1
             if not origin <= g <= last:
                 reason = "outside_outcome_period"
@@ -366,9 +358,7 @@ class ATT:
                 "conflicting_periods",
             ],
         )
-        self.events_ = self.event_diagnostics_[
-            ["firm_id", "cohort", "dose", "design_eligible"]
-        ].copy()
+        self.events_ = self.event_diagnostics_[["firm_id", "cohort", "dose", "design_eligible"]].copy()
         self.events_["cohort"] = pd.to_datetime(self.events_["cohort"])
         self.events_["design_eligible"] = self.events_["design_eligible"].astype(bool)
         eligible = self.events_.loc[self.events_["design_eligible"], "dose"]
@@ -610,22 +600,13 @@ class ATT:
         """Summarize design eligibility and horizon statuses without dropping history."""
         records = []
         for cohort, events in self.events_.groupby("cohort", sort=True):
-            cells = {
-                e: cell
-                for (g, e), cell in self.cell_diagnostics_.items()
-                if g == cohort
-            }
+            cells = {e: cell for (g, e), cell in self.cell_diagnostics_.items() if g == cohort}
             records.append(
                 {
                     "cohort": cohort,
                     "n_firms_design": int(events["design_eligible"].sum()),
-                    "n_cells_available": sum(
-                        cell["n_treated"] > 0 for cell in cells.values()
-                    ),
-                    "n_cells_used": sum(
-                        cell["status"] in {"fitted", "reference"}
-                        for cell in cells.values()
-                    ),
+                    "n_cells_available": sum(cell["n_treated"] > 0 for cell in cells.values()),
+                    "n_cells_used": sum(cell["status"] in {"fitted", "reference"} for cell in cells.values()),
                     "statuses": {e: cell["status"] for e, cell in cells.items()},
                 },
             )
@@ -688,8 +669,7 @@ class ATT:
         failed = [
             key
             for key, cell in self.cell_diagnostics_.items()
-            if key[1] in horizons
-            and cell["status"] not in {"fitted", "reference", "no_observed_treated"}
+            if key[1] in horizons and cell["status"] not in {"fitted", "reference", "no_observed_treated"}
         ]
         if failed:
             logging.warning(
@@ -709,17 +689,12 @@ class ATT:
                 outside = np.zeros(len(dose_values), dtype=bool)
             else:
                 with np.errstate(over="ignore", invalid="ignore"):
-                    predictions = (
-                        coefficients[0]
-                        + basis["spline"](dose_values)[:, 1:] @ coefficients[1:]
-                    )
+                    predictions = coefficients[0] + basis["spline"](dose_values)[:, 1:] @ coefficients[1:]
                 if not np.isfinite(predictions).all():
                     raise ValueError(
                         "Spline predictions are nonfinite at the requested doses.",
                     )
-                outside = (dose_values < basis["lower"]) | (
-                    dose_values > basis["upper"]
-                )
+                outside = (dose_values < basis["lower"]) | (dose_values > basis["upper"])
             extrapolated_count += int(outside.sum())
             for dose, prediction, extrapolated in zip(
                 dose_values,
@@ -945,12 +920,8 @@ def evaluate_theta(
     restricted_event_times = []
     for event_time in resolved_event_times:
         availability = model.availability_diagnostics_
-        observed = availability.loc[
-            (availability["event_time"] == event_time) & availability["available"]
-        ]
-        eligible_events = design_events.loc[
-            design_events["firm_id"].isin(observed["firm_id"])
-        ]
+        observed = availability.loc[(availability["event_time"] == event_time) & availability["available"]]
+        eligible_events = design_events.loc[design_events["firm_id"].isin(observed["firm_id"])]
         eligible_cohorts = set(eligible_events["cohort"])
         retained = model.retained_cohorts_[event_time]
         retained_cohorts = set(retained)
@@ -958,22 +929,14 @@ def evaluate_theta(
             eligible_cohorts,
         ):
             raise ValueError(f"Invalid retained cohorts at event period {event_time}.")
-        used_events = eligible_events.loc[
-            eligible_events["cohort"].isin(retained_cohorts)
-        ]
+        used_events = eligible_events.loc[eligible_events["cohort"].isin(retained_cohorts)]
         if used_events.empty:
             raise ValueError(f"No eligible firms remain at event period {event_time}.")
-        estimate_type = (
-            "reference" if event_time == -1 else "att" if event_time >= 0 else "placebo"
-        )
+        estimate_type = "reference" if event_time == -1 else "att" if event_time >= 0 else "placebo"
         required_status = "reference" if event_time == -1 else "fitted"
         for cohort in retained:
             cell = model.cell_diagnostics_.get((cohort, event_time))
-            if (
-                cell is None
-                or cell["status"] != required_status
-                or cell["n_controls"] < 1
-            ):
+            if cell is None or cell["status"] != required_status or cell["n_controls"] < 1:
                 raise ValueError(
                     f"Required comparison is unavailable for cohort {cohort} "
                     f"at event period {event_time}.",
@@ -1041,11 +1004,7 @@ def evaluate_theta(
                     "n_firms_used": len(used_events),
                     "availability_restricted": len(eligible_events) < n_firms_design,
                     "restricted_target": restricted_target,
-                    "extrapolated": (
-                        False
-                        if event_time == -1
-                        else bool(component["extrapolated"].any())
-                    ),
+                    "extrapolated": False if event_time == -1 else bool(component["extrapolated"].any()),
                 },
             )
     if restricted_event_times:

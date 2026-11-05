@@ -1,8 +1,5 @@
 """Check local environment reporting without importing estimator dependencies."""
 
-# Standalone test module; no package initialization is needed.
-# ruff: noqa: INP001
-
 import importlib.metadata
 import importlib.util
 import io
@@ -14,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "validate.py"
 SPEC = importlib.util.spec_from_file_location("local_validation_script", SCRIPT)
@@ -28,6 +26,24 @@ REQUIRES_PARSER = pytest.mark.skipif(
 )
 ReportResult = tuple[bool, str, list[str]]
 Report = Callable[..., ReportResult]
+
+
+@pytest.fixture
+def checkout(tmp_path: Path) -> Path:
+    """Create the files needed for a complete validation run.
+
+    Args:
+        tmp_path:
+            Directory for the temporary checkout.
+
+    Returns:
+        The checkout root containing the expected Python files and documentation.
+    """
+    for relative in [*VALIDATOR.CHECKED_PYTHON_FILES, "README.md", "att.md"]:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Validation fixture.\n", encoding="utf-8")
+    return tmp_path
 
 
 @pytest.fixture
@@ -52,9 +68,7 @@ def report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Report:
         dev_requirements: list[str] | None = None,
     ) -> ReportResult:
         """Report temporary project requirements and installed distributions."""
-        normalized = {
-            name.lower().replace("_", "-"): value for name, value in versions.items()
-        }
+        normalized = {name.lower().replace("_", "-"): value for name, value in versions.items()}
         queried: list[str] = []
 
         def installed(name: str) -> str:
@@ -239,14 +253,16 @@ def test_missing_optional_parser_reports_uncertainty_without_crashing(
     ids=["mismatch", "exception"],
 )
 def test_failed_environment_check_still_runs_tests_and_writes_summary(
-    tmp_path: Path,
+    checkout: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     failure: Exception | None,
 ) -> None:
     """A mismatch or reporting exception must leave a complete diagnostic log."""
-    log_path = tmp_path / "validation.log"
-    monkeypatch.setattr(VALIDATOR, "ROOT", tmp_path)
+    for relative in ("README.md", "att.md"):
+        (checkout / relative).unlink()
+    log_path = checkout / "validation.log"
+    monkeypatch.setattr(VALIDATOR, "ROOT", checkout)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -278,16 +294,17 @@ def test_failed_environment_check_still_runs_tests_and_writes_summary(
     }
     assert "Summary" in log
     assert "FAIL" in log
+    assert "PASS: Required validation files" in log
     assert "Summary" in capsys.readouterr().out
 
 
 def test_quality_checks_only_target_estimator_files_and_project_docs(
-    tmp_path: Path,
+    checkout: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Avoid scanning unrelated code in a larger project's source directories."""
-    log_path = tmp_path / "validation.log"
-    monkeypatch.setattr(VALIDATOR, "ROOT", tmp_path)
+    log_path = checkout / "validation.log"
+    monkeypatch.setattr(VALIDATOR, "ROOT", checkout)
     monkeypatch.setattr(sys, "argv", ["validate.py", "--log", str(log_path)])
     with (
         patch.object(VALIDATOR, "environment_report", return_value=True),
@@ -311,7 +328,65 @@ def test_quality_checks_only_target_estimator_files_and_project_docs(
         ),
     }
     assert exit_code == 0
+    assert "PASS: Required validation files" in log_path.read_text(encoding="utf-8")
     for label, (arguments, targets) in expected.items():
         prefix = [sys.executable, "-m", *arguments]
         assert commands[label][: len(prefix)] == prefix
         assert set(commands[label][len(prefix) :]) == targets
+
+
+def test_missing_validator_tests_fail_without_blocking_remaining_quality_checks(
+    checkout: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report incomplete copies while checking the Python files that are present."""
+    missing = "tests/test_validate.py"
+    (checkout / missing).unlink()
+    log_path = checkout / "validation.log"
+    monkeypatch.setattr(VALIDATOR, "ROOT", checkout)
+    monkeypatch.setattr(sys, "argv", ["validate.py", "--log", str(log_path)])
+    with (
+        patch.object(VALIDATOR, "environment_report", return_value=True),
+        patch.object(VALIDATOR, "run_check", return_value=True) as checks,
+    ):
+        exit_code = VALIDATOR.main()
+    log = log_path.read_text(encoding="utf-8")
+    commands = {call.args[0]: call.args[1] for call in checks.call_args_list}
+    present = {
+        "src/labor_cost_optimization/att.py",
+        "tests/test_att.py",
+        "scripts/validate.py",
+    }
+    assert exit_code == 1
+    assert "FAIL: Required validation files" in log
+    assert missing in log
+    assert "Overall result: FAIL" in log
+    assert set(commands["Ruff formatting"][5:]) == present
+    assert set(commands["Ruff lint"][4:]) == present
+    assert set(commands["Mypy"][3:]) == present
+    assert set(commands["Spelling"][4:]) == present | {"README.md", "att.md"}
+
+
+def test_no_expected_python_files_never_runs_unscoped_quality_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty checkout must fail without letting tools scan unrelated files."""
+    log_path = tmp_path / "validation.log"
+    monkeypatch.setattr(VALIDATOR, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["validate.py", "--log", str(log_path)])
+    with (
+        patch.object(VALIDATOR, "environment_report", return_value=True),
+        patch.object(VALIDATOR, "run_check", return_value=True) as checks,
+    ):
+        exit_code = VALIDATOR.main()
+    log = log_path.read_text(encoding="utf-8")
+    labels = {call.args[0] for call in checks.call_args_list}
+    assert exit_code == 1
+    assert "FAIL: Required validation files" in log
+    assert "Overall result: FAIL" in log
+    assert "skip" in log.lower()
+    assert labels == {
+        "Installed package and source",
+        "Numerical and behavioral tests",
+    }

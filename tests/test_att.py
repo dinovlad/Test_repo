@@ -1,8 +1,5 @@
 """Check continuous-dose estimates against independent numerical comparisons."""
 
-# Collected directly by pytest; this test directory is not an importable package.
-# ruff: noqa: INP001
-
 import logging
 from collections.abc import Callable
 from typing import TypedDict, cast
@@ -59,8 +56,7 @@ def make_panel(
         nonlinear calendar shock, and a dose-dependent pre-period contrast.
     """
     events = pd.DataFrame(
-        [(f"A{i}", first, 4.0 + i) for i in range(6)]
-        + [(f"B{i}", second, 5.0 + i) for i in range(7)],
+        [(f"A{i}", first, 4.0 + i) for i in range(6)] + [(f"B{i}", second, 5.0 + i) for i in range(7)],
         columns=["firm", "period", "hours"],
     )
     event_lookup = events.set_index("firm")
@@ -75,9 +71,7 @@ def make_panel(
                 if event_time == -2:
                     sales += 0.3 * dose + 0.02 * dose**2
                 elif event_time >= 0:
-                    sales += (event_time + 1) * (
-                        2.0 + 0.5 * dose - 0.03 * dose**2 + 0.004 * dose**3
-                    )
+                    sales += (event_time + 1) * (2.0 + 0.5 * dose - 0.03 * dose**2 + 0.004 * dose**3)
             records.append((firm, period, sales))
     return pd.DataFrame(records, columns=["firm", "period", "sales"]), events
 
@@ -314,12 +308,9 @@ def test_aggregation_matches_manual_kernel_weighted_curves(
         weights = eligible.groupby("period")["kernel"].sum()
         weights = weights / weights.sum()
         subset = components.loc[
-            (components["event_time"] == row["event_time"])
-            & (components["dose"] == row["dose"])
+            (components["event_time"] == row["event_time"]) & (components["dose"] == row["dose"])
         ].set_index("cohort")
-        expected = sum(
-            weights[cohort] * subset.loc[cohort, "att"] for cohort in weights.index
-        )
+        expected = sum(weights[cohort] * subset.loc[cohort, "att"] for cohort in weights.index)
         assert row["theta"] == pytest.approx(expected, rel=0.0, abs=5e-10)
         assert row["n_cohorts_used"] == 2
         assert row["n_firms_used"] == 13
@@ -506,9 +497,7 @@ def test_missing_controls_cannot_be_hidden_by_aggregation(
 ) -> None:
     """Keep no-control cells required even for the reference normalization."""
     outcomes, events = panel
-    missing = (outcomes["firm"] == "C0") & (
-        outcomes["period"] == FIRST - pd.Timedelta(days=1)
-    )
+    missing = (outcomes["firm"] == "C0") & (outcomes["period"] == FIRST - pd.Timedelta(days=1))
     with caplog.at_level(logging.WARNING):
         fitted = ATT(**MAPPINGS).fit(
             outcomes.loc[~missing],
