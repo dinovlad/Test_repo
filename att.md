@@ -64,7 +64,7 @@ $$
 
 Both dates must be observed exactly. Missing intervening days do not prevent that particular long-difference comparison. Let $\mathcal E_e$ contain the design-eligible events with $A_i(e)=1$.
 
-For an eligible event, let $Y^{\mathrm{term}}_{i,t}$ be store sales under the observed termination and $Y^{\mathrm{keep}}_{i,t}$ sales if that employee instead continues at their original daily hours through the comparison endpoint. The regimes share the actual history before the current event; subsequent staffing responses follow their respective regimes. The contrast does not remove every earlier termination from the store's history.
+For an eligible event, let $`Y^{\mathrm{term}}_{i,t}`$ be store sales under the observed termination and $`Y^{\mathrm{keep}}_{i,t}`$ sales if that employee instead continues at their original daily hours through the comparison endpoint. The regimes share the actual history before the current event; subsequent staffing responses follow their respective regimes. The contrast does not remove every earlier termination from the store's history.
 
 The event-specific analogue of the article's unpooled target, restricted to observed endpoints, is
 
