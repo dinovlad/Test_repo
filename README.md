@@ -1,8 +1,8 @@
 # Continuous-dose ATT
 
 A Python 3.11 package with its estimator in the self-contained module
-`src/labor_cost_optimization/att.py`, for fixed-dose event studies. `ATT` fits one
-PyFixest model with separate coefficients for each cohort and horizon.
+`src/labor_cost_optimization/att.py`, for fixed-dose event studies. `ATT` fits a
+separate PyFixest polynomial model for each cohort and horizon.
 `estimate_pi()` estimates dose-specific cohort weights; `evaluate_theta()`
 aggregates cohort effects at each dose and horizon.
 
@@ -52,9 +52,15 @@ assumptions, selected populations, diagnostics, and API are described in
 
 Fitting reuses indexed baseline observations and batches endpoint and termination
 history lookups across cohorts at each horizon. Each comparison still has its
-own spline and rank checks. The single PyFixest regression retains a dense
-design whose memory use grows with the stacked rows and number of comparisons;
-vectorized selection does not remove that constraint.
+own polynomial transformation and rank checks. Each regression uses a
+`poly(..., raw=True)` formula with only its own comparison rows, avoiding a
+global matrix of interactions with every cell. Preparation still collects the
+narrow comparison frames before fitting. Fitted models are available in
+`model.models_`; prediction retains each cell's fitted dose scaling. The default
+cubic polynomial has the same fitted curve as a cubic B-spline with no internal
+knots on the same sample, up to numerical precision. Internal-knot splines are
+not supported; there is no `num_knots` parameter. Selection and aggregation
+rules are unchanged by the polynomial parameterization.
 
 Run validation from the repository root and share `validation.log` here:
 
@@ -88,11 +94,14 @@ nonzero if any requested check fails. It installs nothing and does not modify
 source files. The default timeout is 600 seconds per check; override it with
 `--timeout`. Use `--tests-only` to skip the code-quality checks.
 
-The pytest tests use synthetic data and compare the real PyFixest model against
-independent least-squares calculations. They cover saved splines, cohort weights,
+The pytest tests use synthetic data and compare the real PyFixest cell models against
+independent least-squares calculations, including no-internal-knot B-spline
+reference curves. They cover saved polynomial transformations, cohort weights,
 aggregation, missing periods, isolation, duplicate events, zero effects, and
 failed-fit handling. A run that does not satisfy the configured Python or runtime
 package requirements is marked as a mismatch even if its numerical tests pass.
+The [validation workflow](.github/workflows/validate.yml) runs pytest with Python
+3.11 and the pinned runtime dependencies on pushes to `cgbs-att` and pull requests.
 
 To run individual checks directly:
 
