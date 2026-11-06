@@ -1101,23 +1101,26 @@ def test_bandwidth_cv_matches_stable_brute_force_leave_one_firm_out(
         )
     assert len(caplog.records) <= 1
     assert list(scores.columns) == ["bandwidth", "cv_brier"]
-    ordered = np.sort(candidates)
+    ordered = scores["bandwidth"].to_numpy(dtype=float)
+    assert set(candidates).issubset(set(ordered))
+    assert_allclose(ordered, np.sort(ordered), atol=0.0, rtol=0.0)
     expected = independent_brier_scores(bandwidth_events, ordered)
-    assert_allclose(scores["bandwidth"], ordered, atol=0.0, rtol=0.0)
     assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
-    assert selected == ordered[np.argmin(expected)]
+    assert selected == ordered[np.argmin(scores["cv_brier"].to_numpy())]
+    assert len(ordered) > len(candidates)
     assert np.isfinite(scores["cv_brier"]).all()
 
 
 def test_bandwidth_default_grid_uses_h0(bandwidth_events: pd.DataFrame) -> None:
-    """Evaluate the documented nine bandwidths without changing their order."""
+    """Include all nine starting bandwidths and validate every expanded score."""
     h0 = estimate_h0(bandwidth_events, **EVENT_MAPPINGS)
     selected, scores = estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS)
-    expected_grid = h0 * np.geomspace(0.25, 4.0, 9)
-    assert_allclose(scores["bandwidth"], expected_grid, atol=0.0, rtol=1e-14)
-    expected = independent_brier_scores(bandwidth_events, expected_grid)
+    expected_grid = h0 * np.geomspace(0.1, 10.0, 9)
+    evaluated = scores["bandwidth"].to_numpy(dtype=float)
+    assert set(expected_grid).issubset(set(evaluated))
+    expected = independent_brier_scores(bandwidth_events, evaluated)
     assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
-    assert selected == expected_grid[np.argmin(expected)]
+    assert selected == evaluated[np.argmin(scores["cv_brier"].to_numpy())]
 
 
 def test_bandwidth_cv_accepts_finite_scaled_distances_for_large_doses() -> None:
@@ -1127,8 +1130,10 @@ def test_bandwidth_cv_accepts_finite_scaled_distances_for_large_doses() -> None:
     )
     candidates = np.array([1e308])
     selected, scores = estimate_h_cv(events, **EVENT_MAPPINGS, bandwidths=candidates)
-    expected = independent_brier_scores(events, candidates)
-    assert selected == 1e308
+    evaluated = scores["bandwidth"].to_numpy(dtype=float)
+    expected = independent_brier_scores(events, evaluated)
+    assert 1e308 in evaluated
+    assert selected == evaluated[np.argmin(scores["cv_brier"].to_numpy())]
     assert np.isfinite(scores["cv_brier"]).all()
     assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
 
@@ -1165,7 +1170,9 @@ def test_bandwidth_selection_respects_first_events_mappings_and_eligibility() ->
     assert selected_h0 == pytest.approx(expected_h0, rel=1e-14, abs=0.0)
     expected_all = 0.9 * min(float(np.std([4.0, 6.0, 8.0, 6.0, 10.0], ddof=1)), 2.0 / 1.349) * 5**-0.2
     assert all_h0 == pytest.approx(expected_all, rel=1e-14, abs=0.0)
-    expected_scores = independent_brier_scores(expected_events, np.array([0.5, 1.5, 4.0]))
+    evaluated = scores["bandwidth"].to_numpy(dtype=float)
+    assert {0.5, 1.5, 4.0}.issubset(set(evaluated))
+    expected_scores = independent_brier_scores(expected_events, evaluated)
     assert_allclose(scores["cv_brier"], expected_scores, atol=2e-14, rtol=2e-14)
     assert_frame_equal(events, original)
 
@@ -1177,12 +1184,145 @@ def test_bandwidth_cv_combines_singleton_boundary_and_tie_warnings(
     events = pd.DataFrame({"firm": ["a", "b"], "period": [FIRST, SECOND], "hours": [4.0, 8.0]})
     with caplog.at_level(logging.WARNING):
         selected, scores = estimate_h_cv(events, **EVENT_MAPPINGS, bandwidths=[2.0, 0.001, 1.0])
-    assert selected == 0.001
+    assert selected == 0.001 / 8
+    assert_allclose(
+        scores["bandwidth"],
+        [0.001 / 8, 0.001 / 4, 0.001 / 2, 0.001, 1.0, 2.0, 4.0, 8.0, 16.0],
+        atol=0.0,
+        rtol=0.0,
+    )
     assert_allclose(scores["cv_brier"], 2.0, atol=0.0, rtol=0.0)
     assert len(caplog.records) == 1
     assert "singleton" in caplog.text
     assert "boundary" in caplog.text
     assert "tie" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("initial", "curve", "expected_bandwidth"),
+    [
+        ([1.0, 2.0, 4.0], {1.0: 1.3, 2.0: 1.0, 4.0: 0.8, 8.0: 0.5, 16.0: 0.6}, 8.0),
+        ([1.0, 2.0, 4.0], {0.25: 0.7, 0.5: 0.4, 1.0: 0.6, 2.0: 1.0, 4.0: 1.2}, 0.5),
+        ([1.0, 2.0, 4.0], {1.0: 1.0, 2.0: 0.3, 4.0: 0.8}, 2.0),
+        ([1.0, 2.0, 4.0], {0.25: 0.7, 0.5: 0.6, 1.0: 0.8, 2.0: 1.0, 4.0: 0.8, 8.0: 0.4, 16.0: 0.5}, 8.0),
+        ([2.0], {1.0: 0.8, 2.0: 0.5, 4.0: 0.9}, 2.0),
+    ],
+    ids=["upper", "lower", "interior", "both_initial_edges", "single_candidate"],
+)
+def test_bandwidth_search_brackets_initial_edge_minima_without_rescoring(
+    bandwidth_events: pd.DataFrame,
+    caplog: pytest.LogCaptureFixture,
+    initial: list[float],
+    curve: dict[float, float],
+    expected_bandwidth: float,
+) -> None:
+    """Retain the first upturn and explore both initially minimizing edges."""
+    with (
+        patch.object(
+            att,
+            "_loo_brier_scores",
+            side_effect=lambda _doses, _cohorts, bandwidths, _batch: np.array([curve[float(h)] for h in bandwidths]),
+        ) as scorer,
+        caplog.at_level(logging.WARNING),
+    ):
+        selected, scores = estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=initial)
+    assert selected == expected_bandwidth
+    assert not caplog.records
+    assert scores["bandwidth"].tolist() == sorted(curve)
+    assert_allclose(scores["cv_brier"], [curve[h] for h in sorted(curve)], atol=0.0, rtol=0.0)
+    assert_allclose(scorer.call_args_list[0].args[2], initial, atol=0.0, rtol=0.0)
+    evaluated = [float(h) for call in scorer.call_args_list for h in call.args[2]]
+    assert len(evaluated) == len(set(evaluated))
+    assert set(evaluated) == set(curve)
+    assert all(len(call.args[2]) == 1 for call in scorer.call_args_list[1:])
+
+
+def test_bandwidth_search_stops_after_three_consecutive_numerically_flat_steps(
+    bandwidth_events: pd.DataFrame,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reset the plateau count after a material improvement in Brier loss."""
+    epsilon = np.finfo(float).eps
+    curve = {1.0: 1.0, 2.0: 0.8, 4.0: 0.8 - epsilon, 8.0: 0.6}
+    curve.update({16.0: 0.6 - epsilon, 32.0: 0.6 - 2 * epsilon, 64.0: 0.6 - 3 * epsilon})
+    with (
+        patch.object(
+            att,
+            "_loo_brier_scores",
+            side_effect=lambda _doses, _cohorts, bandwidths, _batch: np.array([curve[float(h)] for h in bandwidths]),
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        selected, scores = estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=[1.0, 2.0])
+    assert selected == 64.0
+    assert scores["bandwidth"].tolist() == sorted(curve)
+    assert len(caplog.records) == 1
+    assert "three numerically flat" in caplog.text
+
+
+def test_bandwidth_search_limits_each_direction_independently(
+    bandwidth_events: pd.DataFrame,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep all evaluated losses when both directions exhaust their budgets."""
+    curve = {0.25: 0.4, 0.5: 0.6, 1.0: 0.8, 2.0: 0.8, 4.0: 0.5, 8.0: 0.3}
+    with (
+        patch.object(
+            att,
+            "_loo_brier_scores",
+            side_effect=lambda _doses, _cohorts, bandwidths, _batch: np.array([curve[float(h)] for h in bandwidths]),
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        selected, scores = estimate_h_cv(
+            bandwidth_events,
+            **EVENT_MAPPINGS,
+            bandwidths=[1.0, 2.0],
+            max_expansions=2,
+        )
+    assert selected == 8.0
+    assert scores["bandwidth"].tolist() == sorted(curve)
+    assert len(caplog.records) == 1
+    assert "lower expansion reached max_expansions=2" in caplog.text
+    assert "upper expansion reached max_expansions=2" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("initial", "curve", "message"),
+    [
+        ([1e308], {5e307: 0.8, 1e308: 0.3}, "upper expansion reached floating-point"),
+        (
+            [np.nextafter(0.0, 1.0), 2 * np.nextafter(0.0, 1.0)],
+            {np.nextafter(0.0, 1.0): 0.3, 2 * np.nextafter(0.0, 1.0): 0.8},
+            "lower expansion reached floating-point",
+        ),
+        ([5e-154, 1e-153], {5e-154: 0.3, 1e-153: 0.8}, "lower expansion reached kernel arithmetic"),
+    ],
+    ids=["overflow", "underflow", "kernel_overflow"],
+)
+def test_bandwidth_search_checks_numerical_limits_before_scoring(
+    bandwidth_events: pd.DataFrame,
+    caplog: pytest.LogCaptureFixture,
+    initial: list[float],
+    curve: dict[float, float],
+    message: str,
+) -> None:
+    """Return valid evaluated candidates without submitting unusable distances."""
+    with (
+        patch.object(
+            att,
+            "_loo_brier_scores",
+            side_effect=lambda _doses, _cohorts, bandwidths, _batch: np.array([curve[float(h)] for h in bandwidths]),
+        ) as scorer,
+        caplog.at_level(logging.WARNING),
+    ):
+        selected, scores = estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=initial)
+    ordered = sorted(curve)
+    assert selected == ordered[np.argmin([curve[h] for h in ordered])]
+    assert scores["bandwidth"].tolist() == ordered
+    assert len(caplog.records) == 1
+    assert message in caplog.text
+    assert sum(len(call.args[2]) for call in scorer.call_args_list) == len(curve)
 
 
 @pytest.mark.parametrize("estimator", [estimate_h0, estimate_h_cv], ids=["h0", "cv"])
@@ -1248,3 +1388,14 @@ def test_bandwidth_cv_rejects_invalid_batch_sizes(
     estimator: Callable[..., object] = estimate_h_cv
     with pytest.raises(ValueError, match="batch_size"):
         estimator(bandwidth_events, **EVENT_MAPPINGS, bandwidths=[0.5, 1.0], batch_size=batch_size)
+
+
+@pytest.mark.parametrize("max_expansions", [0, 1.5, True])
+def test_bandwidth_cv_rejects_invalid_expansion_limits(
+    bandwidth_events: pd.DataFrame,
+    max_expansions: float,
+) -> None:
+    """Require a positive integer budget for each search direction."""
+    estimator: Callable[..., object] = estimate_h_cv
+    with pytest.raises(ValueError, match="max_expansions"):
+        estimator(bandwidth_events, **EVENT_MAPPINGS, bandwidths=[0.5, 1.0], max_expansions=max_expansions)

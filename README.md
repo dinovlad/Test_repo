@@ -63,18 +63,36 @@ h0 = estimate_h0(
 )
 ```
 
-`estimate_h_cv()` evaluates nine bandwidths from `h0 / 4` to `4 * h0` by default,
-or a supplied positive, distinct `bandwidths` grid. It returns the selected
-bandwidth and a table with `bandwidth` and `cv_brier` columns. Its mean multiclass
-Brier loss gives every firm equal weight, holding out only that firm's own
-contribution, including when doses repeat. Exact ties select the smallest
-bandwidth. Singleton cohorts are retained; their held-out own-cohort probability
-is zero. CV requires at least two cohorts and varying doses. It emits at most one
-summary warning for singleton cohorts, a boundary selection, or tied minima.
-`batch_size=256` bounds the query-dose batch; grouping repeated doses reduces
-work, while all-distinct doses can still require quadratic computation.
-These are custom bandwidth choices, not methods prescribed by the article.
-See [att.md](att.md) for the formulas and population requirements.
+`estimate_h_cv()` starts with nine bandwidths from `h0 / 10` to `10 * h0`,
+or a supplied positive, distinct `bandwidths` grid. If an initial minimum lies
+at a boundary, it expands that boundary by factors of two until the score rises
+beyond numerical tolerance. Both directions are explored independently when
+both initial boundaries minimize, including a one-candidate grid. Explicit
+bandwidths are an initial grid, not a restriction on the selected value.
+
+The returned table has `bandwidth` and `cv_brier` columns, sorted by bandwidth,
+and includes all evaluated points, including the first upward turn. Previously
+scored candidates are cached. The selected bandwidth minimizes loss over all
+visited points; exact ties select the smallest. This local boundary search does
+not guarantee the global minimum over all positive bandwidths.
+
+The search also stops a direction after three consecutive negligible score
+changes, after `max_expansions=50` additional evaluations, or before a generated
+bandwidth or squared scaled dose distance would leave the numerical range.
+Those stops produce a warning rather than claiming an upward turn was found.
+Invalid initial grids still raise an error. See [att.md](att.md) for the exact
+floating-point tolerance and stop rules.
+
+The mean multiclass Brier loss gives every firm equal weight, holding out only
+that firm's own contribution, including when doses repeat. Singleton cohorts
+remain in the score; their held-out own-cohort probability is zero. CV requires
+at least two cohorts and varying doses. At most one warning combines singleton
+cohorts, a selected final-grid boundary, tied minima, and expansion stop reasons.
+A clean unique interior minimum emits none. `batch_size=256` bounds the
+query-dose batch; grouping repeated doses reduces work, while all-distinct doses
+can still require quadratic computation. Bandwidth search does not refit ATT
+models or change the selected population. These are custom bandwidth choices,
+not methods prescribed by the article.
 
 The implementation keeps each firm's first termination as its only target,
 retains later terminations for screening, and reports exclusions in one warning
