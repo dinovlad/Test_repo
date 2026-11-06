@@ -142,8 +142,9 @@ reference curves. They cover saved polynomial transformations, cohort weights,
 bandwidth rules and exact leave-one-firm-out scores, aggregation, missing periods, isolation, duplicate events, zero effects, and
 failed-fit handling. A run that does not satisfy the configured Python or runtime
 package requirements is marked as a mismatch even if its numerical tests pass.
-The [validation workflow](.github/workflows/validate.yml) runs pytest with Python
-3.11 and the pinned runtime dependencies on pushes to `cgbs-att` and pull requests.
+The [validation workflow](.github/workflows/validate.yml) runs the tests and
+formatting, lint, type, and spelling checks with Python 3.11 and pinned runtime
+dependencies on pushes to `cgbs-att` and pull requests.
 
 To run individual checks directly:
 

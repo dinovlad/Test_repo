@@ -80,9 +80,7 @@ def report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Report:
             return normalized[key]
 
         config = (
-            "[project]\n"
-            f"requires-python = {json.dumps(requires_python)}\n"
-            f"dependencies = {json.dumps(requirements)}\n"
+            f"[project]\nrequires-python = {json.dumps(requires_python)}\ndependencies = {json.dumps(requirements)}\n"
         )
         if dev_requirements is not None:
             config += f"[dependency-groups]\ndev = {json.dumps(dev_requirements)}\n"
@@ -323,7 +321,7 @@ def test_quality_checks_only_target_estimator_files_and_project_docs(
         "Ruff lint": (["ruff", "check"], files),
         "Mypy": (["mypy"], files),
         "Spelling": (
-            ["codespell", "--ignore-words-list=ure,missings"],
+            ["codespell_lib", "--ignore-words-list=ure,missings"],
             files | {"README.md", "att.md"},
         ),
     }

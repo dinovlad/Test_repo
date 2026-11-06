@@ -101,8 +101,7 @@ def requirement_report(
         actual = "NOT INSTALLED"
     if parsed.url is not None:
         emit(
-            f"{prefix}{parsed.name}: {actual}; "
-            "direct reference; provenance UNVERIFIED.",
+            f"{prefix}{parsed.name}: {actual}; direct reference; provenance UNVERIFIED.",
             log,
         )
         return False
@@ -116,8 +115,7 @@ def requirement_report(
             emit(f"{prefix}{parsed.name}: {actual}; INVALID installed version.", log)
             return False
     emit(
-        f"{prefix}{parsed.name}: {actual}; required {expected}; "
-        f"{'OK' if ok else 'MISMATCH'}",
+        f"{prefix}{parsed.name}: {actual}; required {expected}; {'OK' if ok else 'MISMATCH'}",
         log,
     )
     return bool(ok)
@@ -236,8 +234,7 @@ def run_check(label: str, command: list[str], log: TextIO, timeout: float) -> bo
     if output:
         emit(output.rstrip(), log)
     emit(
-        f"{'PASS' if exit_code == 0 else 'FAIL'}: {label}; "
-        f"exit={exit_code}; elapsed={time.monotonic() - started:.2f}s",
+        f"{'PASS' if exit_code == 0 else 'FAIL'}: {label}; exit={exit_code}; elapsed={time.monotonic() - started:.2f}s",
         log,
     )
     return exit_code == 0
@@ -255,10 +252,7 @@ def main() -> int:
     parser.add_argument(
         "--tests-only",
         action="store_true",
-        help=(
-            "Skip formatting, lint, type, and spelling checks; "
-            "still verify environment and imports."
-        ),
+        help=("Skip formatting, lint, type, and spelling checks; still verify environment and imports."),
     )
     parser.add_argument(
         "--timeout",
@@ -343,7 +337,7 @@ def main() -> int:
                         [
                             sys.executable,
                             "-m",
-                            "codespell",
+                            "codespell_lib",
                             "--ignore-words-list=ure,missings",
                             *sources,
                             *documents,

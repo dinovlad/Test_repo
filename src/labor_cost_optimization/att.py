@@ -998,8 +998,7 @@ def _loo_brier_scores(
             denominator = masses.sum(axis=1) - self_weight
             probabilities = masses / denominator[:, None]
             own_probability = (
-                np.asarray(counts[start:stop].multiply(probabilities).sum(axis=1)).ravel()
-                / multiplicities[start:stop]
+                np.asarray(counts[start:stop].multiply(probabilities).sum(axis=1)).ravel() / multiplicities[start:stop]
             )
             adjustment = self_weight / denominator
             # Subtract the held-out firm's probability only in its own cohort,
@@ -1184,10 +1183,7 @@ def estimate_pi(
         # all unshifted log-kernel values have a very large magnitude.
         log_kernel -= np.max(log_kernel)
         log_mass: FloatArray = np.asarray(
-            [
-                logsumexp(log_kernel[cohort_codes == code], axis=0)
-                for code in range(len(cohort_periods))
-            ],
+            [logsumexp(log_kernel[cohort_codes == code], axis=0) for code in range(len(cohort_periods))],
             dtype=np.float64,
         )
         weights = np.exp(log_mass - logsumexp(log_mass, axis=0))
@@ -1276,16 +1272,14 @@ def evaluate_theta(
             cell = model.cell_diagnostics_.get((cohort, event_time))
             if cell is None or cell["status"] != required_status or cell["n_controls"] < 1:
                 raise ValueError(
-                    f"Required comparison is unavailable for cohort {cohort} "
-                    f"at event period {event_time}.",
+                    f"Required comparison is unavailable for cohort {cohort} at event period {event_time}.",
                 )
             expected_firms = set(
                 used_events.loc[used_events["cohort"] == cohort, "firm_id"],
             )
             if set(cell["treated_firms"]) != expected_firms:
                 raise ValueError(
-                    f"Fitted firms and aggregation firms differ for cohort {cohort} "
-                    f"at event period {event_time}.",
+                    f"Fitted firms and aggregation firms differ for cohort {cohort} at event period {event_time}.",
                 )
 
         weights = estimate_pi(
