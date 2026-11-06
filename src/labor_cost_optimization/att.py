@@ -1016,6 +1016,78 @@ def _loo_brier_scores(
     return losses_by_dose.sum(axis=0) / len(doses)
 
 
+def _expand_bandwidth_grid(
+    doses: FloatArray,
+    cohort_codes: NDArray[np.int64],
+    candidates: FloatArray,
+    scores: FloatArray,
+    batch_size: int,
+    max_expansions: int,
+) -> tuple[FloatArray, FloatArray, list[str]]:
+    """Extend minimizing grid edges until loss rises or a search limit is reached.
+
+    Args:
+        doses:
+            Validated first-event doses from the fixed selected population.
+        cohort_codes:
+            Corresponding consecutive cohort codes starting from zero.
+        candidates:
+            Sorted initial candidate bandwidths.
+        scores:
+            Already evaluated Brier scores for the initial candidates.
+        batch_size:
+            Number of distinct query doses processed together.
+        max_expansions:
+            Maximum number of new bandwidths evaluated in each direction.
+
+    Returns:
+        All evaluated bandwidths and scores in ascending bandwidth order,
+        plus diagnostic messages for directions stopped without a score rise.
+        Both directions are selected from the initial grid, independently.
+
+    Raises:
+        ValueError:
+            An additional CV evaluation produces invalid losses.
+    """
+    evaluated = dict(zip(candidates.tolist(), scores.tolist(), strict=True))
+    minimum = float(scores.min())
+    span = float(doses.max() - doses.min())
+    messages = []
+    for edge, factor, direction in ((0, 0.5, "lower"), (-1, 2.0, "upper")):
+        if scores[edge] != minimum:
+            continue
+        previous_h = float(candidates[edge])
+        previous_score = float(scores[edge])
+        flat_steps = 0
+        for _ in range(max_expansions):
+            next_h = previous_h * factor
+            if not np.isfinite(next_h) or next_h <= 0 or next_h == previous_h:
+                messages.append(f"{direction} expansion reached floating-point bandwidth limits before a score rise")
+                break
+            try:
+                with np.errstate(over="raise", invalid="raise", divide="raise"):
+                    np.square(np.float64(span) / next_h)
+            except FloatingPointError:
+                messages.append(f"{direction} expansion reached kernel arithmetic limits before a score rise")
+                break
+            next_score = float(_loo_brier_scores(doses, cohort_codes, np.array([next_h]), batch_size)[0])
+            evaluated[next_h] = next_score
+            tolerance = 64.0 * np.finfo(float).eps * max(1.0, abs(previous_score), abs(next_score))
+            change = next_score - previous_score
+            if change > tolerance:
+                break
+            flat_steps = flat_steps + 1 if abs(change) <= tolerance else 0
+            if flat_steps == 3:
+                messages.append(f"{direction} expansion stopped after three numerically flat steps before a score rise")
+                break
+            previous_h, previous_score = next_h, next_score
+        else:
+            messages.append(f"{direction} expansion reached max_expansions={max_expansions} before a score rise")
+    expanded = np.asarray(sorted(evaluated), dtype=float)
+    losses = np.asarray([evaluated[float(bandwidth)] for bandwidth in expanded], dtype=float)
+    return expanded, losses, messages
+
+
 def estimate_h_cv(
     events: pd.DataFrame,
     *,
@@ -1025,6 +1097,7 @@ def estimate_h_cv(
     eligible_firms: Iterable[object] | None = None,
     bandwidths: Iterable[float] | None = None,
     batch_size: int = 256,
+    max_expansions: int = 50,
 ) -> tuple[float, pd.DataFrame]:
     """Select a Gaussian bandwidth by leave-one-firm-out multiclass Brier loss.
 
@@ -1044,28 +1117,39 @@ def estimate_h_cv(
             selection. None uses all first events. Outcome availability,
             isolation, and fitted-cell eligibility are not inferred.
         bandwidths:
-            Distinct positive finite candidate bandwidths in dose units.
-            None uses nine geometrically spaced values from h0/4 to 4*h0.
+            Initial distinct positive finite bandwidths in dose units.
+            None starts with nine geometric values from h0/10 to 10*h0.
+            Minimizing edges are extended by halving or doubling until the
+            score rises. Supplied grids are also starting points, not bounds.
         batch_size:
             Positive number of distinct query doses processed together.
             Batching limits kernel memory; all-distinct doses still require
             quadratic work for exact leave-one-firm-out evaluation.
+        max_expansions:
+            Positive maximum number of new evaluations per direction. Search
+            also stops at numerical limits or after three consecutive score
+            changes within 64 machine epsilons times the larger absolute
+            adjacent score or one. Such stops are reported in the warning.
 
     Returns:
         The selected bandwidth and a DataFrame with bandwidth and cv_brier
-        columns, sorted by bandwidth. Scores average over firms, not distinct
-        doses. Exact ties choose the smallest bandwidth. At most one warning
-        summarizes singleton cohorts, a boundary optimum, and tied minima.
+        columns, sorted by bandwidth, including expansion and upturn points.
+        Scores average over firms, not distinct doses. Exact ties choose the
+        smallest bandwidth. At most one warning summarizes singleton cohorts,
+        tied minima, and searches stopped without a score rise. Both edges
+        are explored if they minimize the initial grid. A rise must exceed
+        the same numerical tolerance used to detect flat changes.
         This tunes one selected population; no ATT models are refitted and
         no averaging of horizon-specific CV risks is performed.
 
     Raises:
         ValueError:
-            Inputs, eligibility, candidate bandwidths, or batch size are
+            Inputs, eligibility, initial bandwidths, or search settings are
             invalid; fewer than two cohorts or distinct doses remain; or
             kernel arithmetic overflows or produces invalid losses.
     """
     batch_size = _integer(batch_size, "batch_size", 1)
+    max_expansions = _integer(max_expansions, "max_expansions", 1)
     first = _bandwidth_events(events, firm_col, period_col, dose_col, eligible_firms)
     doses = first["dose"].to_numpy(dtype=float)
     if doses.min() == doses.max():
@@ -1074,7 +1158,7 @@ def estimate_h_cv(
     if len(cohorts) < 2:
         raise ValueError("Bandwidth CV requires at least two selected cohorts.")
     if bandwidths is None:
-        bandwidths = _silverman_h0(doses) * np.geomspace(0.25, 4.0, 9)
+        bandwidths = _silverman_h0(doses) * np.geomspace(0.1, 10.0, 9)
     try:
         if isinstance(bandwidths, (str, bytes)):
             raise ValueError("A bandwidth grid must contain numbers.")
@@ -1084,14 +1168,22 @@ def estimate_h_cv(
         candidates = np.sort(_validate_doses(values))
     except (TypeError, ValueError) as exc:
         raise ValueError("bandwidths must contain distinct positive finite numbers.") from exc
-    scores = _loo_brier_scores(doses, np.asarray(cohort_codes, dtype=np.int64), candidates, batch_size)
+    codes = np.asarray(cohort_codes, dtype=np.int64)
+    scores = _loo_brier_scores(doses, codes, candidates, batch_size)
+    candidates, scores, messages = _expand_bandwidth_grid(
+        doses,
+        codes,
+        candidates,
+        scores,
+        batch_size,
+        max_expansions,
+    )
     best = int(np.argmin(scores))
-    messages = []
     singletons = int(np.count_nonzero(np.bincount(cohort_codes) == 1))
     if singletons:
         messages.append(f"{singletons} singleton cohorts have zero own-cohort probability when held out")
     if best in {0, len(candidates) - 1}:
-        messages.append("selected bandwidth is at the candidate-grid boundary; consider widening the grid")
+        messages.append("selected bandwidth remains at a search boundary")
     ties = int(np.count_nonzero(scores == scores[best]))
     if ties > 1:
         messages.append(f"{ties} candidates tie for the minimum; selected the smallest bandwidth")
