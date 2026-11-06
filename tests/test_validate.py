@@ -217,7 +217,7 @@ def test_python_constraint_comes_from_the_temporary_project(report: Report) -> N
 
 @REQUIRES_PARSER
 def test_invalid_installed_version_is_reported_without_aborting(report: Report) -> None:
-    """Unparseable metadata must not conceal the rest of the environment."""
+    """Unparsable metadata must not conceal the rest of the environment."""
     result, log, queried = report(
         ["feature>=1", "later==2.0"],
         {"feature": "not-a-version", "later": "2.0"},
