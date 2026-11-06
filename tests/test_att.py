@@ -300,8 +300,8 @@ def test_prepared_comparisons_match_direct_row_lookup(
     ]
     outcomes = outcomes.loc[keep].sample(frac=1.0, random_state=17)
     events = events.sample(frac=1.0, random_state=23)
-    outcomes.index = np.zeros(len(outcomes), dtype=int)
-    events.index = np.zeros(len(events), dtype=int)
+    outcomes.index = pd.Index(np.zeros(len(outcomes), dtype=int))
+    events.index = pd.Index(np.zeros(len(events), dtype=int))
     if identifier_kind == "categorical":
         categories = [*outcomes["firm"].unique(), "unused_firm"]
         outcomes["firm"] = pd.Categorical(outcomes["firm"], categories=categories)
@@ -1163,7 +1163,7 @@ def test_bandwidth_selection_respects_first_events_mappings_and_eligibility() ->
     selected_doses = np.array([4.0, 6.0, 10.0])
     expected_h0 = 0.9 * min(np.std(selected_doses, ddof=1), 3.0 / 1.349) * 3**-0.2
     assert selected_h0 == pytest.approx(expected_h0, rel=1e-14, abs=0.0)
-    expected_all = 0.9 * min(np.std([4.0, 6.0, 8.0, 6.0, 10.0], ddof=1), 2.0 / 1.349) * 5**-0.2
+    expected_all = 0.9 * min(float(np.std([4.0, 6.0, 8.0, 6.0, 10.0], ddof=1)), 2.0 / 1.349) * 5**-0.2
     assert all_h0 == pytest.approx(expected_all, rel=1e-14, abs=0.0)
     expected_scores = independent_brier_scores(expected_events, np.array([0.5, 1.5, 4.0]))
     assert_allclose(scores["cv_brier"], expected_scores, atol=2e-14, rtol=2e-14)
@@ -1242,7 +1242,7 @@ def test_bandwidth_cv_rejects_invalid_candidate_grids(
 @pytest.mark.parametrize("batch_size", [0, 1.5, True])
 def test_bandwidth_cv_rejects_invalid_batch_sizes(
     bandwidth_events: pd.DataFrame,
-    batch_size: int | float,
+    batch_size: float,
 ) -> None:
     """Require a positive integer batch size without accepting Boolean values."""
     estimator: Callable[..., object] = estimate_h_cv
