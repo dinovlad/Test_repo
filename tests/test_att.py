@@ -14,7 +14,7 @@ from pandas.testing import assert_frame_equal
 from scipy.interpolate import BSpline
 
 from labor_cost_optimization import att
-from labor_cost_optimization.att import ATT, estimate_pi, evaluate_theta
+from labor_cost_optimization.att import ATT, estimate_h0, estimate_h_cv, estimate_pi, evaluate_theta
 
 
 class ColumnMappings(TypedDict):
@@ -26,10 +26,23 @@ class ColumnMappings(TypedDict):
     dose_col: str
 
 
+class EventMappings(TypedDict):
+    """Name the three columns accepted by the bandwidth selectors."""
+
+    firm_col: str
+    period_col: str
+    dose_col: str
+
+
 MAPPINGS: ColumnMappings = {
     "firm_col": "firm",
     "period_col": "period",
     "outcome_col": "sales",
+    "dose_col": "hours",
+}
+EVENT_MAPPINGS: EventMappings = {
+    "firm_col": "firm",
+    "period_col": "period",
     "dose_col": "hours",
 }
 FIRST = pd.Timestamp("2024-01-08")
@@ -1011,3 +1024,227 @@ def test_kernel_rejects_non_real_numeric_doses(
             eligible_firms=["a", "b", "c"],
             bandwidth=1.0,
         )
+
+
+@pytest.fixture
+def bandwidth_events() -> pd.DataFrame:
+    """Include repeated doses within cohorts and across different cohorts."""
+    return pd.DataFrame(
+        {
+            "firm": list("abcdefgh"),
+            "period": [FIRST] * 3 + [SECOND] * 3 + [SECOND + pd.Timedelta(days=3)] * 2,
+            "hours": [4.0, 4.0, 6.0, 4.0, 7.0, 9.0, 6.0, 10.0],
+        },
+    )
+
+
+def independent_brier_scores(events: pd.DataFrame, bandwidths: FloatArray) -> FloatArray:
+    """Calculate leave-one-firm-out scores without a self-weight subtraction.
+
+    Args:
+        events:
+            Already selected first events using firm, period, and hours columns.
+        bandwidths:
+            Positive bandwidths in the order to evaluate.
+
+    Returns:
+        Mean multiclass Brier scores computed by explicitly removing each firm.
+    """
+    doses = events["hours"].to_numpy(dtype=float)
+    cohorts = events["period"].to_numpy()
+    levels = np.unique(cohorts)
+    scores = []
+    for bandwidth in bandwidths:
+        losses = []
+        for index, dose in enumerate(doses):
+            other = np.arange(len(doses)) != index
+            log_kernel = -0.5 * ((doses[other] - dose) / bandwidth) ** 2
+            weights = np.exp(log_kernel - log_kernel.max())
+            probabilities = np.array([weights[cohorts[other] == level].sum() / weights.sum() for level in levels])
+            target = levels == cohorts[index]
+            losses.append(np.sum((probabilities - target) ** 2))
+        scores.append(np.mean(losses))
+    return np.asarray(scores, dtype=float)
+
+
+@pytest.mark.parametrize("doses", [[1.0, 2.0, 3.0, 4.0, 8.0], [4.0] * 6 + [8.0]])
+def test_h0_matches_silverman_scale_with_zero_iqr_fallback(doses: list[float]) -> None:
+    """Use sample standard deviation when repeated doses make the IQR zero."""
+    events = pd.DataFrame({"firm": range(len(doses)), "period": FIRST, "hours": doses})
+    deviation = np.std(doses, ddof=1)
+    lower, upper = np.quantile(doses, [0.25, 0.75])
+    scale = min(deviation, (upper - lower) / 1.349) if upper > lower else deviation
+    expected = 0.9 * scale * len(doses) ** -0.2
+    actual = estimate_h0(events, **EVENT_MAPPINGS)
+    assert isinstance(actual, float)
+    assert actual == pytest.approx(expected, rel=1e-14, abs=0.0)
+
+
+@pytest.mark.parametrize("unique_doses", [False, True], ids=["repeated", "unique"])
+@pytest.mark.parametrize("batch_size", [1, 2, 256])
+def test_bandwidth_cv_matches_stable_brute_force_leave_one_firm_out(
+    bandwidth_events: pd.DataFrame,
+    caplog: pytest.LogCaptureFixture,
+    unique_doses: bool,
+    batch_size: int,
+) -> None:
+    """Keep scores invariant to batching, including extremely narrow kernels."""
+    if unique_doses:
+        bandwidth_events["hours"] = [4.0, 4.5, 5.0, 7.0, 7.5, 8.0, 10.0, 11.0]
+    candidates = np.array([2.0, 0.001, 0.7, 1.3])
+    with caplog.at_level(logging.WARNING):
+        selected, scores = estimate_h_cv(
+            bandwidth_events,
+            **EVENT_MAPPINGS,
+            bandwidths=candidates,
+            batch_size=batch_size,
+        )
+    assert len(caplog.records) <= 1
+    assert list(scores.columns) == ["bandwidth", "cv_brier"]
+    ordered = np.sort(candidates)
+    expected = independent_brier_scores(bandwidth_events, ordered)
+    assert_allclose(scores["bandwidth"], ordered, atol=0.0, rtol=0.0)
+    assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
+    assert selected == ordered[np.argmin(expected)]
+    assert np.isfinite(scores["cv_brier"]).all()
+
+
+def test_bandwidth_default_grid_uses_h0(bandwidth_events: pd.DataFrame) -> None:
+    """Evaluate the documented nine bandwidths without changing their order."""
+    h0 = estimate_h0(bandwidth_events, **EVENT_MAPPINGS)
+    selected, scores = estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS)
+    expected_grid = h0 * np.geomspace(0.25, 4.0, 9)
+    assert_allclose(scores["bandwidth"], expected_grid, atol=0.0, rtol=1e-14)
+    expected = independent_brier_scores(bandwidth_events, expected_grid)
+    assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
+    assert selected == expected_grid[np.argmin(expected)]
+
+
+def test_bandwidth_cv_accepts_finite_scaled_distances_for_large_doses() -> None:
+    """Evaluate an explicit bandwidth when the sample variance overflows."""
+    events = pd.DataFrame(
+        {"firm": range(7), "period": [FIRST] * 3 + [SECOND] * 4, "hours": [4.0] * 6 + [1e308]},
+    )
+    candidates = np.array([1e308])
+    selected, scores = estimate_h_cv(events, **EVENT_MAPPINGS, bandwidths=candidates)
+    expected = independent_brier_scores(events, candidates)
+    assert selected == 1e308
+    assert np.isfinite(scores["cv_brier"]).all()
+    assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
+
+
+def test_bandwidth_selection_respects_first_events_mappings_and_eligibility() -> None:
+    """Normalize first-event ties without filtering or mutating caller data."""
+    events = pd.DataFrame(
+        [
+            ("a", pd.Timestamp("2024-01-08 20:00"), 4.0),
+            ("b", pd.Timestamp("2024-01-11 12:00"), 50.0),
+            ("a", pd.Timestamp("2024-01-08 01:00"), 9.0),
+            ("c", pd.Timestamp("2024-01-01 12:00"), 8.0),
+            ("b", pd.Timestamp("2024-01-09 12:00"), 6.0),
+            ("d", pd.Timestamp("2024-01-09 13:00"), 6.0),
+            ("e", pd.Timestamp("2023-12-01 12:00"), 10.0),
+            ("a", pd.Timestamp("2024-01-20 12:00"), 100.0),
+        ],
+        columns=["person", "when", "assigned"],
+        index=[3] * 8,
+    )
+    original = events.copy(deep=True)
+    expected_events = pd.DataFrame(
+        [("a", FIRST, 4.0), ("b", pd.Timestamp("2024-01-09"), 6.0), ("e", pd.Timestamp("2023-12-01"), 10.0)],
+        columns=["firm", "period", "hours"],
+    )
+    mappings: EventMappings = {"firm_col": "person", "period_col": "when", "dose_col": "assigned"}
+    with patch.object(att.pf, "feols", side_effect=AssertionError("Bandwidth selection must not fit ATT")) as solver:
+        all_h0 = estimate_h0(events, **mappings)
+        selected_h0 = estimate_h0(events, **mappings, eligible_firms=["e", "a", "b"])
+        _, scores = estimate_h_cv(events, **mappings, eligible_firms=["e", "a", "b"], bandwidths=[0.5, 1.5, 4.0])
+    solver.assert_not_called()
+    selected_doses = np.array([4.0, 6.0, 10.0])
+    expected_h0 = 0.9 * min(np.std(selected_doses, ddof=1), 3.0 / 1.349) * 3**-0.2
+    assert selected_h0 == pytest.approx(expected_h0, rel=1e-14, abs=0.0)
+    expected_all = 0.9 * min(np.std([4.0, 6.0, 8.0, 6.0, 10.0], ddof=1), 2.0 / 1.349) * 5**-0.2
+    assert all_h0 == pytest.approx(expected_all, rel=1e-14, abs=0.0)
+    expected_scores = independent_brier_scores(expected_events, np.array([0.5, 1.5, 4.0]))
+    assert_allclose(scores["cv_brier"], expected_scores, atol=2e-14, rtol=2e-14)
+    assert_frame_equal(events, original)
+
+
+def test_bandwidth_cv_combines_singleton_boundary_and_tie_warnings(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Choose the smallest tied candidate and log all caveats only once."""
+    events = pd.DataFrame({"firm": ["a", "b"], "period": [FIRST, SECOND], "hours": [4.0, 8.0]})
+    with caplog.at_level(logging.WARNING):
+        selected, scores = estimate_h_cv(events, **EVENT_MAPPINGS, bandwidths=[2.0, 0.001, 1.0])
+    assert selected == 0.001
+    assert_allclose(scores["cv_brier"], 2.0, atol=0.0, rtol=0.0)
+    assert len(caplog.records) == 1
+    assert "singleton" in caplog.text
+    assert "boundary" in caplog.text
+    assert "tie" in caplog.text
+
+
+@pytest.mark.parametrize("estimator", [estimate_h0, estimate_h_cv], ids=["h0", "cv"])
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("constant", "variation"),
+        ("nan_dose", "finite"),
+        ("boolean_dose", "real numeric"),
+        ("text_period", "datetime64"),
+        ("missing_firm", "must not be missing"),
+        ("unknown_firm", "eligible firm must be present"),
+    ],
+)
+def test_bandwidth_estimators_reject_invalid_samples(
+    bandwidth_events: pd.DataFrame,
+    estimator: Callable[..., object],
+    case: str,
+    message: str,
+) -> None:
+    """Reject invalid populations before calculating smoothing parameters."""
+    eligible = list(bandwidth_events["firm"])
+    if case == "constant":
+        bandwidth_events["hours"] = 4.0
+    elif case == "nan_dose":
+        bandwidth_events.loc[0, "hours"] = np.nan
+    elif case == "boolean_dose":
+        bandwidth_events["hours"] = True
+    elif case == "text_period":
+        bandwidth_events["period"] = bandwidth_events["period"].astype(str)
+    elif case == "missing_firm":
+        bandwidth_events.loc[0, "firm"] = None
+    else:
+        eligible = ["unknown"]
+    with pytest.raises(ValueError, match=message):
+        estimator(bandwidth_events, **EVENT_MAPPINGS, eligible_firms=eligible)
+
+
+def test_bandwidth_cv_requires_multiple_cohorts(bandwidth_events: pd.DataFrame) -> None:
+    """Allow Silverman scale estimation but reject a one-category CV target."""
+    bandwidth_events["period"] = FIRST
+    assert estimate_h0(bandwidth_events, **EVENT_MAPPINGS) > 0.0
+    with pytest.raises(ValueError, match="cohort"):
+        estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=[0.5, 1.0])
+
+
+@pytest.mark.parametrize("candidates", [[], [0.0, 1.0], [np.nan, 1.0], [1.0, 1.0], [True, 2.0]])
+def test_bandwidth_cv_rejects_invalid_candidate_grids(
+    bandwidth_events: pd.DataFrame,
+    candidates: list[float],
+) -> None:
+    """Require distinct positive finite bandwidths instead of coercing them."""
+    with pytest.raises(ValueError, match="bandwidth"):
+        estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=candidates)
+
+
+@pytest.mark.parametrize("batch_size", [0, 1.5, True])
+def test_bandwidth_cv_rejects_invalid_batch_sizes(
+    bandwidth_events: pd.DataFrame,
+    batch_size: int | float,
+) -> None:
+    """Require a positive integer batch size without accepting Boolean values."""
+    estimator: Callable[..., object] = estimate_h_cv
+    with pytest.raises(ValueError, match="batch_size"):
+        estimator(bandwidth_events, **EVENT_MAPPINGS, bandwidths=[0.5, 1.0], batch_size=batch_size)
