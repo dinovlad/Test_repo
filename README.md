@@ -4,7 +4,9 @@ A Python 3.11 package with its estimator in the self-contained module
 `src/labor_cost_optimization/att.py`, for fixed-dose event studies. `ATT` fits a
 separate PyFixest polynomial model for each cohort and horizon.
 `estimate_pi()` estimates dose-specific cohort weights; `evaluate_theta()`
-aggregates cohort effects at each dose and horizon.
+aggregates cohort effects at each dose and horizon. `estimate_h0()` supplies a
+Silverman bandwidth rule, and `estimate_h_cv()` selects a bandwidth by predicting
+cohorts from doses with leave-one-firm-out cross-validation.
 
 Install the pinned environment:
 
@@ -15,7 +17,14 @@ uv sync --python 3.11 --group dev
 Supply outcome and termination DataFrames and explicitly name their columns:
 
 ```python
-from labor_cost_optimization.att import ATT, evaluate_theta
+from labor_cost_optimization.att import ATT, estimate_h_cv, evaluate_theta
+
+bandwidth, cv_scores = estimate_h_cv(
+    events,
+    firm_col=firm_col,
+    period_col=period_col,
+    dose_col=dose_col,
+)
 
 model = ATT(
     firm_col=firm_col,
@@ -25,7 +34,7 @@ model = ATT(
 ).fit(outcomes, events, isolation_window=(-7, 14))
 
 components = model.predict([4, 6, 8, 10, 12])
-theta = evaluate_theta(model, [4, 6, 8, 10, 12], bandwidth=1.0)
+theta = evaluate_theta(model, [4, 6, 8, 10, 12], bandwidth=bandwidth)
 ```
 
 The four column-name variables are caller-supplied strings. Both tables must
@@ -33,6 +42,39 @@ use the same firm and period labels. Periods are timezone-naive `datetime64[ns]`
 values, normalized at a fixed daily frequency. Missing firm-period rows are
 allowed; outcomes on present rows must be finite. The event table must contain
 the complete termination history used for isolation and control selection.
+
+The bandwidth helpers accept the raw event table and select the first event per
+firm after normalizing periods. They need no outcome table or fitted model.
+Pass `eligible_firms` to restrict their population after first-event selection;
+otherwise they use all first events, without inferring isolation or outcome
+availability. A bandwidth estimated on this population can be reused across
+horizons, but its CV score does not average over different horizon populations.
+
+For a quick dose-scale bandwidth, use:
+
+```python
+from labor_cost_optimization.att import estimate_h0
+
+h0 = estimate_h0(
+    events,
+    firm_col=firm_col,
+    period_col=period_col,
+    dose_col=dose_col,
+)
+```
+
+`estimate_h_cv()` evaluates nine bandwidths from `h0 / 4` to `4 * h0` by default,
+or a supplied positive, distinct `bandwidths` grid. It returns the selected
+bandwidth and a table with `bandwidth` and `cv_brier` columns. Its mean multiclass
+Brier loss gives every firm equal weight, holding out only that firm's own
+contribution, including when doses repeat. Exact ties select the smallest
+bandwidth. Singleton cohorts are retained; their held-out own-cohort probability
+is zero. CV requires at least two cohorts and varying doses. It emits at most one
+summary warning for singleton cohorts, a boundary selection, or tied minima.
+`batch_size=256` bounds the query-dose batch; grouping repeated doses reduces
+work, while all-distinct doses can still require quadratic computation.
+These are custom bandwidth choices, not methods prescribed by the article.
+See [att.md](att.md) for the formulas and population requirements.
 
 The implementation keeps each firm's first termination as its only target,
 retains later terminations for screening, and reports exclusions in one warning
@@ -97,7 +139,7 @@ source files. The default timeout is 600 seconds per check; override it with
 The pytest tests use synthetic data and compare the real PyFixest cell models against
 independent least-squares calculations, including no-internal-knot B-spline
 reference curves. They cover saved polynomial transformations, cohort weights,
-aggregation, missing periods, isolation, duplicate events, zero effects, and
+bandwidth rules and exact leave-one-firm-out scores, aggregation, missing periods, isolation, duplicate events, zero effects, and
 failed-fit handling. A run that does not satisfy the configured Python or runtime
 package requirements is marked as a mismatch even if its numerical tests pass.
 The [validation workflow](.github/workflows/validate.yml) runs pytest with Python

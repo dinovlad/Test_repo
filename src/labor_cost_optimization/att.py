@@ -16,10 +16,11 @@ import numpy as np
 import pandas as pd
 import pyfixest as pf
 from numpy.typing import NDArray
+from scipy.sparse import csr_matrix
 from scipy.special import logsumexp
 
 
-__all__ = ["ATT", "estimate_pi", "evaluate_theta"]
+__all__ = ["ATT", "estimate_h0", "estimate_h_cv", "estimate_pi", "evaluate_theta"]
 
 FloatArray = NDArray[np.float64]
 Cell = tuple[pd.Timestamp, int]
@@ -859,6 +860,245 @@ def _validate_aggregation_firms(firms: Iterable[object], name: str) -> list[obje
     if len(unique) != len(values):
         raise ValueError(f"{name} must contain unique firm identifiers.")
     return values
+
+
+def _bandwidth_events(
+    events: pd.DataFrame,
+    firm_col: str,
+    period_col: str,
+    dose_col: str,
+    eligible_firms: Iterable[object] | None,
+) -> pd.DataFrame:
+    """Validate event inputs and select one first event per requested firm."""
+    columns = [firm_col, period_col, dose_col]
+    if any(not isinstance(column, str) or not column for column in columns) or len(set(columns)) != 3:
+        raise ValueError("Bandwidth column names must be distinct nonempty strings.")
+    _require_columns(events, columns, "events")
+    first = events[columns].copy()
+    first.columns = ["firm_id", "cohort", "dose"]
+    _firm_ids(first["firm_id"])
+    first["cohort"] = _periods(first["cohort"])
+    first["dose"] = _numeric(first["dose"], "Doses", positive=True)
+    first = first.sort_values("cohort", kind="stable").drop_duplicates("firm_id")
+    if eligible_firms is not None:
+        eligible = _validate_aggregation_firms(eligible_firms, "eligible_firms")
+        if not set(eligible).issubset(set(first["firm_id"])):
+            raise ValueError("Every eligible firm must be present in events.")
+        first = first.loc[first["firm_id"].isin(eligible)]
+    if len(first) < 2:
+        raise ValueError("Bandwidth estimation requires at least two selected firms.")
+    return first.reset_index(drop=True)
+
+
+def _silverman_h0(doses: FloatArray) -> float:
+    """Compute the initial bandwidth from validated first-event doses."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        sd = float(doses.std(ddof=1))
+        q25, q75 = np.percentile(doses, [25, 75])
+        iqr = float(q75 - q25)
+        scale = min(sd, iqr / 1.349) if iqr > 0 else sd
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Selected doses must have positive finite variation.")
+    return float(0.9 * scale * len(doses) ** (-0.2))
+
+
+def estimate_h0(
+    events: pd.DataFrame,
+    *,
+    firm_col: str,
+    period_col: str,
+    dose_col: str,
+    eligible_firms: Iterable[object] | None = None,
+) -> float:
+    """Estimate Silverman's starting bandwidth from first-event doses.
+
+    Args:
+        events:
+            Initial event table with positive finite doses and datetime64[ns]
+            periods. Each firm's earliest normalized period is selected;
+            same-period ties retain input order. Inputs are not modified.
+        firm_col:
+            Firm identifier column.
+        period_col:
+            Event period column; time components are ignored.
+        dose_col:
+            Dose column.
+        eligible_firms:
+            Optional unique firm identifiers to retain after first-event
+            selection. None uses all first events. No isolation, outcome
+            availability, or fitted-cell screens are applied automatically.
+
+    Returns:
+        A bandwidth in dose units, using one observation per selected firm.
+        Repeated doses remain separate observations. The sample standard
+        deviation is used alone when the interquartile range is zero.
+
+    Raises:
+        ValueError:
+            Inputs violate the event schema or eligibility rules, fewer than
+            two firms remain, or selected doses lack positive finite variation.
+    """
+    first = _bandwidth_events(events, firm_col, period_col, dose_col, eligible_firms)
+    return _silverman_h0(first["dose"].to_numpy(dtype=float))
+
+
+def _loo_brier_scores(
+    doses: FloatArray,
+    cohort_codes: NDArray[np.int64],
+    bandwidths: FloatArray,
+    batch_size: int,
+) -> FloatArray:
+    """Compute exact firm-level leave-one-out loss using sparse dose-cohort counts.
+
+    Repeated doses share a query but retain their firm multiplicities. Remove
+    singleton query doses before kernel stabilization; subtract one self-weight
+    for repeated doses. This avoids cancellation when a tiny bandwidth would
+    give an isolated held-out firm almost all the in-sample kernel mass.
+
+    Args:
+        doses:
+            Positive finite doses, with one entry per selected firm.
+        cohort_codes:
+            Corresponding consecutive cohort codes starting from zero.
+        bandwidths:
+            Validated positive finite candidate bandwidths.
+        batch_size:
+            Maximum number of distinct query doses processed together.
+
+    Returns:
+        Mean firm-level Brier loss for each supplied bandwidth.
+
+    Raises:
+        ValueError:
+            Kernel arithmetic overflows or losses are nonfinite or outside
+            the Brier bounds beyond rounding tolerance.
+    """
+    unique_doses, dose_codes, multiplicities = np.unique(doses, return_inverse=True, return_counts=True)
+    counts = csr_matrix(
+        (np.ones(len(doses)), (dose_codes, cohort_codes)),
+        shape=(len(unique_doses), int(cohort_codes.max()) + 1),
+    )
+    losses_by_dose = np.empty((len(unique_doses), len(bandwidths)))
+    for start in range(0, len(unique_doses), batch_size):
+        stop = min(start + batch_size, len(unique_doses))
+        query_indices = np.arange(start, stop)
+        singleton = multiplicities[start:stop] == 1
+        self_weight = (~singleton).astype(float)
+        differences = unique_doses[start:stop, None] - unique_doses[None, :]
+        for index, bandwidth in enumerate(bandwidths):
+            try:
+                with np.errstate(over="raise", invalid="raise", divide="raise"):
+                    log_kernel = -0.5 * np.square(differences / bandwidth)
+            except FloatingPointError as exc:
+                raise ValueError("CV kernel calculations overflowed; increase bandwidths or rescale doses.") from exc
+            log_kernel[np.flatnonzero(singleton), query_indices[singleton]] = -np.inf
+            log_kernel -= log_kernel.max(axis=1, keepdims=True)
+            kernel = np.exp(log_kernel)
+            masses = np.asarray(counts.T @ kernel.T, dtype=float).T
+            denominator = masses.sum(axis=1) - self_weight
+            probabilities = masses / denominator[:, None]
+            own_probability = (
+                np.asarray(counts[start:stop].multiply(probabilities).sum(axis=1)).ravel()
+                / multiplicities[start:stop]
+            )
+            adjustment = self_weight / denominator
+            # Subtract the held-out firm's probability only in its own cohort,
+            # then average that cohort's contribution over same-dose firms.
+            losses = (
+                1.0
+                + np.square(probabilities).sum(axis=1)
+                - 2.0 * (1.0 + adjustment) * own_probability
+                + 2.0 * adjustment
+                + np.square(adjustment)
+            )
+            if not np.isfinite(losses).all() or (losses < -1e-12).any() or (losses > 2.0 + 1e-12).any():
+                raise ValueError("CV produced invalid multiclass Brier scores.")
+            losses_by_dose[start:stop, index] = np.clip(losses, 0.0, 2.0) * multiplicities[start:stop]
+    return losses_by_dose.sum(axis=0) / len(doses)
+
+
+def estimate_h_cv(
+    events: pd.DataFrame,
+    *,
+    firm_col: str,
+    period_col: str,
+    dose_col: str,
+    eligible_firms: Iterable[object] | None = None,
+    bandwidths: Iterable[float] | None = None,
+    batch_size: int = 256,
+) -> tuple[float, pd.DataFrame]:
+    """Select a Gaussian bandwidth by leave-one-firm-out multiclass Brier loss.
+
+    Args:
+        events:
+            Initial event table with positive finite doses and datetime64[ns]
+            periods. Select each firm's earliest normalized event, breaking
+            same-period ties by input order, without modifying the input table.
+        firm_col:
+            Firm identifier column.
+        period_col:
+            Event period column; time components are ignored.
+        dose_col:
+            Dose column.
+        eligible_firms:
+            Optional unique firm identifiers to retain after first-event
+            selection. None uses all first events. Outcome availability,
+            isolation, and fitted-cell eligibility are not inferred.
+        bandwidths:
+            Distinct positive finite candidate bandwidths in dose units.
+            None uses nine geometrically spaced values from h0/4 to 4*h0.
+        batch_size:
+            Positive number of distinct query doses processed together.
+            Batching limits kernel memory; all-distinct doses still require
+            quadratic work for exact leave-one-firm-out evaluation.
+
+    Returns:
+        The selected bandwidth and a DataFrame with bandwidth and cv_brier
+        columns, sorted by bandwidth. Scores average over firms, not distinct
+        doses. Exact ties choose the smallest bandwidth. At most one warning
+        summarizes singleton cohorts, a boundary optimum, and tied minima.
+        This tunes one selected population; no ATT models are refitted and
+        no averaging of horizon-specific CV risks is performed.
+
+    Raises:
+        ValueError:
+            Inputs, eligibility, candidate bandwidths, or batch size are
+            invalid; fewer than two cohorts or distinct doses remain; or
+            kernel arithmetic overflows or produces invalid losses.
+    """
+    batch_size = _integer(batch_size, "batch_size", 1)
+    first = _bandwidth_events(events, firm_col, period_col, dose_col, eligible_firms)
+    doses = first["dose"].to_numpy(dtype=float)
+    if doses.min() == doses.max():
+        raise ValueError("Selected doses must have positive variation.")
+    cohort_codes, cohorts = pd.factorize(first["cohort"], sort=True)
+    if len(cohorts) < 2:
+        raise ValueError("Bandwidth CV requires at least two selected cohorts.")
+    if bandwidths is None:
+        bandwidths = _silverman_h0(doses) * np.geomspace(0.25, 4.0, 9)
+    try:
+        if isinstance(bandwidths, (str, bytes)):
+            raise ValueError("A bandwidth grid must contain numbers.")
+        values = list(bandwidths)
+        if any(isinstance(value, (bool, np.bool_)) for value in values):
+            raise ValueError("Boolean bandwidths are invalid.")
+        candidates = np.sort(_validate_doses(values))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("bandwidths must contain distinct positive finite numbers.") from exc
+    scores = _loo_brier_scores(doses, np.asarray(cohort_codes, dtype=np.int64), candidates, batch_size)
+    best = int(np.argmin(scores))
+    messages = []
+    singletons = int(np.count_nonzero(np.bincount(cohort_codes) == 1))
+    if singletons:
+        messages.append(f"{singletons} singleton cohorts have zero own-cohort probability when held out")
+    if best in {0, len(candidates) - 1}:
+        messages.append("selected bandwidth is at the candidate-grid boundary; consider widening the grid")
+    ties = int(np.count_nonzero(scores == scores[best]))
+    if ties > 1:
+        messages.append(f"{ties} candidates tie for the minimum; selected the smallest bandwidth")
+    if messages:
+        logging.warning("Bandwidth CV summary: %s.", "; ".join(messages))
+    return float(candidates[best]), pd.DataFrame({"bandwidth": candidates, "cv_brier": scores})
 
 
 def estimate_pi(

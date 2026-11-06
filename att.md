@@ -4,9 +4,16 @@ This document specifies the self-contained Python module [att.py](src/labor_cost
 
 **Periods and frequency.** The frequency is hardcoded to one calendar day. A period means one step at that fixed frequency. There is no frequency parameter or support for monthly or annual inputs. Input and output period labels are timezone-naive `datetime64[ns]` values normalized to the start of each period. All event-time offsets, isolation bounds, baseline comparisons, and dose units have a daily interpretation.
 
-The public API consists of one class and two functions. In this example, `firm_col`, `period_col`, `outcome_col`, and `dose_col` are caller-supplied strings naming columns in the input tables; all four must be provided:
+The public API consists of one class and four functions: `ATT`, `estimate_h0()`, `estimate_h_cv()`, `estimate_pi()`, and `evaluate_theta()`. In this example, `firm_col`, `period_col`, `outcome_col`, and `dose_col` are caller-supplied strings naming columns in the input tables; all four must be provided:
 
 ```python
+bandwidth, cv_scores = estimate_h_cv(
+    events,
+    firm_col=firm_col,
+    period_col=period_col,
+    dose_col=dose_col,
+)
+
 model = ATT(
     firm_col=firm_col,
     period_col=period_col,
@@ -40,7 +47,7 @@ theta = evaluate_theta(
 
 For `isolation_window=(-7, 14)`, `fit()` processes all 22 integer horizons from -7 through 14. It takes no `event_times` argument. Prediction and aggregation may select subsets of that range.
 
-The standalone weight example requires the precise retained store identifiers eligible at one event period. `evaluate_theta()` constructs that set automatically. The bandwidth is supplied in hours. The illustrated isolation window is a configuration example, not a recommended empirical choice. Screening bounds are inferred from the overall minimum and maximum normalized outcome periods across all stores.
+The standalone weight example requires the precise retained store identifiers eligible at one event period. `evaluate_theta()` constructs that set automatically. The bandwidth is in hours. The illustrated bandwidth call uses the raw event table and selects its own first row per store; it does not require fitted outcomes. Without `eligible_firms`, it tunes over all of those first events, not automatically over the eventual isolated and observed estimation population. The optional subset and bandwidth criteria are specified below. The illustrated isolation window is a configuration example, not a recommended empirical choice. Screening bounds are inferred from the overall minimum and maximum normalized outcome periods across all stores.
 
 **Store units and first terminations.** Store $i$ is the unit. Let $G_i$ be its earliest recorded termination period in the supplied history, and let $D_i>0$ be the scheduled hours per period removed by that termination. The store identifier is the sole estimation-unit key. Employee identifiers are neither required nor used. Keep only this first termination as the store's estimation candidate; later terminations never become additional targets or enter its aggregation weights.
 
@@ -422,7 +429,80 @@ Each supplied store contributes exactly once. Do not count outcome rows, additio
 
 Return `cohort`, `dose`, and `weight`, sorted by normalized cohort period and dose. No event-time argument is needed: supplying a different eligible-event set supplies the horizon dependence. The function can also inspect sensitivity to dose and bandwidth.
 
-This is a custom estimator of conditional cohort probabilities. The article does not prescribe this kernel or bandwidth, and the package's existing dose aggregation does not supply these conditional weights. A positive bandwidth smooths cohort composition over nearby doses; consistency for exact conditional probabilities requires suitable smoothness, bandwidth, and sample-size conditions. Each store supplies only one dose/cohort observation to this calculation. Automatic bandwidth selection is outside the scope of this module.
+This is a custom estimator of conditional cohort probabilities. The article does not prescribe this kernel or bandwidth, and the package's existing dose aggregation does not supply these conditional weights. A positive bandwidth smooths cohort composition over nearby doses; consistency for exact conditional probabilities requires suitable smoothness, bandwidth, and sample-size conditions. Each store supplies only one dose/cohort observation to this calculation. The standalone helpers below provide a dose-scale rule and cross-validated bandwidth selection; callers still pass the selected bandwidth explicitly to `estimate_pi()` or `evaluate_theta()`.
+
+**Standalone bandwidth selection.** The two bandwidth helpers take raw termination records and required column mappings, independently of `ATT` and the outcome panel:
+
+```python
+estimate_h0(
+    events,
+    *,
+    firm_col,
+    period_col,
+    dose_col,
+    eligible_firms=None,
+) -> float
+
+estimate_h_cv(
+    events,
+    *,
+    firm_col,
+    period_col,
+    dose_col,
+    eligible_firms=None,
+    bandwidths=None,
+    batch_size=256,
+) -> tuple[float, pandas.DataFrame]
+```
+
+Validate nonempty, distinct mapped column names, unique DataFrame labels, nonmissing hashable store identifiers, positive finite numeric doses, and timezone-naive `datetime64[ns]` periods. Normalize periods without changing the input table, stably sort by period, and keep the first whole event row per store, using original input order for same-period ties. Apply the optional `eligible_firms` filter only after this first-event selection; filtering cannot promote a later event or give a store several contributions. If supplied, the subset must be nonempty, contain unique valid identifiers, and name only stores present in the event table. With `None`, use every selected first event. A store with several terminations contributes once, and stores with the same dose remain distinct observations.
+
+These helpers receive no outcome table, isolation window, model, or event horizon. They do not apply isolation, endpoint-availability, or regression-design screens and cannot infer the population used by $\theta(d,e)$. In particular, a simultaneous first event is selected by stable order here; the bandwidth helper does not apply `ATT`'s overlap exclusion. Supply `eligible_firms` explicitly to tune on a population selected elsewhere, such as the exact stores used by `evaluate_theta()` at a chosen horizon. The selected bandwidth may be reused across horizons, but the score describes only this one supplied population; it does not implicitly average validation risks across horizon-specific populations or refit any ATT model.
+
+Let $\mathcal I$ be the resulting store set, $n=|\mathcal I|$, and $s_D$ its sample standard deviation of doses, computed with divisor $n-1$. Let $Q_D$ be its interquartile range, using linearly interpolated sample quartiles. The dose-scale rule is
+
+$$
+\widehat h_0
+=0.9\thinspace{}s_\star\thinspace{}n^{-1/5},
+\qquad
+s_\star=
+\begin{cases}
+\min(s_D,Q_D/1.349),&Q_D>0,\\
+s_D,&Q_D=0.
+\end{cases}
+$$
+
+`estimate_h0()` returns this positive finite scalar in the dose's units, hours in this application. It requires at least two selected stores and positive dose variation. The standard-deviation fallback when the interquartile range is zero accommodates repeated doses; it does not assign a bandwidth to constant doses. This Silverman rule supplies a scale-based candidate or a starting grid, not an optimum specifically derived for the conditional cohort probabilities. It does not require several cohorts.
+
+`estimate_h_cv()` selects a bandwidth for predicting the categorical cohort $G_i$ from the dose $D_i$. It uses exact leave-one-store-out Gaussian probabilities. For every held-out store $i$ and cohort $g$ represented in $\mathcal I$, define
+
+$$
+\widehat p_{g,-i}(D_i;h)
+=
+\frac{\displaystyle\sum_{j\in\mathcal I:\,j\ne i,\,G_j=g}
+\exp\left[-\frac12\left(\frac{D_j-D_i}{h}\right)^2\right]}
+{\displaystyle\sum_{j\in\mathcal I:\,j\ne i}
+\exp\left[-\frac12\left(\frac{D_j-D_i}{h}\right)^2\right]}.
+$$
+
+Remove only the held-out store's own kernel contribution. Other stores at exactly the same dose remain in training, including stores in the same cohort. With $\mathcal G$ the represented cohort set, minimize the mean multiclass Brier loss
+
+$$
+CV(h)
+=\frac1n\sum_{i\in\mathcal I}
+\sum_{g\in\mathcal G}
+\left[1\lbrace G_i=g\rbrace-\widehat p_{g,-i}(D_i;h)\right]^2.
+$$
+
+Every selected store has weight $1/n$ in this score. Do not average equally over unique doses or cohorts, and do not divide the inner sum by the number of cohorts. The calculation uses doses and cohort labels only; store sales and fitted ATT values do not enter the loss. It tunes prediction of cohort composition, not the outcome regression or the mean squared error of $\theta$.
+
+If `bandwidths=None`, evaluate the nine candidates from `h0 * numpy.geomspace(0.25, 4.0, 9)`, using `estimate_h0()`'s rule on the same selected population. An explicit grid must be a nonempty collection of distinct positive finite bandwidths. Sort candidates increasingly and return the smallest bandwidth among exact minimizers. Return `(bandwidth, scores)`, where `scores` is a DataFrame with `bandwidth` and `cv_brier` columns, sorted by bandwidth and containing one row per evaluated candidate. The returned minimum is over this finite grid; do not silently expand a boundary grid or optimize between candidates.
+
+Require at least two selected stores, two represented cohorts, and positive dose variation for cross-validation. With one cohort or constant doses, the criterion cannot tune the requested smoothing relationship, so raise `ValueError` even if an explicit candidate grid was supplied. Singleton cohorts remain allowed: when their sole store is held out, the estimated probability of its own cohort is zero. Include those stores and classes in the loss; do not discard them or add pseudocounts. After a successful search, emit at most one `logging.warning()` summarizing the number of singleton cohorts, whether the chosen bandwidth is at a grid boundary, and how many exact minima are tied, whenever any of those conditions applies. Do not issue a warning per cohort or candidate. A search without these conditions emits no warning.
+
+Compute the exact criterion using batches of unique query doses against unique training doses and sparse dose-by-cohort count matrices. Account for multiplicities when subtracting a held-out store's self contribution and averaging the loss, so grouped computation agrees with the explicit store-by-store definition. `batch_size` must be a positive integer and limits the number of query-dose rows processed together; changing it must not change the selected bandwidth or scores beyond numerical precision. Avoid allocating the full store-by-store kernel matrix. Runtime can still be quadratic when every dose is distinct, and memory also depends on the number of distinct doses and cohorts; batching is not an approximation or a guarantee of subquadratic computation.
+
+Both bandwidth rules and this validation criterion are custom additions. Callaway et. al. (2025) do not prescribe them, and selecting a bandwidth does not supply identification or inference for $\theta(d,e)$. The conditional-weight estimator, retained samples, and component regressions remain exactly those specified above.
 
 **Thin extension for evaluating the event study.** A standalone function is sufficient; no second estimator class or inheritance hierarchy is needed:
 
@@ -475,9 +555,9 @@ This equals the pre-screen observed-endpoint target only when every eligible coh
 
 The screen is sample-dependent; this description is not an inferential result about selection. Both within-cohort store composition and retained cohorts may change across horizons. The fixed isolation window ensures period coverage from $L$ through $H$, including the baseline, for all design-eligible events. No common set of stores with complete outcomes is imposed across horizons; inactivity or closure can still change the observed sample.
 
-**Implementation boundaries and validation plan.** Put the class, both public functions, and a few private validation, window-selection, polynomial, and cell-regression helpers in the single `src/labor_cost_optimization/att.py` file. Use the `labor_cost_optimization` package under the `src` directory; keep estimator logic in that module. Use `firm` and `period` consistently in all Python identifiers, canonical column names, docstrings, and error/log messages, including private helpers. Use `period_col`, `origin_period_`, `last_period_`, `last_period_index_`, and output column `period`; preserve literal third-party API/type names such as `datetime64[ns]` and `.dt.normalize()`. This plan keeps the application term “store” in explanatory prose; code examples and public schema names follow the general `firm` and `period` terminology. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. No generic estimator framework, serialization layer, or extra classes are needed.
+**Implementation boundaries and validation plan.** Put the class, all four public functions, and a few private validation, window-selection, polynomial, bandwidth, and cell-regression helpers in the single `src/labor_cost_optimization/att.py` file. Use the `labor_cost_optimization` package under the `src` directory; keep estimator logic in that module. Use `firm` and `period` consistently in all Python identifiers, canonical column names, docstrings, and error/log messages, including private helpers. Use `period_col`, `origin_period_`, `last_period_`, `last_period_index_`, and output column `period`; preserve literal third-party API/type names such as `datetime64[ns]` and `.dt.normalize()`. This plan keeps the application term “store” in explanatory prose; code examples and public schema names follow the general `firm` and `period` terminology. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. No generic estimator framework, serialization layer, or extra classes are needed.
 
-**Docstring convention.** Use Google-style docstrings throughout `src/labor_cost_optimization/att.py`, including the module, `ATT`, its constructor and public methods, both public functions, and private helpers. Start with a concise summary followed by a blank line before any extended description or sections. Use `Args:`, `Returns:`, and `Raises:` where applicable; omit empty or inapplicable sections. Document constructor arguments in `__init__` and fitted public attributes in the class docstring's `Attributes:` section. Simple helpers may use a one-line docstring when no further contract needs explaining.
+**Docstring convention.** Use Google-style docstrings throughout `src/labor_cost_optimization/att.py`, including the module, `ATT`, its constructor and public methods, all four public functions, and private helpers. Start with a concise summary followed by a blank line before any extended description or sections. Use `Args:`, `Returns:`, and `Raises:` where applicable; omit empty or inapplicable sections. Document constructor arguments in `__init__` and fitted public attributes in the class docstring's `Attributes:` section. Simple helpers may use a one-line docstring when no further contract needs explaining.
 
 Indent argument names, exception classes, and attribute names four spaces relative to the section heading, each followed by a colon on its own line. Start each description on the next line, indented eight spaces, and keep wrapped description lines at that indentation. Plain prose in `Returns:` stays at four spaces. Preserve blank lines between the summary and sections and between successive sections. Document every argument except `self` and `cls`, using its exact signature name; type annotations belong in the signature. Explain returned objects and relevant DataFrame schemas, and describe the conditions for exceptions the caller needs to handle. Describe state changes such as `fit()` replacing earlier fitted state and when fitted attributes become available. Keep docstrings consistent with the implemented behavior and use `firm` and `period` throughout. Nonfatal diagnostics emitted by `logging.warning()` are not exceptions and do not belong in `Raises:`.
 
@@ -536,9 +616,14 @@ The pytest suite in [tests/test_att.py](tests/test_att.py) checks the implementa
 - Screening bounds equal the overall normalized outcome-period minimum and maximum, regardless of individual-store gaps or additional event periods. An isolation interval crossing either boundary excludes the event at every horizon; intervals touching the boundaries are allowed. Extra event records outside the panel cannot rescue an excluded event. Changing only prediction horizons leaves the fitted screen unchanged.
 - Small or rank-deficient comparisons contribute to the single fit warning and disappear from the corresponding horizon only, while retaining the complete history. Verify that an estimable short horizon survives a sparse later horizon, with separate fitted bases and matching store-specific kernel inputs.
 - Weights count each selected store once, sum to one, reflect unequal cohort sizes, and match the explicit formula. A within-cohort excluded event cannot leak back into the weights.
+- Both bandwidth helpers select the first event per store after period normalization, apply optional eligible-store filtering afterward, preserve inputs, and work without outcomes or an `ATT` fit. Verify renamed columns, repeated terminations, same-period ties, invalid identifiers, and unknown or duplicated subset identifiers.
+- `estimate_h0()` matches the sample-standard-deviation and interquartile-range formula, including the zero-interquartile-range fallback. One cohort remains valid when doses vary; insufficient observations and constant doses fail.
+- `estimate_h_cv()` matches a direct store-by-store leave-one-out Gaussian calculation, including repeated doses, unequal cohort sizes, and singleton cohorts. Its score averages over stores and sums over every cohort, with the held-out store excluded but same-dose peers retained.
+- Verify the default nine-bandwidth grid, sorted score schema, smallest exact-minimum tie rule, positive unique candidate validation, and positive integer batch size. Different batch sizes must preserve the score and selection within numerical precision. One cohort or constant doses fail even with explicit candidates.
+- A CV search emits at most one aggregate warning for singleton cohorts, a selected boundary, or tied minima, with correct counts. A clean interior unique-minimum search emits none. Bandwidth selection never refits component models or mutates their samples, coefficients, diagnostics, or weights.
 - Aggregation equals a manual weighted sum for both post-treatment and placebo horizons, reports store counts and estimate types, identifies the retained population, and rejects any requested horizon with a missing required cell, including a reference cell with no controls.
 
-The implementation provides point estimates through `ATT`, `estimate_pi()`, and `evaluate_theta()`. Future inference must cluster or resample by store, carrying its selected event, full termination history, and outcomes together, and account for shared controls, estimated weights, smoothing, and selection. Clustering handles dependence; it does not fix contaminated controls or justify the identifying assumption. Store-level independence and an adequate number of independent stores would still require assessment.
+The implementation provides point estimates through `ATT`, `estimate_pi()`, and `evaluate_theta()`, with standalone bandwidth choices through `estimate_h0()` and `estimate_h_cv()`. Future inference must cluster or resample by store, carrying its selected event, full termination history, and outcomes together, and account for shared controls, estimated weights, smoothing, and selection. Clustering handles dependence; it does not fix contaminated controls or justify the identifying assumption. Store-level independence and an adequate number of independent stores would still require assessment.
 
 ## References
 
