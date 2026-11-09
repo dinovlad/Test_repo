@@ -17,7 +17,7 @@ Description: Verify that modified or newly created Python code, tests and notebo
     - double quotes for string values;
     - built-in types instead of `typing` aliases, `|` instead of `Union` / `Optional`;
     - `@override` decorator on overriding methods;
-    - extended assert form `assert expression1, expression2`;
+    - extended assert form `assert expression1, expression2` outside unit tests; assertion messages are optional in unit tests;
     - docstrings in imperative mood, opening on the same line as the quotes, with periods on descriptions of methods, functions, attributes, return values and exceptions;
     - required docstring sections: `Args:` for at least one non-`self`/`cls` argument, `Raises:` for explicitly raised exceptions (excluding `assert` statements) or unhandled exceptions from called functions, `Returns:` when the return value type is not `None`;
     - newline after the argument name in `Args:` / `Attributes:` and after the exception class name in `Raises:`; single reasons as plain text, multiple reasons as bullet points;

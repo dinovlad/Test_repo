@@ -1,4 +1,7 @@
 .venv/
+env/
+.env
+.env.*
 __pycache__/
 .mypy_cache/
 .ruff_cache/
@@ -7,3 +10,10 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+*.parquet
+*.csv
+*.joblib
+*.pkl
+*.xlsx
+*.png
+*.log

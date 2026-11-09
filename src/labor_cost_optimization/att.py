@@ -8,21 +8,22 @@ See att.md for the identifying assumptions and selected-population estimand.
 from __future__ import annotations
 
 import logging
+import numbers
 from collections.abc import Iterable
-from numbers import Integral
-from typing import Any, Self, cast
+from typing import Annotated, Any, Self, cast
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
+import pydantic
 import pyfixest as pf
-from numpy.typing import NDArray
-from scipy.sparse import csr_matrix
-from scipy.special import logsumexp
+import scipy.sparse
+import scipy.special
 
 
 __all__ = ["ATT", "estimate_h0", "estimate_h_cv", "estimate_pi", "evaluate_theta"]
 
-FloatArray = NDArray[np.float64]
+FloatArray = npt.NDArray[np.float64]
 Cell = tuple[pd.Timestamp, int]
 _PERIOD = pd.Timedelta(days=1)
 _PERIOD_NS = 86_400_000_000_000
@@ -39,18 +40,119 @@ _PREDICTION_COLUMNS = [
 ]
 
 
+class _ValidatedInput(pydantic.BaseModel):
+    """Validate runtime types strictly while accepting pandas input objects."""
+
+    model_config = pydantic.ConfigDict(arbitrary_types_allowed=True, strict=True)
+
+
+class _IntegerInput(_ValidatedInput):
+    """Validate an integer and its named lower bound without numeric coercion.
+
+    Attributes:
+        name:
+            Argument name used in validation messages.
+        minimum:
+            Inclusive lower bound, or None when no bound is required.
+        value:
+            Validated built-in integer, including accepted NumPy integers.
+    """
+
+    name: str
+    minimum: int | None
+    value: int
+
+    @pydantic.field_validator("value", mode="before")
+    @classmethod
+    def _validate_integer(cls, value: Any, info: pydantic.ValidationInfo) -> int:
+        """Preserve accepted integer types and reject Boolean values.
+
+        Args:
+            value:
+                Supplied integer argument before Pydantic type validation.
+            info:
+                Validated argument name and lower bound.
+
+        Returns:
+            The supplied value represented as a built-in integer.
+
+        Raises:
+            ValueError:
+                The value is not an integer or violates its lower bound.
+        """
+        name = info.data["name"]
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Integral):
+            raise ValueError(f"{name} must be an integer.")
+        result = int(value)
+        minimum = info.data["minimum"]
+        if minimum is not None and result < minimum:
+            raise ValueError(f"{name} must be at least {minimum}.")
+        return result
+
+
+class _ColumnNames(_ValidatedInput):
+    """Validate mapped column names without coercing non-string values.
+
+    Attributes:
+        names:
+            Nonempty string column names in their supplied order.
+    """
+
+    names: tuple[Annotated[str, pydantic.Field(min_length=1)], ...]
+
+
+class _DataFrameInput(_ValidatedInput):
+    """Validate a pandas table without copying or coercing its contents.
+
+    Attributes:
+        frame:
+            The supplied DataFrame, including supported DataFrame subclasses.
+    """
+
+    frame: pd.DataFrame
+
+
 def _integer(value: Any, name: str, minimum: int | None = None) -> int:
-    """Validate an integer, excluding Boolean values."""
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
-        raise ValueError(f"{name} must be an integer.")
-    result = int(value)
-    if minimum is not None and result < minimum:
-        raise ValueError(f"{name} must be at least {minimum}.")
-    return result
+    """Validate an integer, excluding Boolean values.
+
+    Args:
+        value:
+            Supplied integer, including NumPy integer scalars.
+        name:
+            Argument name used in validation messages.
+        minimum:
+            Inclusive lower bound, or None when no bound is required.
+
+    Returns:
+        The validated value as a built-in integer.
+
+    Raises:
+        ValueError:
+            The value is not an integer or is below the specified minimum.
+    """
+    try:
+        return _IntegerInput(name=name, minimum=minimum, value=value).value
+    except pydantic.ValidationError as exc:
+        error = exc.errors(include_input=False, include_url=False)[0]
+        message = str(error.get("ctx", {}).get("error", error["msg"]))
+        raise ValueError(message) from None
 
 
 def _validate_doses(doses: Iterable[float]) -> FloatArray:
-    """Validate a nonempty collection of distinct positive finite doses."""
+    """Validate a nonempty collection of distinct positive finite doses.
+
+    Args:
+        doses:
+            Numeric dose values to materialize without coercing strings or objects.
+
+    Returns:
+        A one-dimensional floating-point array in the supplied order.
+
+    Raises:
+        ValueError:
+            The values are not a nonempty collection of distinct positive finite
+            real numbers.
+    """
     if isinstance(doses, (str, bytes)):
         raise ValueError("doses must be a collection of numbers.")
     try:
@@ -59,7 +161,7 @@ def _validate_doses(doses: Iterable[float]) -> FloatArray:
         raise ValueError("doses must be a collection of numbers.") from exc
     if values.ndim != 1 or not len(values) or values.dtype.kind not in "iuf":
         raise ValueError("doses must be a nonempty one-dimensional numeric collection.")
-    result = values.astype(float)
+    result = values.astype(float, copy=False)
     if not np.isfinite(result).all() or (result <= 0).any():
         raise ValueError("doses must be positive and finite.")
     if len(np.unique(result)) != len(result):
@@ -68,9 +170,25 @@ def _validate_doses(doses: Iterable[float]) -> FloatArray:
 
 
 def _require_columns(frame: pd.DataFrame, columns: list[str], name: str) -> None:
-    """Validate a DataFrame's unique labels and required mapped columns."""
-    if not isinstance(frame, pd.DataFrame):
-        raise ValueError(f"{name} must be a pandas DataFrame.")
+    """Validate a DataFrame's unique labels and required mapped columns.
+
+    Args:
+        frame:
+            Input table whose type and labels are validated without modification.
+        columns:
+            Required column names.
+        name:
+            Argument name used in validation messages.
+
+    Raises:
+        ValueError:
+            The input is not a DataFrame, its labels are duplicated, or required
+            columns are absent.
+    """
+    try:
+        _DataFrameInput(frame=frame)
+    except pydantic.ValidationError:
+        raise ValueError(f"{name} must be a pandas DataFrame.") from None
     if not frame.columns.is_unique:
         raise ValueError(f"{name} must have unique column labels.")
     missing = [column for column in columns if column not in frame.columns]
@@ -79,7 +197,16 @@ def _require_columns(frame: pd.DataFrame, columns: list[str], name: str) -> None
 
 
 def _firm_ids(values: pd.Series) -> None:
-    """Require nonmissing, hashable firm identifiers without coercion."""
+    """Require nonmissing, hashable firm identifiers without coercion.
+
+    Args:
+        values:
+            Firm identifiers from a validated input table.
+
+    Raises:
+        ValueError:
+            At least one identifier is missing or unhashable.
+    """
     if values.isna().any():
         raise ValueError("Firm identifiers must not be missing.")
     try:
@@ -90,14 +217,43 @@ def _firm_ids(values: pd.Series) -> None:
 
 
 def _periods(values: pd.Series) -> pd.Series:
-    """Normalize timezone-naive datetime64[ns] period labels on a copy."""
+    """Normalize timezone-naive datetime64[ns] period labels on a copy.
+
+    Args:
+        values:
+            Period labels whose time components are discarded.
+
+    Returns:
+        A Series of normalized periods with the original index.
+
+    Raises:
+        ValueError:
+            Periods are missing or do not have timezone-naive datetime64[ns] dtype.
+    """
     if values.dtype != np.dtype("datetime64[ns]") or values.isna().any():
         raise ValueError("Periods must be nonmissing timezone-naive datetime64[ns].")
     return values.dt.normalize()
 
 
 def _numeric(values: pd.Series, name: str, *, positive: bool = False) -> FloatArray:
-    """Require finite real numeric values on every supplied row."""
+    """Require finite real numeric values on every supplied row.
+
+    Args:
+        values:
+            Input values with a real numeric dtype.
+        name:
+            Argument name used in validation messages.
+        positive:
+            Whether every value must also be strictly positive.
+
+    Returns:
+        A floating-point array of the validated values.
+
+    Raises:
+        ValueError:
+            The dtype is not real numeric, a value is nonfinite, or a value fails
+            the requested positivity restriction.
+    """
     if (
         not pd.api.types.is_numeric_dtype(values.dtype)
         or pd.api.types.is_bool_dtype(values.dtype)
@@ -112,7 +268,15 @@ def _numeric(values: pd.Series, name: str, *, positive: bool = False) -> FloatAr
 
 
 def _estimate_type(event_time: int) -> str:
-    """Return the interpretation of a relative horizon."""
+    """Return the interpretation of a relative horizon.
+
+    Args:
+        event_time:
+            Integer number of periods relative to the first event.
+
+    Returns:
+        The reference, placebo, or treatment-effect label for the horizon.
+    """
     return "reference" if event_time == -1 else "placebo" if event_time < -1 else "att"
 
 
@@ -133,7 +297,7 @@ class ATT:
         bases_:
             Saved polynomial degrees and dose bounds keyed by (cohort, event_time).
         cell_coefficients_:
-            Treatment coefficients from models_, with exact zeros for references.
+            Treatment coefficients from `models_`, with exact zeros for references.
         retained_cohorts_:
             Cohorts passing treated-design screening at each horizon, including
             those with missing controls that must cause aggregation to fail.
@@ -162,7 +326,7 @@ class ATT:
         last_period_:
             Latest normalized outcome period.
         last_period_index_:
-            Inclusive elapsed-period index of last_period_ from origin_period_.
+            Inclusive elapsed-period index of `last_period_` from `origin_period_`.
         isolation_window_:
             Signed lower and upper screening offsets.
         cell_keys_:
@@ -204,8 +368,10 @@ class ATT:
                 configuration value is invalid.
         """
         names = (firm_col, period_col, outcome_col, dose_col)
-        if any(not isinstance(name, str) or not name for name in names):
-            raise ValueError("All four column-name arguments must be nonempty strings.")
+        try:
+            _ColumnNames(names=names)
+        except pydantic.ValidationError:
+            raise ValueError("All four column-name arguments must be nonempty strings.") from None
         if len(set(names[:3])) != 3 or len({firm_col, period_col, dose_col}) != 3:
             raise ValueError("Mapped column names must be distinct within each table.")
         self.firm_col = firm_col
@@ -253,7 +419,22 @@ class ATT:
         outcomes: pd.DataFrame,
         events: pd.DataFrame,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Validate and copy the two tables into internal column conventions."""
+        """Validate and copy the two tables into internal column conventions.
+
+        Args:
+            outcomes:
+                Firm-period outcomes using the configured column mappings.
+            events:
+                Complete termination history using the configured column mappings.
+
+        Returns:
+            Separate canonical outcome and event tables without changing the inputs.
+
+        Raises:
+            ValueError:
+                Tables, labels, identifiers, periods, or numeric values violate the
+                required schema, outcome rows repeat, or event firms are unknown.
+        """
         outcome_columns = [self.firm_col, self.period_col, self.outcome_col]
         event_columns = [self.firm_col, self.period_col, self.dose_col]
         _require_columns(outcomes, outcome_columns, "outcomes")
@@ -279,7 +460,18 @@ class ATT:
         return outcome, event
 
     def _prepare_events(self, outcome: pd.DataFrame, event: pd.DataFrame) -> None:
-        """Select first events and screen their complete isolation intervals."""
+        """Select first events and screen their complete isolation intervals.
+
+        Args:
+            outcome:
+                Validated canonical outcome panel defining the observed period bounds.
+            event:
+                Validated canonical termination history, including repeated events.
+
+        Raises:
+            ValueError:
+                No first event has a complete and isolated panel window.
+        """
         self.origin_period_: pd.Timestamp = outcome["period"].min()
         self.last_period_: pd.Timestamp = outcome["period"].max()
         origin = self.origin_period_.value // _PERIOD_NS
@@ -360,6 +552,18 @@ class ATT:
 
         Rank uses NumPy's SVD tolerance: largest singular value multiplied by
         max(number of observations, number of columns) and machine precision.
+
+        Args:
+            doses:
+                Validated treated doses for one cohort-horizon comparison.
+
+        Returns:
+            The screening status, saved dose transformation, and polynomial matrix.
+            Rejected comparisons return empty transformation and matrix objects.
+
+        Raises:
+            numpy.linalg.LinAlgError:
+                Singular-value decomposition fails while checking polynomial rank.
         """
         p = self.degree + 1
         empty = np.empty((0, p))
@@ -397,7 +601,7 @@ class ATT:
         Returns:
             This estimator with fitted coefficients, saved bases, and diagnostics.
             Fitting clears any earlier fitted state, even if the new fit fails.
-            Exclusions are recorded in drop_summary_ and logged once per fit.
+            Exclusions are recorded in `drop_summary_` and logged once per fit.
 
         Raises:
             ValueError:
@@ -405,6 +609,8 @@ class ATT:
                 non-reference comparison passes the design checks.
             RuntimeError:
                 PyFixest fitting fails or omits a required finite coefficient.
+            numpy.linalg.LinAlgError:
+                Singular-value decomposition fails while screening a comparison.
         """
         self._reset()
         try:
@@ -452,6 +658,8 @@ class ATT:
         Raises:
             ValueError:
                 An observed outcome difference is nonfinite.
+            numpy.linalg.LinAlgError:
+                Singular-value decomposition fails while screening a comparison.
         """
         # First-event metadata is already stably sorted by cohort.
         eligible = self.events_.loc[self.events_["design_eligible"]]
@@ -631,7 +839,17 @@ class ATT:
             )
 
     def _fit_model(self, blocks: list[tuple[Cell, pd.DataFrame, FloatArray]]) -> None:
-        """Fit narrow cell models without constructing a global interaction matrix."""
+        """Fit narrow cell models without constructing a global interaction matrix.
+
+        Args:
+            blocks:
+                Prepared comparison keys, regression tables, and treated basis matrices.
+
+        Raises:
+            RuntimeError:
+                A PyFixest fit fails or returns missing or nonfinite coefficients.
+                All attempted non-reference fits are invalidated together.
+        """
         polynomial = f"poly(scaled_dose, degree={self.degree}, raw=True)"
         formula = f"delta_y ~ treated + treated:{polynomial}"
         # Formulaic labels raw ndarray columns from zero; column k is power k+1.
@@ -688,12 +906,30 @@ class ATT:
         self.cohort_diagnostics_ = pd.DataFrame(records)
 
     def _require_fitted(self) -> None:
-        """Reject prediction or aggregation without a successful current fit."""
+        """Reject prediction or aggregation without a successful current fit.
+
+        Raises:
+            RuntimeError:
+                The estimator has no successful current fit.
+        """
         if not self._is_fitted:
             raise RuntimeError("ATT must be successfully fitted before evaluation.")
 
     def _resolve_event_times(self, event_times: Iterable[int] | None) -> list[int]:
-        """Validate a horizon subset without fitting or changing eligibility."""
+        """Validate a horizon subset without fitting or changing eligibility.
+
+        Args:
+            event_times:
+                Distinct fitted integer horizons, or None to select the entire window.
+
+        Returns:
+            Requested horizons sorted in increasing order.
+
+        Raises:
+            ValueError:
+                Requested horizons are not a nonempty collection of distinct fitted
+                integers.
+        """
         if event_times is None:
             return list(self.event_times_)
         try:
@@ -770,7 +1006,7 @@ class ATT:
                 Validated fitted horizons to evaluate.
 
         Returns:
-            Component prediction rows with the same schema as predict().
+            Component prediction rows with the same schema as `predict()`.
 
         Raises:
             ValueError:
@@ -824,6 +1060,7 @@ class ATT:
                 "n_controls": "int64",
                 "extrapolated": "bool",
             },
+            copy=False,
         )
 
 
@@ -869,9 +1106,34 @@ def _bandwidth_events(
     dose_col: str,
     eligible_firms: Iterable[object] | None,
 ) -> pd.DataFrame:
-    """Validate event inputs and select one first event per requested firm."""
+    """Validate event inputs and select one first event per requested firm.
+
+    Args:
+        events:
+            Initial termination table without an imposed outcome-panel screen.
+        firm_col:
+            Firm identifier column.
+        period_col:
+            Event period column with timezone-naive datetime64[ns] values.
+        dose_col:
+            Positive finite dose column.
+        eligible_firms:
+            Optional unique firm identifiers to retain after first-event selection.
+
+    Returns:
+        Canonical first-event rows for the selected firms, with a fresh row index.
+
+    Raises:
+        ValueError:
+            Column mappings, input values, or eligibility are invalid, or fewer
+            than two selected firms remain.
+    """
     columns = [firm_col, period_col, dose_col]
-    if any(not isinstance(column, str) or not column for column in columns) or len(set(columns)) != 3:
+    try:
+        _ColumnNames(names=tuple(columns))
+    except pydantic.ValidationError:
+        raise ValueError("Bandwidth column names must be distinct nonempty strings.") from None
+    if len(set(columns)) != 3:
         raise ValueError("Bandwidth column names must be distinct nonempty strings.")
     _require_columns(events, columns, "events")
     first = events[columns].copy()
@@ -891,7 +1153,19 @@ def _bandwidth_events(
 
 
 def _silverman_h0(doses: FloatArray) -> float:
-    """Compute the initial bandwidth from validated first-event doses."""
+    """Compute the initial bandwidth from validated first-event doses.
+
+    Args:
+        doses:
+            Positive finite doses for at least two selected firms.
+
+    Returns:
+        Silverman's starting bandwidth in dose units.
+
+    Raises:
+        ValueError:
+            The selected doses do not have positive finite variation.
+    """
     with np.errstate(over="ignore", invalid="ignore"):
         sd = float(doses.std(ddof=1))
         q25, q75 = np.percentile(doses, [25, 75])
@@ -944,7 +1218,7 @@ def estimate_h0(
 
 def _loo_brier_scores(
     doses: FloatArray,
-    cohort_codes: NDArray[np.int64],
+    cohort_codes: npt.NDArray[np.int64],
     bandwidths: FloatArray,
     batch_size: int,
 ) -> FloatArray:
@@ -974,7 +1248,7 @@ def _loo_brier_scores(
             the Brier bounds beyond rounding tolerance.
     """
     unique_doses, dose_codes, multiplicities = np.unique(doses, return_inverse=True, return_counts=True)
-    counts = csr_matrix(
+    counts = scipy.sparse.csr_matrix(
         (np.ones(len(doses)), (dose_codes, cohort_codes)),
         shape=(len(unique_doses), int(cohort_codes.max()) + 1),
     )
@@ -983,7 +1257,7 @@ def _loo_brier_scores(
         stop = min(start + batch_size, len(unique_doses))
         query_indices = np.arange(start, stop)
         singleton = multiplicities[start:stop] == 1
-        self_weight = (~singleton).astype(float)
+        self_weight = (~singleton).astype(float, copy=False)
         differences = unique_doses[start:stop, None] - unique_doses[None, :]
         for index, bandwidth in enumerate(bandwidths):
             try:
@@ -1018,7 +1292,7 @@ def _loo_brier_scores(
 
 def _expand_bandwidth_grid(
     doses: FloatArray,
-    cohort_codes: NDArray[np.int64],
+    cohort_codes: npt.NDArray[np.int64],
     candidates: FloatArray,
     scores: FloatArray,
     batch_size: int,
@@ -1235,13 +1509,10 @@ def estimate_pi(
         raise ValueError("bandwidth must be positive and finite.") from exc
     if not np.isfinite(kernel_bandwidth) or kernel_bandwidth <= 0:
         raise ValueError("bandwidth must be positive and finite.")
-    required_columns = {"firm_id", "cohort", "dose"}
-    if (
-        not isinstance(events, pd.DataFrame)
-        or not events.columns.is_unique
-        or not required_columns.issubset(events.columns)
-    ):
-        raise ValueError("events must have unique firm_id, cohort, and dose columns.")
+    try:
+        _require_columns(events, ["firm_id", "cohort", "dose"], "events")
+    except ValueError:
+        raise ValueError("events must have unique firm_id, cohort, and dose columns.") from None
     event_firms = _validate_aggregation_firms(events["firm_id"], "events.firm_id")
     eligible = _validate_aggregation_firms(eligible_firms, "eligible_firms")
     if not set(eligible).issubset(set(event_firms)):
@@ -1275,10 +1546,10 @@ def estimate_pi(
         # all unshifted log-kernel values have a very large magnitude.
         log_kernel -= np.max(log_kernel)
         log_mass: FloatArray = np.asarray(
-            [logsumexp(log_kernel[cohort_codes == code], axis=0) for code in range(len(cohort_periods))],
+            [scipy.special.logsumexp(log_kernel[cohort_codes == code], axis=0) for code in range(len(cohort_periods))],
             dtype=np.float64,
         )
-        weights = np.exp(log_mass - logsumexp(log_mass, axis=0))
+        weights = np.exp(log_mass - scipy.special.logsumexp(log_mass, axis=0))
         if not np.isfinite(weights).all() or not np.isclose(
             weights.sum(),
             1.0,

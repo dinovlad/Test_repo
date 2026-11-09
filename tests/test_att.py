@@ -1,20 +1,19 @@
 """Check continuous-dose estimates against independent numerical comparisons."""
 
 import logging
+import unittest.mock
 from collections.abc import Callable
 from typing import TypedDict, cast
-from unittest.mock import Mock, patch
 
 import numpy as np
+import numpy.testing as np_testing
+import numpy.typing as npt
 import pandas as pd
+import pandas.testing as pd_testing
 import pytest
-from numpy.testing import assert_allclose
-from numpy.typing import NDArray
-from pandas.testing import assert_frame_equal
-from scipy.interpolate import BSpline
+import scipy.interpolate
 
-from labor_cost_optimization import att
-from labor_cost_optimization.att import ATT, estimate_h0, estimate_h_cv, estimate_pi, evaluate_theta
+import labor_cost_optimization.att as att
 
 
 class ColumnMappings(TypedDict):
@@ -49,79 +48,7 @@ FIRST = pd.Timestamp("2024-01-08")
 SECOND = pd.Timestamp("2024-01-10")
 WINDOW = (-2, 3)
 Panel = tuple[pd.DataFrame, pd.DataFrame]
-FloatArray = NDArray[np.float64]
-
-
-def make_panel(
-    first: pd.Timestamp = FIRST,
-    second: pd.Timestamp = SECOND,
-) -> Panel:
-    """Construct two dose groups and one clean comparison firm.
-
-    Args:
-        first:
-            First cohort's normalized termination period.
-        second:
-            Second cohort's normalized termination period.
-
-    Returns:
-        Outcome and event tables with different dose supports, a common
-        nonlinear calendar shock, and a dose-dependent pre-period contrast.
-    """
-    events = pd.DataFrame(
-        [(f"A{i}", first, 4.0 + i) for i in range(6)] + [(f"B{i}", second, 5.0 + i) for i in range(7)],
-        columns=["firm", "period", "hours"],
-    )
-    event_lookup = events.set_index("firm")
-    records = []
-    for index, firm in enumerate([*events["firm"], "C0"]):
-        for position, period in enumerate(pd.date_range("2024-01-01", periods=24)):
-            sales = 100.0 + 11.0 * index + 3.0 * position + 0.07 * position**2
-            if firm in event_lookup.index:
-                cohort = event_lookup.loc[firm, "period"]
-                dose = float(event_lookup.loc[firm, "hours"])
-                event_time = (period - cohort).days
-                if event_time == -2:
-                    sales += 0.3 * dose + 0.02 * dose**2
-                elif event_time >= 0:
-                    sales += (event_time + 1) * (2.0 + 0.5 * dose - 0.03 * dose**2 + 0.004 * dose**3)
-            records.append((firm, period, sales))
-    return pd.DataFrame(records, columns=["firm", "period", "sales"]), events
-
-
-@pytest.fixture
-def panel() -> Panel:
-    """Provide fresh synthetic input tables for each test."""
-    return make_panel()
-
-
-@pytest.fixture
-def model(panel: Panel) -> ATT:
-    """Fit a fresh estimator without sharing mutable state between tests.
-
-    Args:
-        panel:
-            This test's synthetic outcome and event tables.
-
-    Returns:
-        An estimator covering all horizons of the fixture's isolation window.
-    """
-    outcomes, events = panel
-    return ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
-
-
-@pytest.fixture
-def kernel_events() -> pd.DataFrame:
-    """Provide canonical metadata including one deliberately ineligible firm."""
-    return pd.DataFrame(
-        [
-            ("a", FIRST, 4.0),
-            ("b", FIRST, 5.0),
-            ("c", SECOND, 9.0),
-            ("excluded", FIRST, 9.0),
-        ],
-        columns=["firm_id", "cohort", "dose"],
-    )
+FloatArray = npt.NDArray[np.float64]
 
 
 def independent_att(
@@ -170,7 +97,7 @@ def independent_att(
         np.repeat(observed_doses.max(), degree + 1),
     ]
     dimension = len(knot_vector) - degree - 1
-    basis = BSpline(knot_vector, np.eye(dimension), degree, extrapolate=True)
+    basis = scipy.interpolate.BSpline(knot_vector, np.eye(dimension), degree, extrapolate=True)
     design = np.column_stack(
         [np.ones(len(observed_doses)), basis(observed_doses)[:, 1:]],
     )
@@ -190,12 +117,21 @@ def test_separate_models_match_independent_spline_estimates(
     caplog: pytest.LogCaptureFixture,
     degree: int,
 ) -> None:
-    """Preserve ATT and theta while fitting each cell with a narrow formula."""
+    """Preserve ATT and theta while fitting each cell with a narrow formula.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        caplog:
+            Fixture capturing diagnostic log messages.
+        degree:
+            Polynomial degree for the comparison regressions.
+    """
     outcomes, events = panel
     original_outcomes = outcomes.copy(deep=True)
     original_events = events.copy(deep=True)
-    with patch.object(att.pf, "feols", wraps=att.pf.feols) as solver:
-        fitted = ATT(**MAPPINGS, degree=degree).fit(outcomes, events, isolation_window=WINDOW)
+    with unittest.mock.patch.object(att.pf, "feols", wraps=att.pf.feols) as solver:
+        fitted = att.ATT(**MAPPINGS, degree=degree).fit(outcomes, events, isolation_window=WINDOW)
     assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
     assert fitted.drop_summary_ == {
         "duplicate_event_rows": 0,
@@ -227,7 +163,7 @@ def test_separate_models_match_independent_spline_estimates(
         treated = block["treated"] == 1
         cell_doses = events.set_index("firm")["hours"].loc[block.loc[treated, "firm_id"]].to_numpy(dtype=float)
         expected_scaled = (cell_doses - cell_doses.min()) / (cell_doses.max() - cell_doses.min())
-        assert_allclose(block.loc[treated, "scaled_dose"], expected_scaled, atol=0.0, rtol=0.0)
+        np_testing.assert_allclose(block.loc[treated, "scaled_dose"], expected_scaled, atol=0.0, rtol=0.0)
         assert (block.loc[~treated, "scaled_dose"] == 0.0).all()
         assert fitted.bases_[key] == {"degree": degree, "lower": cell_doses.min(), "upper": cell_doses.max()}
     assert fitted.event_times_ == list(range(-2, 4))
@@ -251,9 +187,9 @@ def test_separate_models_match_independent_spline_estimates(
             group["dose"].to_numpy(dtype=float),
             degree=degree,
         )
-        assert_allclose(group["att"], expected, atol=1e-8, rtol=1e-8)
+        np_testing.assert_allclose(group["att"], expected, atol=1e-8, rtol=1e-8)
         independent_components[(cohort, event_time)] = expected
-    theta = evaluate_theta(fitted, doses, bandwidth=1.3)
+    theta = att.evaluate_theta(fitted, doses, bandwidth=1.3)
     for event_time in range(-2, 4):
         expected_theta = []
         for dose_index, dose in enumerate(doses):
@@ -267,9 +203,9 @@ def test_separate_models_match_independent_spline_estimates(
                 ),
             )
         actual = theta.loc[theta["event_time"] == event_time, "theta"]
-        assert_allclose(actual, expected_theta, atol=1e-8, rtol=1e-8)
-    assert_frame_equal(outcomes, original_outcomes)
-    assert_frame_equal(events, original_events)
+        np_testing.assert_allclose(actual, expected_theta, atol=1e-8, rtol=1e-8)
+    pd_testing.assert_frame_equal(outcomes, original_outcomes)
+    pd_testing.assert_frame_equal(events, original_events)
 
 
 @pytest.mark.parametrize("identifier_kind", ["strings", "categorical", "mixed"])
@@ -278,7 +214,16 @@ def test_prepared_comparisons_match_direct_row_lookup(
     caplog: pytest.LogCaptureFixture,
     identifier_kind: str,
 ) -> None:
-    """Check missing-period and history selection before invoking the solver."""
+    """Check missing-period and history selection before invoking the solver.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        caplog:
+            Fixture capturing diagnostic log messages.
+        identifier_kind:
+            Firm identifier representation used in the comparison lookup.
+    """
     outcomes, events = panel
     clean = outcomes.loc[outcomes["firm"] == "C0"].copy()
     clean["firm"] = "C1"
@@ -314,8 +259,8 @@ def test_prepared_comparisons_match_direct_row_lookup(
         outcomes["firm"] = outcomes["firm"].map(identifiers)
         events["firm"] = events["firm"].map(identifiers)
 
-    fitted = ATT(**MAPPINGS)
-    with patch.object(fitted, "_fit_model") as solver, caplog.at_level(logging.WARNING):
+    fitted = att.ATT(**MAPPINGS)
+    with unittest.mock.patch.object(fitted, "_fit_model") as solver, caplog.at_level(logging.WARNING):
         fitted.fit(outcomes, events, isolation_window=WINDOW)
     solver.assert_called_once()
     assert solver.call_args is not None
@@ -372,7 +317,7 @@ def test_prepared_comparisons_match_direct_row_lookup(
                 firms = [*treated, *controls]
                 assert block["firm_id"].tolist() == firms
                 expected_changes = [values[(firm, endpoint)] - values[(firm, baseline)] for firm in firms]
-                assert_allclose(block["delta_y"], expected_changes, atol=0.0, rtol=0.0)
+                np_testing.assert_allclose(block["delta_y"], expected_changes, atol=0.0, rtol=0.0)
                 assert block["treated"].tolist() == [1] * len(treated) + [0] * len(controls)
                 assert design.shape == (len(treated), 4)
     actual_availability = {
@@ -399,12 +344,17 @@ def test_prepared_comparisons_match_direct_row_lookup(
     }
 
 
-def test_placebo_sign_and_reference_normalization(model: ATT) -> None:
-    """Recover a nonzero pre-trend and exact unestimated reference zeros."""
+def test_placebo_sign_and_reference_normalization(model: att.ATT) -> None:
+    """Recover a nonzero pre-trend and exact unestimated reference zeros.
+
+    Args:
+        model:
+            Independently fitted estimator for the default synthetic panel.
+    """
     results = model.predict([6.0, 8.0], event_times=[-2, -1, 0])
     placebo = results.loc[results["event_time"] == -2]
     expected = 0.3 * placebo["dose"] + 0.02 * placebo["dose"] ** 2
-    assert_allclose(placebo["att"], expected, atol=1e-8)
+    np_testing.assert_allclose(placebo["att"], expected, atol=1e-8)
     assert (placebo["estimate_type"] == "placebo").all()
     reference = results.loc[results["event_time"] == -1]
     assert (reference["att"] == 0.0).all()
@@ -424,24 +374,40 @@ def test_constant_and_zero_changes_have_zero_treatment_effects(
     panel: Panel,
     slope: float,
 ) -> None:
-    """Allow zero changes and calendar changes shared by every firm."""
+    """Allow zero changes and calendar changes shared by every firm.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        slope:
+            Common outcome-change specification applied to every firm.
+    """
     outcomes, events = panel
     periods = (outcomes["period"] - outcomes["period"].min()).dt.days
     outcomes["sales"] = 200.0 + slope * periods
-    fitted = ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
+    fitted = att.ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
     result = fitted.predict([6.0, 8.0])
-    assert_allclose(result["att"], 0.0, atol=1e-10)
-    theta = evaluate_theta(fitted, [6.0, 8.0], bandwidth=1.0)
-    assert_allclose(theta["theta"], 0.0, atol=1e-10)
+    np_testing.assert_allclose(result["att"], 0.0, atol=1e-10)
+    theta = att.evaluate_theta(fitted, [6.0, 8.0], bandwidth=1.0)
+    np_testing.assert_allclose(theta["theta"], 0.0, atol=1e-10)
 
 
 @pytest.mark.parametrize("failure", ["missing", "nonfinite", "nonfinite_intercept"])
 def test_incomplete_or_nonfinite_solver_coefficients_fail_the_entire_fit(
     panel: Panel,
-    model: ATT,
+    model: att.ATT,
     failure: str,
 ) -> None:
-    """Never accept a backend's missing term or silently reduce a fitted curve."""
+    """Never accept a backend's missing term or silently reduce a fitted curve.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        model:
+            Independently fitted estimator for the default synthetic panel.
+        failure:
+            Backend failure or reporting error to simulate.
+    """
     outcomes, events = panel
     first_key, second_key = list(model.models_)[:2]
     coefficients = model.models_[second_key].coef()
@@ -451,11 +417,11 @@ def test_incomplete_or_nonfinite_solver_coefficients_fail_the_entire_fit(
     else:
         malformed = coefficients.copy()
         malformed.loc["Intercept" if failure == "nonfinite_intercept" else term] = np.nan
-    backend_model = Mock()
+    backend_model = unittest.mock.Mock()
     backend_model.coef.return_value = malformed
-    failed = ATT(**MAPPINGS)
+    failed = att.ATT(**MAPPINGS)
     with (
-        patch.object(att.pf, "feols", side_effect=[model.models_[first_key], backend_model]) as solver,
+        unittest.mock.patch.object(att.pf, "feols", side_effect=[model.models_[first_key], backend_model]) as solver,
         pytest.raises(RuntimeError, match="could not be fitted"),
     ):
         failed.fit(outcomes, events, isolation_window=WINDOW)
@@ -468,13 +434,18 @@ def test_incomplete_or_nonfinite_solver_coefficients_fail_the_entire_fit(
         failed.predict([7.0])
 
 
-def test_prediction_grid_cannot_redefine_the_fitted_basis(model: ATT) -> None:
-    """Keep predictions unchanged when other requested doses change."""
+def test_prediction_grid_cannot_redefine_the_fitted_basis(model: att.ATT) -> None:
+    """Keep predictions unchanged when other requested doses change.
+
+    Args:
+        model:
+            Independently fitted estimator for the default synthetic panel.
+    """
     saved = {key: basis.copy() for key, basis in model.bases_.items()}
     single = model.predict([7.0])
     expanded = model.predict([5.5, 7.0, 8.5])
     expanded = expanded.loc[expanded["dose"] == 7.0].reset_index(drop=True)
-    assert_frame_equal(single, expanded)
+    pd_testing.assert_frame_equal(single, expanded)
     assert model.bases_ == saved
     with pytest.raises(ValueError, match="outside the fitted isolation window"):
         model.predict([7.0], event_times=[4])
@@ -482,14 +453,23 @@ def test_prediction_grid_cannot_redefine_the_fitted_basis(model: ATT) -> None:
 
 def test_aggregation_matches_manual_kernel_weighted_curves(
     panel: Panel,
-    model: ATT,
+    model: att.ATT,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Preserve cohort size and dose composition at every requested horizon."""
+    """Preserve cohort size and dose composition at every requested horizon.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        model:
+            Independently fitted estimator for the default synthetic panel.
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     _, events = panel
     doses = [5.5, 8.5]
     bandwidth = 1.3
-    theta = evaluate_theta(
+    theta = att.evaluate_theta(
         model,
         doses,
         bandwidth=bandwidth,
@@ -518,15 +498,22 @@ def test_aggregation_summarizes_all_horizons_without_silencing_prediction(
     panel: Panel,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Count dropped comparisons and extrapolated components in one message."""
+    """Count dropped comparisons and extrapolated components in one message.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     outcomes, events = panel
-    fitted = ATT(**MAPPINGS, min_cohort_size=7).fit(outcomes, events, isolation_window=WINDOW)
+    fitted = att.ATT(**MAPPINGS, min_cohort_size=7).fit(outcomes, events, isolation_window=WINDOW)
     fit_summary = fitted.drop_summary_.copy()
     caplog.clear()
     doses = [14.0, 2.0, 7.0]
     horizons = [3, -1, 0, -2]
     with caplog.at_level(logging.WARNING):
-        theta = evaluate_theta(fitted, doses, bandwidth=1.3, event_times=horizons)
+        theta = att.evaluate_theta(fitted, doses, bandwidth=1.3, event_times=horizons)
     assert len(caplog.records) == 1
     assert caplog.records[0].getMessage().startswith("Aggregation summary:")
     assert caplog.records[0].args == (4, 24, 4, 6)
@@ -554,7 +541,7 @@ def test_aggregation_summarizes_all_horizons_without_silencing_prediction(
             cell["control_firms"],
             group["dose"].to_numpy(dtype=float),
         )
-        assert_allclose(group["theta"], expected, atol=1e-8, rtol=1e-8)
+        np_testing.assert_allclose(group["theta"], expected, atol=1e-8, rtol=1e-8)
 
     caplog.clear()
     with caplog.at_level(logging.WARNING):
@@ -564,16 +551,23 @@ def test_aggregation_summarizes_all_horizons_without_silencing_prediction(
     assert caplog.records[0].args == (4,)
     assert "Extrapolating" in caplog.records[1].getMessage()
     assert caplog.records[1].args == (6,)
-    assert_allclose(predictions["att"], theta["theta"], atol=1e-12, rtol=0.0)
+    np_testing.assert_allclose(predictions["att"], theta["theta"], atol=1e-12, rtol=0.0)
 
 
 def test_reference_aggregation_outside_support_does_not_warn(
-    model: ATT,
+    model: att.ATT,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Keep reference zeros free of extrapolation flags and warning counts."""
+    """Keep reference zeros free of extrapolation flags and warning counts.
+
+    Args:
+        model:
+            Independently fitted estimator for the default synthetic panel.
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     with caplog.at_level(logging.WARNING):
-        theta = evaluate_theta(model, [2.0, 14.0], bandwidth=1.3, event_times=[-1])
+        theta = att.evaluate_theta(model, [2.0, 14.0], bandwidth=1.3, event_times=[-1])
     assert not caplog.records
     assert (theta["theta"] == 0.0).all()
     assert (theta["estimate_type"] == "reference").all()
@@ -586,29 +580,41 @@ def test_reference_aggregation_outside_support_does_not_warn(
 
 @pytest.mark.parametrize("num_knots", [0, 1])
 def test_polynomial_api_rejects_internal_knots(num_knots: int) -> None:
-    """Reject the removed spline option instead of silently changing its model."""
-    constructor: Callable[..., ATT] = ATT
+    """Reject the removed spline option instead of silently changing its model.
+
+    Args:
+        num_knots:
+            Removed spline argument that the public constructor must reject.
+    """
+    constructor: Callable[..., att.ATT] = att.ATT
     with pytest.raises(TypeError, match="num_knots"):
         constructor(**MAPPINGS, num_knots=num_knots)
 
 
 def test_unused_categorical_firms_do_not_create_phantom_terminations(
     panel: Panel,
-    model: ATT,
+    model: att.ATT,
 ) -> None:
-    """Unused categories must neither block clean controls nor add events."""
+    """Keep unused categories from blocking controls or creating events.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        model:
+            Independently fitted estimator for the default synthetic panel.
+    """
     outcomes, events = panel
     outcomes = outcomes.copy()
     events = events.copy()
     categories = [*outcomes["firm"].unique(), "unused_firm"]
     outcomes["firm"] = pd.Categorical(outcomes["firm"], categories=categories)
     events["firm"] = pd.Categorical(events["firm"], categories=categories)
-    categorical = ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
+    categorical = att.ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
     assert categorical.duplicate_diagnostics_["n_dropped_events"] == 0
     assert categorical.duplicate_diagnostics_["n_affected_firms"] == 0
     assert (categorical.termination_history_["n_terminations"] > 0).all()
     assert set(categorical.termination_history_["firm_id"]) == set(events["firm"])
-    assert_frame_equal(
+    pd_testing.assert_frame_equal(
         categorical.predict([6.0, 8.0], event_times=[-2, 0, 3]),
         model.predict([6.0, 8.0], event_times=[-2, 0, 3]),
         check_exact=False,
@@ -621,7 +627,14 @@ def test_missing_endpoints_drop_only_the_affected_comparison(
     panel: Panel,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Do not require complete trajectories or leak missing firms into weights."""
+    """Do not require complete trajectories or leak missing firms into weights.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     outcomes, events = panel
     omitted = {
         ("A0", pd.Timestamp("2024-01-09")),
@@ -632,7 +645,7 @@ def test_missing_endpoints_drop_only_the_affected_comparison(
     keep = [(firm, period) not in omitted for firm, period in pairs]
     outcomes = outcomes.loc[keep].reset_index(drop=True)
     with caplog.at_level(logging.WARNING):
-        fitted = ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
+        fitted = att.ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
     assert len(caplog.records) == 1
     assert "small_sample" in caplog.text
     assert fitted.drop_summary_["unavailable_treated_rows"] == 8
@@ -645,13 +658,13 @@ def test_missing_endpoints_drop_only_the_affected_comparison(
     assert "A1" not in fitted.cell_diagnostics_[(FIRST, 2)]["treated_firms"]
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        observed_target = evaluate_theta(fitted, [7.0], bandwidth=1.0, event_times=[0])
+        observed_target = att.evaluate_theta(fitted, [7.0], bandwidth=1.0, event_times=[0])
     assert not caplog.records
     assert observed_target["availability_restricted"].all()
     assert not observed_target["restricted_target"].any()
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        theta = evaluate_theta(fitted, [7.0], bandwidth=1.0, event_times=[1])
+        theta = att.evaluate_theta(fitted, [7.0], bandwidth=1.0, event_times=[1])
     assert caplog.records
     row = theta.iloc[0]
     assert row["n_firms_design"] == 13
@@ -679,14 +692,21 @@ def test_missing_endpoints_drop_only_the_affected_comparison(
         cell["control_firms"],
         np.array([7.0]),
     )
-    assert_allclose(prediction["att"], expected, atol=1e-8)
+    np_testing.assert_allclose(prediction["att"], expected, atol=1e-8)
 
 
 def test_same_period_ties_are_not_promoted_to_later_events(
     panel: Panel,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Log dropped records while retaining simultaneous-event multiplicity."""
+    """Log dropped records while retaining simultaneous-event multiplicity.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     outcomes, events = panel
     earlier_input = pd.DataFrame(
         [("A0", FIRST + pd.Timedelta(hours=1), 9.0)],
@@ -701,7 +721,7 @@ def test_same_period_ties_are_not_promoted_to_later_events(
     )
     events = pd.concat([earlier_input, events, later], ignore_index=True)
     with caplog.at_level(logging.WARNING):
-        fitted = ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
+        fitted = att.ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
     assert fitted.duplicate_diagnostics_["n_dropped_events"] == 3
     assert fitted.duplicate_diagnostics_["n_affected_firms"] == 2
     assert len(caplog.records) == 1
@@ -724,7 +744,14 @@ def test_later_history_still_blocks_controls_after_first_event_selection(
     panel: Panel,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An excluded first event does not erase a later conflicting termination."""
+    """Preserve later conflicting terminations after excluding a first event.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     outcomes, events = panel
     clean = outcomes.loc[outcomes["firm"] == "C0"].copy()
     clean["firm"] = "C1"
@@ -737,7 +764,7 @@ def test_later_history_still_blocks_controls_after_first_event_selection(
         columns=events.columns,
     )
     with caplog.at_level(logging.WARNING):
-        fitted = ATT(**MAPPINGS).fit(
+        fitted = att.ATT(**MAPPINGS).fit(
             outcomes,
             pd.concat([events, history], ignore_index=True),
             isolation_window=WINDOW,
@@ -756,11 +783,20 @@ def test_missing_controls_cannot_be_hidden_by_aggregation(
     caplog: pytest.LogCaptureFixture,
     event_time: int,
 ) -> None:
-    """Keep no-control cells required even for the reference normalization."""
+    """Keep no-control cells required even for the reference normalization.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        caplog:
+            Fixture capturing diagnostic log messages.
+        event_time:
+            Horizon at which to remove the required control observation.
+    """
     outcomes, events = panel
     missing = (outcomes["firm"] == "C0") & (outcomes["period"] == FIRST - pd.Timedelta(days=1))
     with caplog.at_level(logging.WARNING):
-        fitted = ATT(**MAPPINGS).fit(
+        fitted = att.ATT(**MAPPINGS).fit(
             outcomes.loc[~missing],
             events,
             isolation_window=WINDOW,
@@ -772,22 +808,29 @@ def test_missing_controls_cannot_be_hidden_by_aggregation(
     assert fitted.cell_diagnostics_[(FIRST, event_time)]["status"] == "no_controls"
     assert FIRST in fitted.retained_cohorts_[event_time]
     with pytest.raises(ValueError, match="Required comparison is unavailable"):
-        evaluate_theta(fitted, [7.0], bandwidth=1.0, event_times=[event_time])
+        att.evaluate_theta(fitted, [7.0], bandwidth=1.0, event_times=[event_time])
 
 
 def test_reference_only_success_is_not_a_fitted_model(
     panel: Panel,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Do not invoke the regression solver when only reference zeros survive."""
+    """Do not invoke the regression solver when only reference zeros survive.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     outcomes, events = panel
     chosen = outcomes["firm"].str.startswith("A") | (outcomes["firm"] == "C0")
     outcomes = outcomes.loc[chosen]
     events = events.loc[events["firm"].str.startswith("A")]
     missing = outcomes["firm"].str.startswith("A") & (outcomes["period"] == FIRST)
-    failed = ATT(**MAPPINGS)
+    failed = att.ATT(**MAPPINGS)
     with (
-        patch.object(att.pf, "feols", wraps=att.pf.feols) as solver,
+        unittest.mock.patch.object(att.pf, "feols", wraps=att.pf.feols) as solver,
         pytest.raises(ValueError, match="No non-reference comparison"),
     ):
         failed.fit(outcomes.loc[~missing], events, isolation_window=(-1, 0))
@@ -804,10 +847,17 @@ def test_explicit_minimum_cannot_be_bypassed_by_other_cells(
     panel: Panel,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A larger requested sample minimum screens the smaller cohort."""
+    """Screen the smaller cohort using the requested sample minimum.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     outcomes, events = panel
     with caplog.at_level(logging.WARNING):
-        fitted = ATT(**MAPPINGS, min_cohort_size=7).fit(
+        fitted = att.ATT(**MAPPINGS, min_cohort_size=7).fit(
             outcomes,
             events,
             isolation_window=WINDOW,
@@ -824,12 +874,20 @@ def test_explicit_minimum_cannot_be_bypassed_by_other_cells(
 
 
 def test_isolation_boundaries_use_overall_outcome_coverage(
+    panel_factory: Callable[[pd.Timestamp, pd.Timestamp], Panel],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Accept touching windows and never promote an earlier out-of-panel event."""
+    """Accept touching windows and never promote an earlier out-of-panel event.
+
+    Args:
+        panel_factory:
+            Factory creating synthetic panels with specified cohort periods.
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     first = pd.Timestamp("2024-01-03")
     second = pd.Timestamp("2024-01-21")
-    outcomes, events = make_panel(first, second)
+    outcomes, events = panel_factory(first, second)
     extra_outcomes = []
     for firm in ("left", "right", "outside"):
         copied = outcomes.loc[outcomes["firm"] == "C0"].copy()
@@ -846,7 +904,7 @@ def test_isolation_boundaries_use_overall_outcome_coverage(
         columns=events.columns,
     )
     with caplog.at_level(logging.WARNING):
-        fitted = ATT(**MAPPINGS).fit(
+        fitted = att.ATT(**MAPPINGS).fit(
             outcomes,
             pd.concat([events, extra_events], ignore_index=True),
             isolation_window=WINDOW,
@@ -864,17 +922,124 @@ def test_isolation_boundaries_use_overall_outcome_coverage(
 
 @pytest.mark.parametrize("missing", list(MAPPINGS))
 def test_column_arguments_are_required(missing: str) -> None:
-    """Never infer a missing input-column mapping from conventional labels."""
-    constructor: Callable[..., ATT] = ATT
+    """Never infer a missing input-column mapping from conventional labels.
+
+    Args:
+        missing:
+            Required column-mapping argument omitted from construction.
+    """
+    constructor: Callable[..., att.ATT] = att.ATT
     incomplete = {key: value for key, value in MAPPINGS.items() if key != missing}
     with pytest.raises(TypeError, match=missing):
         constructor(**incomplete)
 
 
+def test_runtime_validation_preserves_numpy_scalar_configuration(panel: Panel, model: att.ATT) -> None:
+    """Accept NumPy integer and string scalars without changing fitted curves.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        model:
+            Reference estimator fitted with ordinary Python configuration values.
+    """
+    constructor: Callable[..., att.ATT] = att.ATT
+    fitted = constructor(
+        firm_col=np.str_("firm"),
+        period_col=np.str_("period"),
+        outcome_col=np.str_("sales"),
+        dose_col=np.str_("hours"),
+        degree=np.int64(3),
+        min_cohort_size=np.int64(5),
+    )
+    fit: Callable[..., att.ATT] = fitted.fit
+    outcomes, events = panel
+    fit(outcomes, events, isolation_window=(np.int64(-2), np.int64(3)))
+    assert type(fitted.degree) is int
+    assert type(fitted.min_cohort_size) is int
+    pd_testing.assert_frame_equal(fitted.predict([5.0, 7.0]), model.predict([5.0, 7.0]))
+
+
+@pytest.mark.parametrize(
+    ("argument", "value", "message"),
+    [
+        ("degree", True, "degree must be an integer"),
+        ("degree", np.bool_(True), "degree must be an integer"),
+        ("degree", "3", "degree must be an integer"),
+        ("degree", 3.0, "degree must be an integer"),
+        ("min_cohort_size", True, "min_cohort_size must be an integer"),
+        ("min_cohort_size", "5", "min_cohort_size must be an integer"),
+        ("min_cohort_size", 5.0, "min_cohort_size must be an integer"),
+        ("firm_col", 1, "All four column-name arguments must be nonempty strings"),
+        ("dose_col", "", "All four column-name arguments must be nonempty strings"),
+        ("period_col", "firm", "Mapped column names must be distinct within each table"),
+    ],
+)
+def test_runtime_validation_does_not_coerce_configuration(argument: str, value: object, message: str) -> None:
+    """Preserve strict constructor validation when using runtime schemas.
+
+    Args:
+        argument:
+            Configuration argument to replace with an invalid value.
+        value:
+            Value that must not be coerced into an accepted configuration.
+        message:
+            Existing validation error message that callers should still receive.
+    """
+    constructor: Callable[..., att.ATT] = att.ATT
+    arguments: dict[str, object] = {**MAPPINGS, argument: value}
+    with pytest.raises(ValueError, match=message):
+        constructor(**arguments)
+
+
+def test_runtime_validation_accepts_dataframe_subclasses(panel: Panel, model: att.ATT) -> None:
+    """Preserve arbitrary DataFrame subclasses when validating input tables.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        model:
+            Reference estimator fitted with ordinary DataFrame inputs.
+    """
+
+    class Frame(pd.DataFrame):
+        """Supply a DataFrame subtype without changing table behavior."""
+
+    outcomes, events = panel
+    fitted = att.ATT(**MAPPINGS).fit(Frame(outcomes), Frame(events), isolation_window=WINDOW)
+    pd_testing.assert_frame_equal(fitted.predict([5.0, 7.0]), model.predict([5.0, 7.0]))
+
+
+@pytest.mark.parametrize("argument", ["outcomes", "events"])
+@pytest.mark.parametrize("value", [{}, []], ids=["mapping", "list"])
+def test_runtime_validation_does_not_coerce_input_tables(panel: Panel, argument: str, value: object) -> None:
+    """Reject mappings and row sequences instead of converting them to tables.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        argument:
+            Input table to replace with a non-DataFrame object.
+        value:
+            Object that must be rejected by the DataFrame type check.
+    """
+    outcomes, events = panel
+    inputs = {"outcomes": outcomes, "events": events, argument: value}
+    fitted = att.ATT(**MAPPINGS)
+    fit: Callable[..., att.ATT] = fitted.fit
+    with pytest.raises(ValueError, match=f"{argument} must be a pandas DataFrame"):
+        fit(**inputs, isolation_window=WINDOW)
+
+
 def test_normalization_renaming_and_input_order_preserve_estimates(
     panel: Panel,
 ) -> None:
-    """Normalize times while respecting every configured input-column name."""
+    """Normalize times while respecting every configured input-column name.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+    """
     outcomes, events = panel
     outcomes["period"] += pd.Timedelta(hours=13)
     events["period"] += pd.Timedelta(hours=23)
@@ -884,7 +1049,7 @@ def test_normalization_renaming_and_input_order_preserve_estimates(
     renamed_events = events.rename(
         columns={"firm": "unit", "period": "when", "hours": "value"},
     ).sample(frac=1.0, random_state=2)
-    fitted = ATT(
+    fitted = att.ATT(
         firm_col="unit",
         period_col="when",
         outcome_col="value",
@@ -894,9 +1059,9 @@ def test_normalization_renaming_and_input_order_preserve_estimates(
     assert fitted.min_cohort_size_ == 5
     result = fitted.predict([6.0], event_times=[-2, 0])
     placebo = result.loc[result["event_time"] == -2, "att"]
-    assert_allclose(placebo, 0.3 * 6 + 0.02 * 6**2, atol=1e-8)
+    np_testing.assert_allclose(placebo, 0.3 * 6 + 0.02 * 6**2, atol=1e-8)
     post = result.loc[result["event_time"] == 0, "att"]
-    assert_allclose(post, 2 + 0.5 * 6 - 0.03 * 6**2 + 0.004 * 6**3, atol=1e-8)
+    np_testing.assert_allclose(post, 2 + 0.5 * 6 - 0.03 * 6**2 + 0.004 * 6**3, atol=1e-8)
     assert fitted.origin_period_ == pd.Timestamp("2024-01-01")
     assert fitted.last_period_ == pd.Timestamp("2024-01-24")
 
@@ -916,7 +1081,16 @@ def test_invalid_periods_present_missing_outcomes_and_normalized_duplicates(
     case: str,
     message: str,
 ) -> None:
-    """Distinguish missing rows from invalid values and invalid period types."""
+    """Distinguish missing rows from invalid values and invalid period types.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+        case:
+            Invalid input or sample configuration to exercise.
+        message:
+            Expected validation error or diagnostic message fragment.
+    """
     outcomes, events = panel
     if case == "text_periods":
         outcomes["period"] = outcomes["period"].astype(str)
@@ -931,20 +1105,30 @@ def test_invalid_periods_present_missing_outcomes_and_normalized_duplicates(
     else:
         outcomes = outcomes.drop(columns="firm")
     with pytest.raises(ValueError, match=message):
-        ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
+        att.ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
 
 
 def test_positive_isolation_lower_bound_is_rejected(panel: Panel) -> None:
-    """Reject an invalid signed window instead of silently changing its sign."""
+    """Reject an invalid signed window instead of silently changing its sign.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+    """
     outcomes, events = panel
     with pytest.raises(ValueError, match="lower <= -1"):
-        ATT(**MAPPINGS).fit(outcomes, events, isolation_window=(2, 3))
+        att.ATT(**MAPPINGS).fit(outcomes, events, isolation_window=(2, 3))
 
 
 def test_failed_refit_invalidates_prior_predictions(panel: Panel) -> None:
-    """An earlier valid model must not survive a failed replacement fit."""
+    """Invalidate earlier predictions after a replacement fit fails.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+    """
     outcomes, events = panel
-    fitted = ATT(**MAPPINGS)
+    fitted = att.ATT(**MAPPINGS)
     assert fitted.fit(outcomes, events, isolation_window=WINDOW) is fitted
     previous_regressions = fitted.models_.copy()
     fitted.fit(outcomes, events, isolation_window=(-1, 0))
@@ -963,10 +1147,15 @@ def test_failed_refit_invalidates_prior_predictions(panel: Panel) -> None:
 def test_kernel_weights_count_only_the_supplied_firms_once(
     kernel_events: pd.DataFrame,
 ) -> None:
-    """Match direct Gaussian sums using only eligible firms, counted once each."""
+    """Match direct Gaussian sums using only eligible firms, counted once each.
+
+    Args:
+        kernel_events:
+            Canonical first-event metadata with an explicitly excluded firm.
+    """
     eligible = ["a", "b", "c"]
     doses = [4.5, 8.5]
-    weights = estimate_pi(
+    weights = att.estimate_pi(
         kernel_events,
         doses,
         eligible_firms=eligible,
@@ -978,7 +1167,7 @@ def test_kernel_weights_count_only_the_supplied_firms_once(
         gaussian = pd.Series(np.exp(-0.5 * distances**2), index=selected.index)
         expected = gaussian.groupby(selected["cohort"]).sum() / gaussian.sum()
         actual = weights.loc[weights["dose"] == dose].set_index("cohort")["weight"]
-        assert_allclose(actual.reindex(expected.index), expected, atol=1e-14)
+        np_testing.assert_allclose(actual.reindex(expected.index), expected, atol=1e-14)
         assert actual.sum() == pytest.approx(1.0, rel=0.0, abs=5e-8)
 
 
@@ -998,9 +1187,20 @@ def test_kernel_rejects_invalid_eligibility_and_bandwidth(
     bandwidth: float,
     message: str,
 ) -> None:
-    """Reject ambiguous eligible populations and invalid smoothing parameters."""
+    """Reject ambiguous eligible populations and invalid smoothing parameters.
+
+    Args:
+        kernel_events:
+            Canonical first-event metadata with an explicitly excluded firm.
+        eligible_firms:
+            Firm identifiers selected for kernel aggregation.
+        bandwidth:
+            Gaussian-kernel bandwidth supplied to the estimator.
+        message:
+            Expected validation error or diagnostic message fragment.
+    """
     with pytest.raises(ValueError, match=message):
-        estimate_pi(
+        att.estimate_pi(
             kernel_events,
             [4.5, 8.5],
             eligible_firms=eligible_firms,
@@ -1013,29 +1213,24 @@ def test_kernel_rejects_non_real_numeric_doses(
     kernel_events: pd.DataFrame,
     bad_dose: str | bool | complex,
 ) -> None:
-    """Do not coerce text, Boolean, or complex doses into treatment amounts."""
+    """Do not coerce text, Boolean, or complex doses into treatment amounts.
+
+    Args:
+        kernel_events:
+            Canonical first-event metadata with an explicitly excluded firm.
+        bad_dose:
+            Non-real numeric or nonnumeric value that must be rejected.
+    """
     invalid = kernel_events.copy()
     invalid["dose"] = invalid["dose"].astype(object)
     invalid.loc[0, "dose"] = bad_dose
     with pytest.raises(ValueError, match="real numeric"):
-        estimate_pi(
+        att.estimate_pi(
             invalid,
             [4.5, 8.5],
             eligible_firms=["a", "b", "c"],
             bandwidth=1.0,
         )
-
-
-@pytest.fixture
-def bandwidth_events() -> pd.DataFrame:
-    """Include repeated doses within cohorts and across different cohorts."""
-    return pd.DataFrame(
-        {
-            "firm": list("abcdefgh"),
-            "period": [FIRST] * 3 + [SECOND] * 3 + [SECOND + pd.Timedelta(days=3)] * 2,
-            "hours": [4.0, 4.0, 6.0, 4.0, 7.0, 9.0, 6.0, 10.0],
-        },
-    )
 
 
 def independent_brier_scores(events: pd.DataFrame, bandwidths: FloatArray) -> FloatArray:
@@ -1069,13 +1264,18 @@ def independent_brier_scores(events: pd.DataFrame, bandwidths: FloatArray) -> Fl
 
 @pytest.mark.parametrize("doses", [[1.0, 2.0, 3.0, 4.0, 8.0], [4.0] * 6 + [8.0]])
 def test_h0_matches_silverman_scale_with_zero_iqr_fallback(doses: list[float]) -> None:
-    """Use sample standard deviation when repeated doses make the IQR zero."""
+    """Use sample standard deviation when repeated doses make the IQR zero.
+
+    Args:
+        doses:
+            Observed dose sample used for the independent bandwidth calculation.
+    """
     events = pd.DataFrame({"firm": range(len(doses)), "period": FIRST, "hours": doses})
     deviation = np.std(doses, ddof=1)
     lower, upper = np.quantile(doses, [0.25, 0.75])
     scale = min(deviation, (upper - lower) / 1.349) if upper > lower else deviation
     expected = 0.9 * scale * len(doses) ** -0.2
-    actual = estimate_h0(events, **EVENT_MAPPINGS)
+    actual = att.estimate_h0(events, **EVENT_MAPPINGS)
     assert isinstance(actual, float)
     assert actual == pytest.approx(expected, rel=1e-14, abs=0.0)
 
@@ -1088,12 +1288,23 @@ def test_bandwidth_cv_matches_stable_brute_force_leave_one_firm_out(
     unique_doses: bool,
     batch_size: int,
 ) -> None:
-    """Keep scores invariant to batching, including extremely narrow kernels."""
+    """Keep scores invariant to batching, including extremely narrow kernels.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+        caplog:
+            Fixture capturing diagnostic log messages.
+        unique_doses:
+            Whether to replace repeated doses with distinct values.
+        batch_size:
+            Number of dose queries processed in each computation batch.
+    """
     if unique_doses:
         bandwidth_events["hours"] = [4.0, 4.5, 5.0, 7.0, 7.5, 8.0, 10.0, 11.0]
     candidates = np.array([2.0, 0.001, 0.7, 1.3])
     with caplog.at_level(logging.WARNING):
-        selected, scores = estimate_h_cv(
+        selected, scores = att.estimate_h_cv(
             bandwidth_events,
             **EVENT_MAPPINGS,
             bandwidths=candidates,
@@ -1103,23 +1314,28 @@ def test_bandwidth_cv_matches_stable_brute_force_leave_one_firm_out(
     assert list(scores.columns) == ["bandwidth", "cv_brier"]
     ordered = scores["bandwidth"].to_numpy(dtype=float)
     assert set(candidates).issubset(set(ordered))
-    assert_allclose(ordered, np.sort(ordered), atol=0.0, rtol=0.0)
+    np_testing.assert_allclose(ordered, np.sort(ordered), atol=0.0, rtol=0.0)
     expected = independent_brier_scores(bandwidth_events, ordered)
-    assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
+    np_testing.assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
     assert selected == ordered[np.argmin(scores["cv_brier"].to_numpy())]
     assert len(ordered) > len(candidates)
     assert np.isfinite(scores["cv_brier"]).all()
 
 
 def test_bandwidth_default_grid_uses_h0(bandwidth_events: pd.DataFrame) -> None:
-    """Include all nine starting bandwidths and validate every expanded score."""
-    h0 = estimate_h0(bandwidth_events, **EVENT_MAPPINGS)
-    selected, scores = estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS)
+    """Include all nine starting bandwidths and validate every expanded score.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+    """
+    h0 = att.estimate_h0(bandwidth_events, **EVENT_MAPPINGS)
+    selected, scores = att.estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS)
     expected_grid = h0 * np.geomspace(0.1, 10.0, 9)
     evaluated = scores["bandwidth"].to_numpy(dtype=float)
     assert set(expected_grid).issubset(set(evaluated))
     expected = independent_brier_scores(bandwidth_events, evaluated)
-    assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
+    np_testing.assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
     assert selected == evaluated[np.argmin(scores["cv_brier"].to_numpy())]
 
 
@@ -1129,13 +1345,13 @@ def test_bandwidth_cv_accepts_finite_scaled_distances_for_large_doses() -> None:
         {"firm": range(7), "period": [FIRST] * 3 + [SECOND] * 4, "hours": [4.0] * 6 + [1e308]},
     )
     candidates = np.array([1e308])
-    selected, scores = estimate_h_cv(events, **EVENT_MAPPINGS, bandwidths=candidates)
+    selected, scores = att.estimate_h_cv(events, **EVENT_MAPPINGS, bandwidths=candidates)
     evaluated = scores["bandwidth"].to_numpy(dtype=float)
     expected = independent_brier_scores(events, evaluated)
     assert 1e308 in evaluated
     assert selected == evaluated[np.argmin(scores["cv_brier"].to_numpy())]
     assert np.isfinite(scores["cv_brier"]).all()
-    assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
+    np_testing.assert_allclose(scores["cv_brier"], expected, atol=2e-14, rtol=2e-14)
 
 
 def test_bandwidth_selection_respects_first_events_mappings_and_eligibility() -> None:
@@ -1160,10 +1376,14 @@ def test_bandwidth_selection_respects_first_events_mappings_and_eligibility() ->
         columns=["firm", "period", "hours"],
     )
     mappings: EventMappings = {"firm_col": "person", "period_col": "when", "dose_col": "assigned"}
-    with patch.object(att.pf, "feols", side_effect=AssertionError("Bandwidth selection must not fit ATT")) as solver:
-        all_h0 = estimate_h0(events, **mappings)
-        selected_h0 = estimate_h0(events, **mappings, eligible_firms=["e", "a", "b"])
-        _, scores = estimate_h_cv(events, **mappings, eligible_firms=["e", "a", "b"], bandwidths=[0.5, 1.5, 4.0])
+    with unittest.mock.patch.object(
+        att.pf,
+        "feols",
+        side_effect=AssertionError("Bandwidth selection must not fit ATT"),
+    ) as solver:
+        all_h0 = att.estimate_h0(events, **mappings)
+        selected_h0 = att.estimate_h0(events, **mappings, eligible_firms=["e", "a", "b"])
+        _, scores = att.estimate_h_cv(events, **mappings, eligible_firms=["e", "a", "b"], bandwidths=[0.5, 1.5, 4.0])
     solver.assert_not_called()
     selected_doses = np.array([4.0, 6.0, 10.0])
     expected_h0 = 0.9 * min(np.std(selected_doses, ddof=1), 3.0 / 1.349) * 3**-0.2
@@ -1173,25 +1393,30 @@ def test_bandwidth_selection_respects_first_events_mappings_and_eligibility() ->
     evaluated = scores["bandwidth"].to_numpy(dtype=float)
     assert {0.5, 1.5, 4.0}.issubset(set(evaluated))
     expected_scores = independent_brier_scores(expected_events, evaluated)
-    assert_allclose(scores["cv_brier"], expected_scores, atol=2e-14, rtol=2e-14)
-    assert_frame_equal(events, original)
+    np_testing.assert_allclose(scores["cv_brier"], expected_scores, atol=2e-14, rtol=2e-14)
+    pd_testing.assert_frame_equal(events, original)
 
 
 def test_bandwidth_cv_combines_singleton_boundary_and_tie_warnings(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Choose the smallest tied candidate and log all caveats only once."""
+    """Choose the smallest tied candidate and log all caveats only once.
+
+    Args:
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     events = pd.DataFrame({"firm": ["a", "b"], "period": [FIRST, SECOND], "hours": [4.0, 8.0]})
     with caplog.at_level(logging.WARNING):
-        selected, scores = estimate_h_cv(events, **EVENT_MAPPINGS, bandwidths=[2.0, 0.001, 1.0])
+        selected, scores = att.estimate_h_cv(events, **EVENT_MAPPINGS, bandwidths=[2.0, 0.001, 1.0])
     assert selected == 0.001 / 8
-    assert_allclose(
+    np_testing.assert_allclose(
         scores["bandwidth"],
         [0.001 / 8, 0.001 / 4, 0.001 / 2, 0.001, 1.0, 2.0, 4.0, 8.0, 16.0],
         atol=0.0,
         rtol=0.0,
     )
-    assert_allclose(scores["cv_brier"], 2.0, atol=0.0, rtol=0.0)
+    np_testing.assert_allclose(scores["cv_brier"], 2.0, atol=0.0, rtol=0.0)
     assert len(caplog.records) == 1
     assert "singleton" in caplog.text
     assert "boundary" in caplog.text
@@ -1216,21 +1441,34 @@ def test_bandwidth_search_brackets_initial_edge_minima_without_rescoring(
     curve: dict[float, float],
     expected_bandwidth: float,
 ) -> None:
-    """Retain the first upturn and explore both initially minimizing edges."""
+    """Retain the first upturn and explore both initially minimizing edges.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+        caplog:
+            Fixture capturing diagnostic log messages.
+        initial:
+            Initial bandwidth candidate grid for adaptive expansion.
+        curve:
+            Mocked mapping from each evaluated bandwidth to its Brier score.
+        expected_bandwidth:
+            Bandwidth minimizing the supplied score curve.
+    """
     with (
-        patch.object(
+        unittest.mock.patch.object(
             att,
             "_loo_brier_scores",
             side_effect=lambda _doses, _cohorts, bandwidths, _batch: np.array([curve[float(h)] for h in bandwidths]),
         ) as scorer,
         caplog.at_level(logging.WARNING),
     ):
-        selected, scores = estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=initial)
+        selected, scores = att.estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=initial)
     assert selected == expected_bandwidth
     assert not caplog.records
     assert scores["bandwidth"].tolist() == sorted(curve)
-    assert_allclose(scores["cv_brier"], [curve[h] for h in sorted(curve)], atol=0.0, rtol=0.0)
-    assert_allclose(scorer.call_args_list[0].args[2], initial, atol=0.0, rtol=0.0)
+    np_testing.assert_allclose(scores["cv_brier"], [curve[h] for h in sorted(curve)], atol=0.0, rtol=0.0)
+    np_testing.assert_allclose(scorer.call_args_list[0].args[2], initial, atol=0.0, rtol=0.0)
     evaluated = [float(h) for call in scorer.call_args_list for h in call.args[2]]
     assert len(evaluated) == len(set(evaluated))
     assert set(evaluated) == set(curve)
@@ -1241,19 +1479,26 @@ def test_bandwidth_search_stops_after_three_consecutive_numerically_flat_steps(
     bandwidth_events: pd.DataFrame,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Reset the plateau count after a material improvement in Brier loss."""
+    """Reset the plateau count after a material improvement in Brier loss.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     epsilon = np.finfo(float).eps
     curve = {1.0: 1.0, 2.0: 0.8, 4.0: 0.8 - epsilon, 8.0: 0.6}
     curve.update({16.0: 0.6 - epsilon, 32.0: 0.6 - 2 * epsilon, 64.0: 0.6 - 3 * epsilon})
     with (
-        patch.object(
+        unittest.mock.patch.object(
             att,
             "_loo_brier_scores",
             side_effect=lambda _doses, _cohorts, bandwidths, _batch: np.array([curve[float(h)] for h in bandwidths]),
         ),
         caplog.at_level(logging.WARNING),
     ):
-        selected, scores = estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=[1.0, 2.0])
+        selected, scores = att.estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=[1.0, 2.0])
     assert selected == 64.0
     assert scores["bandwidth"].tolist() == sorted(curve)
     assert len(caplog.records) == 1
@@ -1264,17 +1509,24 @@ def test_bandwidth_search_limits_each_direction_independently(
     bandwidth_events: pd.DataFrame,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Keep all evaluated losses when both directions exhaust their budgets."""
+    """Keep all evaluated losses when both directions exhaust their budgets.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+        caplog:
+            Fixture capturing diagnostic log messages.
+    """
     curve = {0.25: 0.4, 0.5: 0.6, 1.0: 0.8, 2.0: 0.8, 4.0: 0.5, 8.0: 0.3}
     with (
-        patch.object(
+        unittest.mock.patch.object(
             att,
             "_loo_brier_scores",
             side_effect=lambda _doses, _cohorts, bandwidths, _batch: np.array([curve[float(h)] for h in bandwidths]),
         ),
         caplog.at_level(logging.WARNING),
     ):
-        selected, scores = estimate_h_cv(
+        selected, scores = att.estimate_h_cv(
             bandwidth_events,
             **EVENT_MAPPINGS,
             bandwidths=[1.0, 2.0],
@@ -1307,16 +1559,29 @@ def test_bandwidth_search_checks_numerical_limits_before_scoring(
     curve: dict[float, float],
     message: str,
 ) -> None:
-    """Return valid evaluated candidates without submitting unusable distances."""
+    """Return valid evaluated candidates without submitting unusable distances.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+        caplog:
+            Fixture capturing diagnostic log messages.
+        initial:
+            Initial bandwidth candidate grid for adaptive expansion.
+        curve:
+            Mocked mapping from each evaluated bandwidth to its Brier score.
+        message:
+            Expected validation error or diagnostic message fragment.
+    """
     with (
-        patch.object(
+        unittest.mock.patch.object(
             att,
             "_loo_brier_scores",
             side_effect=lambda _doses, _cohorts, bandwidths, _batch: np.array([curve[float(h)] for h in bandwidths]),
         ) as scorer,
         caplog.at_level(logging.WARNING),
     ):
-        selected, scores = estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=initial)
+        selected, scores = att.estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=initial)
     ordered = sorted(curve)
     assert selected == ordered[np.argmin([curve[h] for h in ordered])]
     assert scores["bandwidth"].tolist() == ordered
@@ -1325,7 +1590,7 @@ def test_bandwidth_search_checks_numerical_limits_before_scoring(
     assert sum(len(call.args[2]) for call in scorer.call_args_list) == len(curve)
 
 
-@pytest.mark.parametrize("estimator", [estimate_h0, estimate_h_cv], ids=["h0", "cv"])
+@pytest.mark.parametrize("estimator", [att.estimate_h0, att.estimate_h_cv], ids=["h0", "cv"])
 @pytest.mark.parametrize(
     ("case", "message"),
     [
@@ -1343,7 +1608,18 @@ def test_bandwidth_estimators_reject_invalid_samples(
     case: str,
     message: str,
 ) -> None:
-    """Reject invalid populations before calculating smoothing parameters."""
+    """Reject invalid populations before calculating smoothing parameters.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+        estimator:
+            Bandwidth-selection function under test.
+        case:
+            Invalid input or sample configuration to exercise.
+        message:
+            Expected validation error or diagnostic message fragment.
+    """
     eligible = list(bandwidth_events["firm"])
     if case == "constant":
         bandwidth_events["hours"] = 4.0
@@ -1362,11 +1638,16 @@ def test_bandwidth_estimators_reject_invalid_samples(
 
 
 def test_bandwidth_cv_requires_multiple_cohorts(bandwidth_events: pd.DataFrame) -> None:
-    """Allow Silverman scale estimation but reject a one-category CV target."""
+    """Allow Silverman scale estimation but reject a one-category CV target.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+    """
     bandwidth_events["period"] = FIRST
-    assert estimate_h0(bandwidth_events, **EVENT_MAPPINGS) > 0.0
+    assert att.estimate_h0(bandwidth_events, **EVENT_MAPPINGS) > 0.0
     with pytest.raises(ValueError, match="cohort"):
-        estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=[0.5, 1.0])
+        att.estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=[0.5, 1.0])
 
 
 @pytest.mark.parametrize("candidates", [[], [0.0, 1.0], [np.nan, 1.0], [1.0, 1.0], [True, 2.0]])
@@ -1374,9 +1655,16 @@ def test_bandwidth_cv_rejects_invalid_candidate_grids(
     bandwidth_events: pd.DataFrame,
     candidates: list[float],
 ) -> None:
-    """Require distinct positive finite bandwidths instead of coercing them."""
+    """Require distinct positive finite bandwidths instead of coercing them.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+        candidates:
+            Invalid initial bandwidth candidate grid.
+    """
     with pytest.raises(ValueError, match="bandwidth"):
-        estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=candidates)
+        att.estimate_h_cv(bandwidth_events, **EVENT_MAPPINGS, bandwidths=candidates)
 
 
 @pytest.mark.parametrize("batch_size", [0, 1.5, True])
@@ -1384,8 +1672,15 @@ def test_bandwidth_cv_rejects_invalid_batch_sizes(
     bandwidth_events: pd.DataFrame,
     batch_size: float,
 ) -> None:
-    """Require a positive integer batch size without accepting Boolean values."""
-    estimator: Callable[..., object] = estimate_h_cv
+    """Require a positive integer batch size without accepting Boolean values.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+        batch_size:
+            Number of dose queries processed in each computation batch.
+    """
+    estimator: Callable[..., object] = att.estimate_h_cv
     with pytest.raises(ValueError, match="batch_size"):
         estimator(bandwidth_events, **EVENT_MAPPINGS, bandwidths=[0.5, 1.0], batch_size=batch_size)
 
@@ -1395,7 +1690,14 @@ def test_bandwidth_cv_rejects_invalid_expansion_limits(
     bandwidth_events: pd.DataFrame,
     max_expansions: float,
 ) -> None:
-    """Require a positive integer budget for each search direction."""
-    estimator: Callable[..., object] = estimate_h_cv
+    """Require a positive integer budget for each search direction.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+        max_expansions:
+            Invalid bound on adaptive search steps in each direction.
+    """
+    estimator: Callable[..., object] = att.estimate_h_cv
     with pytest.raises(ValueError, match="max_expansions"):
         estimator(bandwidth_events, **EVENT_MAPPINGS, bandwidths=[0.5, 1.0], max_expansions=max_expansions)

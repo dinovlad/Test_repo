@@ -1,20 +1,22 @@
-**Implementation specification: unpooled continuous-dose ATT and dose-specific event-study aggregation.**
+**Implementation Specification: Unpooled Continuous-Dose ATT and Dose-Specific Event-Study Aggregation.**
 
 This document specifies the self-contained Python module [att.py](src/labor_cost_optimization/att.py). The design uses a separate PyFixest OLS model for every cohort-time comparison, with a polynomial dose curve and a saved dose transformation for every comparison. Its point estimates reproduce the parametric `contdid` calculation with no internal knots on the same comparison samples, and a separate Gaussian-kernel function estimates conditional cohort weights. It estimates the effect of each store's first recorded termination, with at most one target event per store. Event selection and control selection are extensions to the article's design; each cell regression is an algebraically equivalent parameterization of the reference point-estimation calculation with the same polynomial degree and no internal knots. The module evaluates every integer horizon in the isolation window: post-treatment effects, pre-treatment placebo contrasts, and the reference period. All estimates are point estimates.
 
-**Periods and frequency.** The frequency is hardcoded to one calendar day. A period means one step at that fixed frequency. There is no frequency parameter or support for monthly or annual inputs. Input and output period labels are timezone-naive `datetime64[ns]` values normalized to the start of each period. All event-time offsets, isolation bounds, baseline comparisons, and dose units have a daily interpretation.
+**Periods and Frequency.** The frequency is hardcoded to one calendar day. A period means one step at that fixed frequency. There is no frequency parameter or support for monthly or annual inputs. Input and output period labels are timezone-naive `datetime64[ns]` values normalized to the start of each period. All event-time offsets, isolation bounds, baseline comparisons, and dose units have a daily interpretation.
 
 The public API consists of one class and four functions: `ATT`, `estimate_h0()`, `estimate_h_cv()`, `estimate_pi()`, and `evaluate_theta()`. In this example, `firm_col`, `period_col`, `outcome_col`, and `dose_col` are caller-supplied strings naming columns in the input tables; all four must be provided:
 
 ```python
-bandwidth, cv_scores = estimate_h_cv(
+import labor_cost_optimization.att as att
+
+bandwidth, cv_scores = att.estimate_h_cv(
     events,
     firm_col=firm_col,
     period_col=period_col,
     dose_col=dose_col,
 )
 
-model = ATT(
+model = att.ATT(
     firm_col=firm_col,
     period_col=period_col,
     outcome_col=outcome_col,
@@ -30,14 +32,14 @@ model.fit(
 
 unpooled = model.predict(doses=[4, 6, 8, 10, 12])
 
-weights = estimate_pi(
+weights = att.estimate_pi(
     model.events_,
     doses=[4, 6, 8, 10, 12],
     eligible_firms=eligible_firms,
     bandwidth=bandwidth,
 )
 
-theta = evaluate_theta(
+theta = att.evaluate_theta(
     model,
     doses=[4, 6, 8, 10, 12],
     bandwidth=bandwidth,
@@ -49,7 +51,7 @@ For `isolation_window=(-7, 14)`, `fit()` processes all 22 integer horizons from 
 
 The standalone weight example requires the precise retained store identifiers eligible at one event period. `evaluate_theta()` constructs that set automatically. The bandwidth is in hours. The illustrated bandwidth call uses the raw event table and selects its own first row per store; it does not require fitted outcomes. Without `eligible_firms`, it tunes over all of those first events, not automatically over the eventual isolated and observed estimation population. The optional subset and bandwidth criteria are specified below. The illustrated isolation window is a configuration example, not a recommended empirical choice. Screening bounds are inferred from the overall minimum and maximum normalized outcome periods across all stores.
 
-**Store units and first terminations.** Store $i$ is the unit. Let $G_i$ be its earliest recorded termination period in the supplied history, and let $D_i>0$ be the scheduled hours per period removed by that termination. The store identifier is the sole estimation-unit key. Employee identifiers are neither required nor used. Keep only this first termination as the store's estimation candidate; later terminations never become additional targets or enter its aggregation weights.
+**Store Units and First Terminations.** Store $i$ is the unit. Let $G_i$ be its earliest recorded termination period in the supplied history, and let $D_i>0$ be the scheduled hours per period removed by that termination. The store identifier is the sole estimation-unit key. Employee identifiers are neither required nor used. Keep only this first termination as the store's estimation candidate; later terminations never become additional targets or enter its aggregation weights.
 
 The fixed treatment label is
 
@@ -59,13 +61,13 @@ $$
 
 The outcome $Y_{it}$ is store sales per period. The dose is the hours removed by the selected termination, not the store's total subsequent staffing reduction. Replacement hiring or redistribution of work does not change this label; those responses belong to the total effect of the selected termination. Keep store-period outcomes and termination records in separate tables, with at most one treated observation per store in each comparison.
 
-**Isolation and event eligibility.** Prespecify an isolation window $(L,H)$, where $L\le-1$ and $H\ge0$. These bounds define all fitted event periods, $e\in\lbrace L,L+1,\ldots,H\rbrace$. The tuple contains signed offsets in periods: `(-7, 14)` means seven periods before through fourteen periods after termination, with both boundaries included. For an event at $g$, screen the closed period interval $[g+L,g+H]$. An event is design-eligible only if its entire isolation interval lies within the overall outcome panel bounds and no other termination at its store occurs inside it, including any later termination that is excluded from target estimation. In internal period indices, require $g+L\ge1$ and $g+H\le T$, with equality allowed at either boundary. Assume termination recording is complete for every outcome store throughout these panel bounds, including periods with no outcome row. Simultaneous terminations therefore exclude every affected event. Apply this rule to each first-event candidate using the complete distinct-period termination history described below. Exclude only the one selected termination from its store's overlap count, not all records at that store or in that period. The same-period rule below specifies how multiple input records are counted. Dropping rows from target estimation must not make another event artificially eligible.
+**Isolation and Event Eligibility.** Prespecify an isolation window $(L,H)$, where $L\le-1$ and $H\ge0$. These bounds define all fitted event periods, $e\in\lbrace L,L+1,\ldots,H\rbrace$. The tuple contains signed offsets in periods: `(-7, 14)` means seven periods before through fourteen periods after termination, with both boundaries included. For an event at $g$, screen the closed period interval $[g+L,g+H]$. An event is design-eligible only if its entire isolation interval lies within the overall outcome panel bounds and no other termination at its store occurs inside it, including any later termination that is excluded from target estimation. In internal period indices, require $g+L\ge1$ and $g+H\le T$, with equality allowed at either boundary. Assume termination recording is complete for every outcome store throughout these panel bounds, including periods with no outcome row. Simultaneous terminations therefore exclude every affected event. Apply this rule to each first-event candidate using the complete distinct-period termination history described below. Exclude only the one selected termination from its store's overlap count, not all records at that store or in that period. The same-period rule below specifies how multiple input records are counted. Dropping rows from target estimation must not make another event artificially eligible.
 
 Here, an overlapping event means another termination falls within the specified screening interval. Reuse of a store's sales observations in separate comparisons is still possible and creates dependence. Window lengths must address the plausible duration of anticipation and changing carryover effects; spacing alone does not establish identification.
 
 Write $S_i=1$ for an event passing these design restrictions and $\mathcal E$ for the resulting event population, before endpoint-availability and small-sample screening. Keep $(L,H)$ fixed when comparing different event periods or prediction requests. Refitting with a different window can change even the event-period-zero target. Do not derive screening bounds from termination periods or from an individual store's first and last observed sales periods. An event whose isolation interval extends beyond the overall panel bounds is ineligible at every requested horizon, including shorter horizons with observed endpoints. Additional termination records outside the panel do not extend these bounds. Completeness of termination recording within the bounds is a data assumption, not something inferred from sales observations.
 
-**Statistical target and identifying restriction.** For each comparison let $e=t-g$ be any integer from $L$ through $H$. Define $O_{s,u}=1$ when the outcome table contains a valid observation for store $s$ in period $u$, and zero otherwise. Event endpoint availability is
+**Statistical Target and Identifying Restriction.** For each comparison let $e=t-g$ be any integer from $L$ through $H$. Define $O_{s,u}=1$ when the outcome table contains a valid observation for store $s$ in period $u$, and zero otherwise. Event endpoint availability is
 
 $$
 A_i(e)=O_{i,G_i-1}\thinspace{}O_{i,G_i+e}.
@@ -106,7 +108,7 @@ The right-hand expectation weights control stores equally. This is an assumption
 
 Selection on later terminations and on observed outcomes uses post-event information and may itself be affected by the focal event. Identification is asserted only under the stated restriction for the selected population. In particular, excluding stores after closure does not recover a treatment effect that includes their subsequent sales or closure consequences. Generalizing to all isolated events requires additional assumptions or a different outcome definition. The target is not a population guaranteed to remain isolated and observed under both counterfactual regimes. Parametric estimation also requires an adequate specification of each comparison's dose curve and relevant dose support. Strong parallel trends is not assumed, and slopes across doses are not interpreted as causal marginal responses.
 
-**Negative horizons and the reference period.** Use the same baseline $g-1$ for every horizon. For $e\le-2$, estimate the dose-specific pre-treatment contrast
+**Negative Horizons and the Reference Period.** Use the same baseline $g-1$ for every horizon. For $e\le-2$, estimate the dose-specific pre-treatment contrast
 
 $$
 P_{g,e}(d)
@@ -140,7 +142,7 @@ $$
 
 The reported `estimate_type` is `att` for $e\ge0$, `placebo` for $e\le-2$, and `reference` for $e=-1$. For negative horizons, the numeric columns `att` and `theta` contain these diagnostics or the zero reference, not post-treatment causal ATT estimates. Provided the reference population passes the bookkeeping checks below, its aggregation is exactly zero at every requested dose.
 
-**Relationship to the article.** Callaway et. al. (2025) provide the starting point. With stores as units and one selected termination per store, the treatment-label structure matches one adoption period and fixed dose per unit. The isolation screen, observed-outcome selection, and comparison-store rule require the distinctions below.
+**Relationship to the Article.** Callaway et. al. (2025) provide the starting point. With stores as units and one selected termination per store, the treatment-label structure matches one adoption period and fixed dose per unit. The isolation screen, observed-outcome selection, and comparison-store rule require the distinctions below.
 
 | Feature | Article's staggered-adoption setting | This plan |
 | --- | --- | --- |
@@ -154,13 +156,13 @@ The reported `estimate_type` is `att` for $e\ge0$, `placebo` for $e\le-2$, and `
 
 The article's dose-specific event-study aggregation on printed page 41 is unnumbered; it is the source of the aggregation structure, not an equation establishing identification for these selected store comparisons. Remark C.1 on page 42 discusses estimating components and aggregating them. [Callaway et. al. (2025), Appendix C](https://psantanna.com/files/CGBS_v4.pdf#page=40)
 
-**Relationship to the R implementation.** The reference calculation is the parametric level-effect part of `contdid::cont_did_acrt`: regress raw outcome changes on an intercept and dose B-splines among the focal treated cohort, then subtract the comparison group's mean change. This module implements its polynomial case: with degree $q$ and no internal knots, that B-spline basis spans exactly the polynomials of degree at most $q$. Use baseline $g-1$ and reproduce those point estimates through a separate PyFixest regression for each cell, with a control intercept and treatment-interacted polynomial terms. The equivalence below holds for identical samples and polynomial degree without additional covariates; basis coefficients differ, while fitted dose curves agree up to numerical precision. Ordinary polynomials do not reproduce specifications containing internal spline knots, and this module exposes no knot parameter. Extending this fixed baseline to pre-treatment horizons is an explicit convention of this plan; numerical comparisons with the package must use the same pre-treatment baseline convention rather than assuming its defaults match. [Estimator and subset source](https://github.com/bcallaway11/contdid/blob/main/R/cont_did.R)
+**Relationship to the R Implementation.** The reference calculation is the parametric level-effect part of `contdid::cont_did_acrt`: regress raw outcome changes on an intercept and dose B-splines among the focal treated cohort, then subtract the comparison group's mean change. This module implements its polynomial case: with degree $q$ and no internal knots, that B-spline basis spans exactly the polynomials of degree at most $q$. Use baseline $g-1$ and reproduce those point estimates through a separate PyFixest regression for each cell, with a control intercept and treatment-interacted polynomial terms. The equivalence below holds for identical samples and polynomial degree without additional covariates; basis coefficients differ, while fitted dose curves agree up to numerical precision. Ordinary polynomials do not reproduce specifications containing internal spline knots, and this module exposes no knot parameter. Extending this fixed baseline to pre-treatment horizons is an explicit convention of this plan; numerical comparisons with the package must use the same pre-treatment baseline convention rather than assuming its defaults match. [Estimator and subset source](https://github.com/bcallaway11/contdid/blob/main/R/cont_did.R)
 
 The separate input tables, first-event selection, isolation screen, and explicit handling of missing store-periods are custom additions. The clean-window control rule can include stores whose first termination occurred earlier, provided their history and counterfactual trends satisfy the stated assumption. Keeping one target event per store does not make such stores untreated in the article's absorbing-treatment sense; this control rule remains an extension to its comparison design.
 
 Other intentional implementation differences are retaining the fitted basis at prediction, warning and dropping small or unidentifiable cohort–event-period comparisons, and adding dose-conditional kernel aggregation. Thus compatibility refers to the regression calculation on the same comparison sample with a consistent fitted basis. The inspected R prediction path rebuilds its basis on the prediction grid. Sources were inspected on 2026-11-03; implementation validation should record the R version or source revision actually used.
 
-**Input contract and configurable columns.** `ATT.fit()` accepts two pandas DataFrames. All four input-column parameters are required keyword-only constructor arguments with no defaults. Omitting any one raises `TypeError` at construction. No input-column names are inferred or supplied as fallbacks. The outcome table uses:
+**Input Contract and Configurable Columns.** `ATT.fit()` accepts two pandas DataFrames. All four input-column parameters are required keyword-only constructor arguments with no defaults. Omitting any one raises `TypeError` at construction. No input-column names are inferred or supplied as fallbacks. The outcome table uses:
 
 | `ATT` parameter | Meaning |
 | --- | --- |
@@ -180,7 +182,7 @@ The shared `firm_col` and `period_col` parameters name columns present in both i
 
 Validate both period columns as timezone-naive `datetime64[ns]` with no `NaT`. Do not silently parse strings, accept columns with object dtype, or convert timezone-aware datetimes. Normalize copies with `.dt.normalize()` under the fixed daily frequency, ignoring within-period time components while retaining `datetime64[ns]`. Do not infer frequency from observed gaps or convert inputs to pandas Period dtype. Validate uniqueness using the column named by `firm_col` and the normalized column named by `period_col` in the outcome table. Two within-period rows that collapse to the same store-period are an error, not an instruction to sum or select one. Multiple event rows per store are allowed and processed by the first-event and same-period rules below.
 
-**First-event selection and additional-event counts.** Validate required input values and normalize periods before selection. Group only by the column named by `firm_col`, sort by the normalized `period_col` using a stable sort, and retain that entire first row for each store. If several rows share the earliest period, retain the first in original input order as the candidate. Ignore within-period time components and retain that row's dose without averaging or summing across rows.
+**First-Event Selection and Additional-Event Counts.** Validate required input values and normalize periods before selection. Group only by the column named by `firm_col`, sort by the normalized `period_col` using a stable sort, and retain that entire first row for each store. If several rows share the earliest period, retain the first in original input order as the candidate. Ignore within-period time components and retain that row's dose without averaging or summing across rows.
 
 Select the first event across the full supplied history, before isolation, outcome availability, or sample-size screening. If it is subsequently ineligible, do not promote a later event from the same store. The target is the effect of each eligible store's earliest recorded termination in the supplied history, not necessarily its first-ever termination outside that history.
 
@@ -188,9 +190,9 @@ Let `n_dropped_events` be the input row count minus the number of distinct store
 
 Only first-event rows populate `events_`, fitted targets and kernel inputs. Build `termination_history_` separately from all input records, grouped by the column named by `firm_col` and the normalized column named by `period_col`, with the number of records in that period. Later periods remain solely for isolation and control-exposure screening. No employee or new event identifier is stored.
 
-**Same-period records.** Treat each supplied event row as one actual termination. Without employee identifiers, multiple rows at the same store and normalized period cannot be distinguished automatically from duplicate copies of one record. The working convention is that they are simultaneous terminations, including when their doses match. Preserve their count in `termination_history_`. If the first termination period has more than one record, mark its candidate `overlapping_termination` and exclude it; do not promote a later period or interpret the first row's dose as the combined reduction. Duplicate copies of the same underlying termination must be removed upstream if that is how the source data are recorded.
+**Same-Period Records.** Treat each supplied event row as one actual termination. Without employee identifiers, multiple rows at the same store and normalized period cannot be distinguished automatically from duplicate copies of one record. The working convention is that they are simultaneous terminations, including when their doses match. Preserve their count in `termination_history_`. If the first termination period has more than one record, mark its candidate `overlapping_termination` and exclude it; do not promote a later period or interpret the first row's dose as the combined reduction. Duplicate copies of the same underlying termination must be removed upstream if that is how the source data are recorded.
 
-**Logging convention.** Every nonfatal warning in this specification must use the standard-library function `logging.warning()`. During `fit()`, collect selection and comparison exclusions in `drop_summary_` and emit one aggregate warning if any occur; do not emit separate warnings for duplicate-event selection, individual cohorts, individual cells, or missing controls. A fit with no exclusions emits no selection warning. Direct prediction warnings remain separate from the fit summary. Each successful `evaluate_theta()` call emits at most one aggregate warning covering its complete requested horizon and dose grid; its internal prediction calculations emit no intermediate warnings. Do not import or use the `warnings` module, warning categories, or `warnings.warn()`. Do not explicitly configure logging handlers or levels in the module; leave logging setup to the caller. Validation and required-model failures remain exceptions.
+**Logging Convention.** Every nonfatal warning in this specification must use the standard-library function `logging.warning()`. During `fit()`, collect selection and comparison exclusions in `drop_summary_` and emit one aggregate warning if any occur; do not emit separate warnings for duplicate-event selection, individual cohorts, individual cells, or missing controls. A fit with no exclusions emits no selection warning. Direct prediction warnings remain separate from the fit summary. Each successful `evaluate_theta()` call emits at most one aggregate warning covering its complete requested horizon and dose grid; its internal prediction calculations emit no intermediate warnings. Do not import or use the `warnings` module, warning categories, or `warnings.warn()`. Do not explicitly configure logging handlers or levels in the module; leave logging setup to the caller. Validation and required-model failures remain exceptions.
 
 The outcome panel may have missing store-periods, including temporary inactivity and permanent closure. Every row that is present must have a finite, nonmissing outcome. An absent row is not a zero outcome. Do not fill missing periods, impute outcomes, carry observations forward, or replace a required endpoint with the nearest observed period. A real observed zero is allowed. A store or event contributes to a comparison only when its exact baseline and endpoint rows exist. Missing intermediate periods alone do not invalidate that comparison.
 
@@ -200,7 +202,7 @@ A design-eligible target event has $1-L\le G_i\le T-H$; actual endpoint observat
 
 The inferred coverage interval runs from the earliest to the latest normalized outcome period over the entire panel. Assume the event table is complete for every outcome store throughout that interval, including stores with no recorded terminations and periods when a store is closed or inactive. Completeness cannot be verified from the outcome panel or the presence of individual event records. Preserve all supplied terminations for first-event selection and history screening, including those during missing outcome periods, outside the panel, overlapping other events, or excluded from estimation. Extra event records do not relax the requirement that the full isolation interval lies inside the outcome panel bounds.
 
-Runtime dependencies are NumPy, pandas, PyFixest, SciPy, and the Python standard library. Exact runtime pins and development-tool requirements are declared in [pyproject.toml](pyproject.toml). The project requires Python 3.11; [.python-version](.python-version) selects that interpreter for tools such as uv. The module covers outcomes per period with missing store-periods allowed, equal weights for treated and control rows within each comparison, no anticipation, post-treatment level estimates, and pre-treatment placebo diagnostics. Covariates, inference, plotting, treatment slopes, and changing the dose within an event are outside this scope.
+Runtime dependencies are NumPy, pandas, Pydantic v2, PyFixest, SciPy, and the Python standard library. Dependency constraints and development-tool requirements are declared in [pyproject.toml](pyproject.toml). The project requires Python 3.11; [.python-version](.python-version) selects that interpreter for tools such as uv. The module covers outcomes per period with missing store-periods allowed, equal weights for treated and control rows within each comparison, no anticipation, post-treatment level estimates, and pre-treatment placebo diagnostics. Covariates, inference, plotting, treatment slopes, and changing the dose within an event are outside this scope.
 
 Use the supplied [.pre-commit-config.yaml](.pre-commit-config.yaml) for spelling, formatting, lint, and type checks on Python, Markdown, and notebooks. The hooks use system executables, so activate the development environment before installing or running them:
 
@@ -211,7 +213,7 @@ pre-commit install
 pre-commit run --all-files
 ```
 
-**`ATT` owns separate PyFixest cell models.** The class manages the two tables, constructs eligible cohort-time comparisons, and estimates one `pyfixest.feols()` model per non-reference comparison. Every comparison has its own coefficients; none are shared across cohorts or horizons. The formula construction provides a place for future covariate extensions, but this specification adds no covariates or control-column parameters. Its signatures are:
+**`ATT` Owns Separate PyFixest Cell Models.** The class manages the two tables, constructs eligible cohort-time comparisons, and estimates one `pyfixest.feols()` model per non-reference comparison. Every comparison has its own coefficients; none are shared across cohorts or horizons. The formula construction provides a place for future covariate extensions, but this specification adds no covariates or control-column parameters. Its signatures are:
 
 ```python
 ATT(
@@ -248,13 +250,13 @@ $$
 
 Count each control store once, regardless of workforce size. A treated store cannot also be its own control. A store may control for another event outside its own termination window, including after an earlier termination, only under the stated PT and carryover conditions. The history screen remains fixed through $g+H$ at all horizons; the observed-endpoint restriction can change both treated and control samples across horizons.
 
-**Batched comparison construction.** Use internal integer store codes and elapsed-period indices for exact outcome and termination-history lookups. Prepare and index the shared baseline observations once, and evaluate their fixed history-window exposure once. At each horizon, match endpoints for candidate comparisons across cohorts in batches, rather than repeatedly filtering the entire panel and history inside a cohort loop. Preserve the original identifier values and normalized datetime labels in public outputs and diagnostics; integer indices must preserve gaps in the calendar.
+**Batched Comparison Construction.** Use internal integer store codes and elapsed-period indices for exact outcome and termination-history lookups. Prepare and index the shared baseline observations once, and evaluate their fixed history-window exposure once. At each horizon, match endpoints for candidate comparisons across cohorts in batches, rather than repeatedly filtering the entire panel and history inside a cohort loop. Preserve the original identifier values and normalized datetime labels in public outputs and diagnostics; integer indices must preserve gaps in the calendar.
 
 Keep the cell-specific loop needed to save each polynomial transformation, screen its support and rank, record its diagnostics, and assemble accepted comparison rows. Vectorized selection must preserve treated and control membership, endpoint availability, saved transformations, and the cell-specific coefficient interpretation. Do not construct a dense store-by-period-by-horizon panel to perform these lookups.
 
 Preparation collects narrow DataFrames for the accepted non-reference comparisons, then fits those cells in order. Each regression contains only one cell's rows and $q+2$ columns, counting its control intercept, treatment intercept, and $q$ polynomial terms. Do not concatenate all comparisons into a global regression or create columns for interactions with every cell. This is not a streaming implementation: the collected comparison frames, lookup arrays, diagnostics, and retained models still consume memory, and comparison rows can reuse the same store at several cohorts or horizons. Performance claims require measurement on a specified dataset; changing the regression architecture does not establish a universal speed bound.
 
-**Separate polynomial cell regressions.** Let $\mathcal J$ contain the non-reference cells $c=(g,e)$ with $e\ne-1$ that pass both treated-design and clean-control availability checks. For each cell, form one row per eligible treated store and one row per clean control store. The row outcome is
+**Separate Polynomial Cell Regressions.** Let $\mathcal J$ contain the non-reference cells $c=(g,e)$ with $e\ne-1$ that pass both treated-design and clean-control availability checks. For each cell, form one row per eligible treated store and one row per clean control store. The row outcome is
 
 $$
 \Delta Y_{ic}=Y_{i,g+e}-Y_{i,g-1}.
@@ -301,7 +303,7 @@ self.models_[key] = pf.feols(
 
 Use separate `feols()` calls and store their `Feols` objects by `(cohort, event_time)` in `models_`. The ordinary intercept supplies $\alpha_c$; no fixed-effect formula is required within a single cell. The absolute endpoint period $g+e$ and baseline period $g-1$ are fixed within each cell, so a common calendar effect contributes $\lambda_{g+e}-\lambda_{g-1}$ and is absorbed by $\alpha_c$. No separate calendar-period fixed effect is included. Use PyFixest's regression solver without constructing an explicit matrix inverse. `lean=True` and `store_data=False` avoid retaining large regression data in the fitted objects. `copy_data=False` avoids an extra copy of the internally constructed cell frame; callers' input tables remain untouched. Module predictions use the saved treatment coefficients and transformation instead of PyFixest's full-outcome prediction API. [PyFixest 0.60.0 API and formula syntax](https://github.com/py-econometrics/pyfixest/blob/v0.60.0/pyfixest/estimation/api/feols.py)
 
-**Equivalence and component prediction.** Let $\mathcal C_c=\mathcal C_{g,e}$ and define the clean-control mean change as $\widehat m_{0,c}$. Let $\widehat\gamma_{c0},\ldots,\widehat\gamma_{cq}$ denote the coefficients from the reference treated-only regression on an intercept and the same polynomial terms. For identical samples and degree, the cell OLS estimates satisfy, up to numerical precision,
+**Equivalence and Component Prediction.** Let $\mathcal C_c=\mathcal C_{g,e}$ and define the clean-control mean change as $\widehat m_{0,c}$. Let $\widehat\gamma_{c0},\ldots,\widehat\gamma_{cq}$ denote the coefficients from the reference treated-only regression on an intercept and the same polynomial terms. For identical samples and degree, the cell OLS estimates satisfy, up to numerical precision,
 
 $$
 \widehat\alpha_c
@@ -326,11 +328,11 @@ $$
 
 For $e\ge0$ this predicts ATT; for $e\le-2$ it predicts the placebo contrast. `ATT.predict()` evaluates the saved cell transformation and this treatment component. It does not add $\widehat\alpha_c$ or subtract $\widehat m_{0,c}$ again. PyFixest's full outcome prediction includes the control intercept and must not be returned directly as ATT. Separate control-mean estimation and reference treated-only regression fits are not needed for prediction. Unchanged component curves and unchanged kernel weights imply unchanged $\theta(d,e)$ point estimates.
 
-**Reference-cell handling.** At $e=-1$, availability requires only the observed baseline row: $A_i(-1)=O_{i,G_i-1}$. Apply the same treated-sample minimum, dose-support, rank, and clean-control availability checks as at other horizons. These are bookkeeping rules for a consistent reported population; they are not needed to identify the zero normalization itself.
+**Reference-Cell Handling.** At $e=-1$, availability requires only the observed baseline row: $A_i(-1)=O_{i,G_i-1}$. Apply the same treated-sample minimum, dose-support, rank, and clean-control availability checks as at other horizons. These are bookkeeping rules for a consistent reported population; they are not needed to identify the zero normalization itself.
 
 For a reference cell passing those checks, save its transformation, sample counts, and an ATT coefficient vector of exact zeros. Do not fit a PyFixest model for it. Record the cell status as `reference`, and return `att=0` with `estimate_type="reference"` for every requested dose. Reference rows use `extrapolated=False` and do not trigger extrapolation warnings because the value is a normalization, not an estimated continuation of a dose curve. A failed reference cell follows the usual screening or missing-control rules; do not supply a zero for an unavailable comparison.
 
-**Saved polynomial transformation.** Each cell's degree-$q$ treatment curve has $p=q+1$ coefficients, including its treatment intercept; its regression also has one control intercept. The default $q=3$ gives a cubic polynomial. There are no internal knots or piecewise-polynomial options.
+**Saved Polynomial Transformation.** Each cell's degree-$q$ treatment curve has $p=q+1$ coefficients, including its treatment intercept; its regression also has one control intercept. The default $q=3$ gives a cubic polynomial. There are no internal knots or piecewise-polynomial options.
 
 For each `(cohort, event_time)` comparison, save `lower`, `upper`, and `degree` from its endpoint-observed treated doses and the configured degree in `bases_`. Construct the treated intercept-plus-power matrix for design checks using the saved scaling. The PyFixest formula uses `poly(..., raw=True)` so its columns are precisely the powers of that scaled dose, with no independently fitted orthogonalization or prediction-grid-dependent transformation.
 
@@ -338,7 +340,7 @@ For non-reference comparisons, `predict()` must use these saved values without r
 
 For non-reference comparisons, allow polynomial continuation outside the observed dose range, issue an extrapolation warning, and flag those rows. Do not clip doses, discard cohorts at particular doses, or renormalize weights because of extrapolation. Such values rely on the fitted functional form beyond observed support.
 
-**Small-sample screening and dropping.** `min_cohort_size=None` resolves to the minimum treated sample size permitted by this design. Let $p=q+1$ be the dimension of the treated-only intercept-plus-basis design within a cell. Require positive residual degrees of freedom for that treated component, giving a treated-sample floor of $p+1$. Full-column-rank estimation of that component algebraically requires only $p$ treated observations; the extra observation is this module's design rule, not an identification threshold supplied by the article. The control intercept additionally requires at least one clean control. Additional control rows or observations in other cells do not relax the treated-sample floor.
+**Small-Sample Screening and Dropping.** `min_cohort_size=None` resolves to the minimum treated sample size permitted by this design. Let $p=q+1$ be the dimension of the treated-only intercept-plus-basis design within a cell. Require positive residual degrees of freedom for that treated component, giving a treated-sample floor of $p+1$. Full-column-rank estimation of that component algebraically requires only $p$ treated observations; the extra observation is this module's design rule, not an identification threshold supplied by the article. The control intercept additionally requires at least one clean control. Additional control rows or observations in other cells do not relax the treated-sample floor.
 
 If the caller supplies a positive integer minimum, denote it by $n_{\mathrm{user}}$. Resolve the effective threshold as
 
@@ -362,7 +364,7 @@ Distinguish design and availability exclusions from estimation failures. Mark an
 
 If no non-reference comparison passes the required checks, `fit()` raises an error after recording reasons and does not call `feols()`; reference zeros alone do not constitute a successful fit. Otherwise, fit every cell in $\mathcal J$ separately and verify that every expected treatment coefficient is present and finite. A model-fitting error, nonfinite coefficient, or unexpected coefficient dropped by PyFixest makes the entire `fit()` fail; do not silently accept a lower-dimensional curve or omit a failed cell. At least one post-treatment or placebo cell must be successfully fitted, and every attempted cell model must pass validation. On a backend failure, clear the non-reference fitted models and coefficients and invalidate prediction for the whole fit while retaining diagnostics. Never fill a failed cell with a zero effect.
 
-**One fit-level exclusion summary.** Reset `drop_summary_` at the start of each `fit()` and collect counts across selection, availability, and comparison screening. Its fields and counting units are:
+**One Fit-Level Exclusion Summary.** Reset `drop_summary_` at the start of each `fit()` and collect counts across selection, availability, and comparison screening. Its fields and counting units are:
 
 | Field | Meaning |
 | --- | --- |
@@ -378,7 +380,7 @@ The two treated-row fields count comparison rows across all fitted horizons, inc
 
 Emit one `logging.warning()` message containing the aggregate counts and reason totals when any selection or comparison exclusion occurs, with a pointer to the detailed diagnostics. Do not separately log duplicate-event selection or individual cell failures. When all counts are zero and the reason dictionaries are empty, emit no fit-selection warning. Keep the summary and whatever diagnostics have already been computed if preparation or fitting subsequently raises an exception; counts from stages not reached must not be presented as completed screening. Later calls to `predict()` and `evaluate_theta()` retain their own warnings and do not change the fit summary.
 
-**Stored state and unpooled output.** Keep the information needed for prediction, weights, and diagnostics:
+**Stored State and Unpooled Output.** Keep the information needed for prediction, weights, and diagnostics:
 
 - `column_names_`: the four supplied input-column mappings; the `firm_col` and `period_col` mappings are shared by both tables.
 - `min_cohort_size_`: the resolved effective sample-size minimum, including the design floor.
@@ -401,7 +403,7 @@ Emit one `logging.warning()` message containing the aggregate counts and reason 
 
 `ATT.predict()` returns one row per available `(cohort, event_time, dose)`, with `cohort`, `period`, `event_time`, `dose`, `att`, `estimate_type`, `n_treated`, `n_controls`, and `extrapolated`. Both `cohort` and endpoint `period` are normalized `datetime64[ns]` period labels, not internal integer indices. `estimate_type` distinguishes `att`, `placebo`, and `reference`; `n_treated` counts the termination cohort even at negative horizons. Sort by cohort, event time, and dose. Warn when requested comparisons were dropped or have no controls, directing the caller to diagnostics. Ordinary outcome-availability exclusions are recorded separately; do not manufacture predictions for them.
 
-**Separate kernel-weight function.** This function is independent of fitted outcomes and of `ATT` internals:
+**Separate Kernel-Weight Function.** This function is independent of fitted outcomes and of `ATT` internals:
 
 ```python
 estimate_pi(
@@ -431,7 +433,7 @@ Return `cohort`, `dose`, and `weight`, sorted by normalized cohort period and do
 
 This is a custom estimator of conditional cohort probabilities. The article does not prescribe this kernel or bandwidth, and the package's existing dose aggregation does not supply these conditional weights. A positive bandwidth smooths cohort composition over nearby doses; consistency for exact conditional probabilities requires suitable smoothness, bandwidth, and sample-size conditions. Each store supplies only one dose/cohort observation to this calculation. The standalone helpers below provide a dose-scale rule and cross-validated bandwidth selection; callers still pass the selected bandwidth explicitly to `estimate_pi()` or `evaluate_theta()`.
 
-**Standalone bandwidth selection.** The two bandwidth helpers take raw termination records and required column mappings, independently of `ATT` and the outcome panel:
+**Standalone Bandwidth Selection.** The two bandwidth helpers take raw termination records and required column mappings, independently of `ATT` and the outcome panel:
 
 ```python
 estimate_h0(
@@ -521,7 +523,7 @@ Compute the exact criterion using batches of unique query doses against unique t
 
 Both bandwidth rules and this validation criterion are custom additions. Callaway et. al. (2025) do not prescribe them, and selecting a bandwidth does not supply identification or inference for $\theta(d,e)$. The conditional-weight estimator, retained samples, and component regressions remain exactly those specified above.
 
-**Thin extension for evaluating the event study.** A standalone function is sufficient; no second estimator class or inheritance hierarchy is needed:
+**Thin Extension for Evaluating the Event Study.** A standalone function is sufficient; no second estimator class or inheritance hierarchy is needed:
 
 ```python
 evaluate_theta(
@@ -553,7 +555,7 @@ At $e\ge0$, this aggregates causal ATT estimates under the stated assumptions; a
 
 Return `event_time`, `dose`, `theta`, `estimate_type`, `n_cohorts_eligible`, `n_cohorts_used`, `n_firms_design`, `n_firms_eligible`, `n_firms_used`, `availability_restricted`, `restricted_target`, and `extrapolated`. `n_firms_design` counts stores with design-eligible first terminations, including those without observed endpoints at this horizon. Eligible counts refer to the endpoint-observed population before comparison screening; used counts refer to retained comparisons. Store and selected-event counts are identical, so separate event-count columns are unnecessary. `availability_restricted` is true when some design-eligible stores lack a baseline or endpoint row at the requested horizon. Overall panel-boundary exclusions have already occurred in the design screen. `restricted_target` is true when any nonempty eligible cohort is excluded at this horizon by a sample-size, rank, or dose-support screen. Isolation restrictions always define the target and are recorded separately. For non-reference horizons, `extrapolated` is true if any contributing prediction is outside that comparison's observed dose range. The `estimate_type` values follow the same horizon-based rule as `ATT.predict()`; reference rows have `extrapolated=False`. Sort by event time and dose; component estimates and weights remain separately inspectable.
 
-**Observation availability and screening change the target.** First-event selection limits candidates to one termination per store. The isolation design then restricts that population to $S_i=1$. Outcome availability then restricts it to $A_i(e)=1$ at each horizon. After comparison screening, weights estimate
+**Observation Availability and Screening Change the Target.** First-event selection limits candidates to one termination per store. The isolation design then restricts that population to $S_i=1$. Outcome availability then restricts it to $A_i(e)=1$ at each horizon. After comparison screening, weights estimate
 
 $$
 P(G_i=g\mid D_i=d,S_i=1,A_i(e)=1,G_i\in\mathcal R_e).
@@ -572,11 +574,11 @@ This equals the pre-screen observed-endpoint target only when every eligible coh
 
 The screen is sample-dependent; this description is not an inferential result about selection. Both within-cohort store composition and retained cohorts may change across horizons. The fixed isolation window ensures period coverage from $L$ through $H$, including the baseline, for all design-eligible events. No common set of stores with complete outcomes is imposed across horizons; inactivity or closure can still change the observed sample.
 
-**Implementation boundaries and validation plan.** Put the class, all four public functions, and a few private validation, window-selection, polynomial, bandwidth, and cell-regression helpers in the single `src/labor_cost_optimization/att.py` file. Use the `labor_cost_optimization` package under the `src` directory; keep estimator logic in that module. Use `firm` and `period` consistently in all Python identifiers, canonical column names, docstrings, and error/log messages, including private helpers. Use `period_col`, `origin_period_`, `last_period_`, `last_period_index_`, and output column `period`; preserve literal third-party API/type names such as `datetime64[ns]` and `.dt.normalize()`. This plan keeps the application term “store” in explanatory prose; code examples and public schema names follow the general `firm` and `period` terminology. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. No generic estimator framework, serialization layer, or extra classes are needed.
+**Implementation Boundaries and Validation Plan.** Put the class, all four public functions, and a few private validation, window-selection, polynomial, bandwidth, and cell-regression helpers in the single `src/labor_cost_optimization/att.py` file. Use the `labor_cost_optimization` package under the `src` directory; keep estimator logic in that module. Use `firm` and `period` consistently in all Python identifiers, canonical column names, docstrings, and error/log messages, including private helpers. Use `period_col`, `origin_period_`, `last_period_`, `last_period_index_`, and output column `period`; preserve literal third-party API/type names such as `datetime64[ns]` and `.dt.normalize()`. This plan keeps the application term “store” in explanatory prose; code examples and public schema names follow the general `firm` and `period` terminology. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. Private Pydantic v2 input models use `ConfigDict(arbitrary_types_allowed=True, strict=True)` for runtime type validation. Preserve accepted NumPy integer values and the existing public `ValueError` behavior; numerical, period, isolation, and sample checks remain explicit domain validation. These private models stay in the same module and do not extend the public API. No generic estimator framework or serialization layer is needed. Include the package's `py.typed` marker through `[tool.setuptools.package-data]` so installed consumers can use its inline annotations.
 
-**Docstring convention.** Use Google-style docstrings throughout `src/labor_cost_optimization/att.py`, including the module, `ATT`, its constructor and public methods, all four public functions, and private helpers. Start with a concise summary followed by a blank line before any extended description or sections. Use `Args:`, `Returns:`, and `Raises:` where applicable; omit empty or inapplicable sections. Document constructor arguments in `__init__` and fitted public attributes in the class docstring's `Attributes:` section. Simple helpers may use a one-line docstring when no further contract needs explaining.
+**Docstring Convention.** Use Google-style docstrings throughout `src/labor_cost_optimization/att.py`, including the module, `ATT`, its constructor and public methods, all four public functions, and private helpers. Start with a concise summary followed by a blank line before any extended description or sections. Use `Args:`, `Returns:`, and `Raises:` where applicable; omit empty or inapplicable sections. Document constructor arguments in `__init__` and fitted public attributes in the class docstring's `Attributes:` section. Include `Args:` whenever a function or method accepts arguments other than `self` or `cls`, `Returns:` whenever its return annotation is not `None`, and `Raises:` for explicit or relevant unhandled exceptions. A one-line helper docstring is appropriate only when none of these sections is required. Wrap references to functions, methods, attributes, and schema columns in backticks.
 
-Indent argument names, exception classes, and attribute names four spaces relative to the section heading, each followed by a colon on its own line. Start each description on the next line, indented eight spaces, and keep wrapped description lines at that indentation. Plain prose in `Returns:` stays at four spaces. Preserve blank lines between the summary and sections and between successive sections. Document every argument except `self` and `cls`, using its exact signature name; type annotations belong in the signature. Explain returned objects and relevant DataFrame schemas, and describe the conditions for exceptions the caller needs to handle. Describe state changes such as `fit()` replacing earlier fitted state and when fitted attributes become available. Keep docstrings consistent with the implemented behavior and use `firm` and `period` throughout. Nonfatal diagnostics emitted by `logging.warning()` are not exceptions and do not belong in `Raises:`.
+Indent argument names, exception classes, and attribute names four spaces relative to the section heading, each followed by a colon on its own line. Start each description on the next line, indented eight spaces, and keep wrapped description lines at that indentation. Plain prose in `Returns:` stays at four spaces. Preserve blank lines between the summary and sections and between successive sections. Do not insert a blank line between a section heading and its first entry. Exception descriptions may use plain prose for multiple related conditions, as in the example below. Document every argument except `self` and `cls`, using its exact signature name; type annotations belong in the signature. Explain returned objects and relevant DataFrame schemas, and describe the conditions for exceptions the caller needs to handle. Describe state changes such as `fit()` replacing earlier fitted state and when fitted attributes become available. Keep docstrings consistent with the implemented behavior and use `firm` and `period` throughout. Nonfatal diagnostics emitted by `logging.warning()` are not exceptions and do not belong in `Raises:`.
 
 For example, the `estimate_pi()` docstring follows this layout:
 
@@ -585,7 +587,7 @@ For example, the `estimate_pi()` docstring follows this layout:
 
 Args:
     events:
-        Canonical first-event metadata with firm_id, cohort, and dose
+        Canonical first-event metadata with `firm_id`, `cohort`, and `dose`
         columns, containing one row per firm.
     doses:
         Distinct positive finite doses at which to evaluate weights.
@@ -595,8 +597,8 @@ Args:
         Positive finite Gaussian-kernel bandwidth in dose units.
 
 Returns:
-    A DataFrame with cohort, dose, and weight columns, sorted by cohort
-    and dose. Weights sum to one at each requested dose.
+    A DataFrame with `cohort`, `dose`, and `weight` columns, sorted by `cohort`
+    and `dose`. Weights sum to one at each requested dose.
 
 Raises:
     ValueError:
@@ -606,7 +608,7 @@ Raises:
 """
 ```
 
-The pytest suite in [tests/test_att.py](tests/test_att.py) checks the implementation against independent numerical calculations and targeted examples. Run `uv sync --python 3.11 --group dev`, then `uv run --no-sync python scripts/validate.py --log validation.log` from the repository root. The runner [scripts/validate.py](scripts/validate.py) records environment versions, package-source verification, test tracebacks, and read-only quality checks in a shareable log, continuing after individual failures. It performs no installation and returns a nonzero exit status for any failed check or mismatch with the configured runtime requirements. It uses `packaging` when available to interpret Python constraints and dependency requirements, including ranges and environment markers; missing parsing support is reported without preventing the remaining checks. Run the tests directly with `python -m pytest tests -v`; [tests/test_validate.py](tests/test_validate.py) also checks the diagnostic runner without importing the estimator. Quality commands target only the estimator module, the two test modules, the runner, and project documentation. Missing required files produce a failed validation result; quality checks continue on the expected files that are present, with no broad directory scan. Development dependencies include `pytest` and `codespell`. Required behaviors include:
+The pytest suite in [tests/test_att.py](tests/test_att.py) checks the implementation against independent numerical calculations and targeted examples. Run `uv sync --python 3.11 --group dev`, then `uv run --no-sync python scripts/validate.py --log validation.log` from the repository root. The runner [scripts/validate.py](scripts/validate.py) records environment versions, package-source verification, test tracebacks, and read-only quality checks in a shareable log, continuing after individual failures. It performs no installation and returns a nonzero exit status for any failed check or mismatch with the configured runtime requirements. It uses `packaging` when available to interpret Python constraints and dependency requirements, including ranges and environment markers; missing parsing support is reported without preventing the remaining checks. Run the tests directly with `python -m pytest tests -v`; [tests/test_validate.py](tests/test_validate.py) also checks the diagnostic runner without importing the estimator. Shared, independently initialized fixtures live in [tests/conftest.py](tests/conftest.py); include that file when copying the validation suite. Unit-test assertions may omit messages. Quality commands target only the estimator module, the two test modules, the shared fixture module, the runner, and project documentation. Missing required files produce a failed validation result; quality checks continue on the expected files that are present, with no broad directory scan. Development dependencies include `pytest`, `codespell`, and `orjson`; test fixtures use `orjson` for serialization. Required behaviors include:
 
 - All four column-name arguments are required; omitting any one raises `TypeError` at construction. No conventional input labels or internal schema names supply defaults. Renaming every input column through the constructor leaves results unchanged, using the same `firm_col` and `period_col` labels in both tables. Inputs missing either shared column fail validation; `outcome_col` and `dose_col` may share a label across the two tables.
 - `fit()` has no `event_times` argument and generates `list(range(-7, 15))` for `(-7, 14)`. Default prediction and aggregation include all 22 horizons; explicit subsets may include negative periods, and out-of-window requests fail.

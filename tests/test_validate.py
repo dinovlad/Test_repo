@@ -1,100 +1,22 @@
 """Check local environment reporting without importing estimator dependencies."""
 
-import importlib.metadata
 import importlib.util
-import io
-import json
-import subprocess
 import sys
+import types
+import unittest.mock
 from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 import pytest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "validate.py"
-SPEC = importlib.util.spec_from_file_location("local_validation_script", SCRIPT)
-if SPEC is None or SPEC.loader is None:
-    raise RuntimeError(f"Cannot load validation script: {SCRIPT}")
-VALIDATOR = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(VALIDATOR)
-HAS_PARSER = getattr(VALIDATOR, "Requirement", None) is not None
+HAS_PARSER = importlib.util.find_spec("packaging") is not None
 REQUIRES_PARSER = pytest.mark.skipif(
     not HAS_PARSER,
     reason="Optional packaging parser is not installed",
 )
 ReportResult = tuple[bool, str, list[str]]
 Report = Callable[..., ReportResult]
-
-
-@pytest.fixture
-def checkout(tmp_path: Path) -> Path:
-    """Create the files needed for a complete validation run.
-
-    Args:
-        tmp_path:
-            Directory for the temporary checkout.
-
-    Returns:
-        The checkout root containing the expected Python files and documentation.
-    """
-    for relative in [*VALIDATOR.CHECKED_PYTHON_FILES, "README.md", "att.md"]:
-        path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("# Validation fixture.\n", encoding="utf-8")
-    return tmp_path
-
-
-@pytest.fixture
-def report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Report:
-    """Create environment reports using isolated project metadata.
-
-    Args:
-        tmp_path:
-            Directory for temporary project metadata.
-        monkeypatch:
-            Fixture for replacing metadata lookups and Git commands.
-
-    Returns:
-        A callable that reports a project's success flag, log, and queried names.
-    """
-
-    def make_report(
-        requirements: list[str],
-        versions: dict[str, str],
-        *,
-        requires_python: str = ">=3.0",
-        dev_requirements: list[str] | None = None,
-    ) -> ReportResult:
-        """Report temporary project requirements and installed distributions."""
-        normalized = {name.lower().replace("_", "-"): value for name, value in versions.items()}
-        queried: list[str] = []
-
-        def installed(name: str) -> str:
-            """Return fixture metadata or the normal missing-distribution error."""
-            queried.append(name)
-            key = name.lower().replace("_", "-")
-            if key not in normalized:
-                raise importlib.metadata.PackageNotFoundError(name)
-            return normalized[key]
-
-        config = (
-            f"[project]\nrequires-python = {json.dumps(requires_python)}\ndependencies = {json.dumps(requirements)}\n"
-        )
-        if dev_requirements is not None:
-            config += f"[dependency-groups]\ndev = {json.dumps(dev_requirements)}\n"
-        (tmp_path / "pyproject.toml").write_text(config, encoding="utf-8")
-        log = io.StringIO()
-        git = subprocess.CompletedProcess([], 0, "fixture commit\n", "")
-        with monkeypatch.context() as scoped:
-            scoped.setattr(VALIDATOR, "ROOT", tmp_path)
-            scoped.setattr(VALIDATOR.importlib.metadata, "version", installed)
-            scoped.setattr(VALIDATOR.subprocess, "run", Mock(return_value=git))
-            result = VALIDATOR.environment_report(log)
-        return result, log.getvalue(), queried
-
-    return make_report
 
 
 @REQUIRES_PARSER
@@ -116,7 +38,16 @@ def test_standard_specifiers_and_unversioned_requirements(
     requirement: str,
     expected: bool,
 ) -> None:
-    """Accept supported installed versions without requiring exact pins."""
+    """Accept supported installed versions without requiring exact pins.
+
+    Args:
+        report:
+            Fixture producing isolated dependency-validation reports.
+        requirement:
+            Dependency declaration checked against installed metadata.
+        expected:
+            Expected validity of the dependency declaration.
+    """
     result, log, queried = report([requirement], {"numpy": "1.26.4"})
     assert result is expected, log
     assert "numpy" in queried
@@ -127,7 +58,12 @@ def test_standard_specifiers_and_unversioned_requirements(
 def test_mixed_project_requirements_continue_through_unpinned_entries(
     report: Report,
 ) -> None:
-    """Reproduce a project combining exact, range, and unversioned entries."""
+    """Reproduce a project combining exact, range, and unversioned entries.
+
+    Args:
+        report:
+            Fixture producing isolated dependency-validation reports.
+    """
     result, log, queried = report(
         ["numpy>=1.20,<2", "pandas", "csdid==0.4.5"],
         {"numpy": "1.26.4", "pandas": "1.5.3", "csdid": "0.4.5"},
@@ -143,7 +79,12 @@ def test_mixed_project_requirements_continue_through_unpinned_entries(
 def test_extras_use_base_distribution_and_false_markers_skip_lookup(
     report: Report,
 ) -> None:
-    """Evaluate markers and never request metadata for a distribution extra."""
+    """Evaluate markers and never request metadata for a distribution extra.
+
+    Args:
+        report:
+            Fixture producing isolated dependency-validation reports.
+    """
     result, log, queried = report(
         [
             "feature[speed]>=2; python_version >= '3.0'",
@@ -159,7 +100,12 @@ def test_extras_use_base_distribution_and_false_markers_skip_lookup(
 
 @REQUIRES_PARSER
 def test_missing_distribution_does_not_hide_later_packages(report: Report) -> None:
-    """Keep checking every runtime entry after a missing distribution."""
+    """Keep checking every runtime entry after a missing distribution.
+
+    Args:
+        report:
+            Fixture producing isolated dependency-validation reports.
+    """
     result, log, queried = report(
         ["missing-package>=1", "later==2.0"],
         {"later": "2.0"},
@@ -172,7 +118,12 @@ def test_missing_distribution_does_not_hide_later_packages(report: Report) -> No
 
 @REQUIRES_PARSER
 def test_invalid_requirement_is_reported_without_aborting(report: Report) -> None:
-    """Malformed declarations must not terminate the diagnostic report."""
+    """Continue the diagnostic report after malformed declarations.
+
+    Args:
+        report:
+            Fixture producing isolated dependency-validation reports.
+    """
     result, log, queried = report(
         ["not a valid [ requirement", "later>=1"],
         {"later": "2.0"},
@@ -187,7 +138,12 @@ def test_invalid_requirement_is_reported_without_aborting(report: Report) -> Non
 def test_direct_url_is_unverified_and_does_not_abort_later_checks(
     report: Report,
 ) -> None:
-    """Installed version metadata cannot prove a direct URL's provenance."""
+    """Report direct-reference provenance as unverified from version metadata.
+
+    Args:
+        report:
+            Fixture producing isolated dependency-validation reports.
+    """
     result, log, queried = report(
         ["remote @ https://example.invalid/remote.whl", "later==2.0"],
         {"remote": "1.2.0", "later": "2.0"},
@@ -200,7 +156,12 @@ def test_direct_url_is_unverified_and_does_not_abort_later_checks(
 
 @REQUIRES_PARSER
 def test_python_constraint_comes_from_the_temporary_project(report: Report) -> None:
-    """Interpreter matching must use requires-python, not a fixed version."""
+    """Use `requires-python` when checking the current interpreter.
+
+    Args:
+        report:
+            Fixture producing isolated dependency-validation reports.
+    """
     major, minor = sys.version_info[:2]
     matching = f">={major}.{minor},<{major}.{minor + 1}"
     result, log, _ = report([], {}, requires_python=matching)
@@ -217,7 +178,12 @@ def test_python_constraint_comes_from_the_temporary_project(report: Report) -> N
 
 @REQUIRES_PARSER
 def test_invalid_installed_version_is_reported_without_aborting(report: Report) -> None:
-    """Unparsable metadata must not conceal the rest of the environment."""
+    """Continue checking the environment after unparsable version metadata.
+
+    Args:
+        report:
+            Fixture producing isolated dependency-validation reports.
+    """
     result, log, queried = report(
         ["feature>=1", "later==2.0"],
         {"feature": "not-a-version", "later": "2.0"},
@@ -228,12 +194,22 @@ def test_invalid_installed_version_is_reported_without_aborting(report: Report) 
 
 
 def test_missing_optional_parser_reports_uncertainty_without_crashing(
+    validator: types.ModuleType,
     report: Report,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Retain useful installed versions when dependency parsing is unavailable."""
-    monkeypatch.setattr(VALIDATOR, "Requirement", None)
-    monkeypatch.setattr(VALIDATOR, "SpecifierSet", None)
+    """Retain useful installed versions when dependency parsing is unavailable.
+
+    Args:
+        validator:
+            Freshly loaded standalone validation module.
+        report:
+            Fixture producing isolated dependency-validation reports.
+        monkeypatch:
+            Fixture restoring temporary attribute and argument replacements.
+    """
+    monkeypatch.setattr(validator, "Requirement", None)
+    monkeypatch.setattr(validator, "SpecifierSet", None)
     result, log, queried = report(
         ["numpy>=1.20,<2", "csdid", "later==2.0"],
         {"numpy": "1.26.4", "csdid": "0.4.5", "later": "2.0"},
@@ -251,31 +227,45 @@ def test_missing_optional_parser_reports_uncertainty_without_crashing(
     ids=["mismatch", "exception"],
 )
 def test_failed_environment_check_still_runs_tests_and_writes_summary(
+    validator: types.ModuleType,
     checkout: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     failure: Exception | None,
 ) -> None:
-    """A mismatch or reporting exception must leave a complete diagnostic log."""
+    """Write a complete diagnostic log after a mismatch or reporting exception.
+
+    Args:
+        validator:
+            Freshly loaded standalone validation module.
+        checkout:
+            Temporary checkout containing the required validation files.
+        monkeypatch:
+            Fixture restoring temporary attribute and argument replacements.
+        capsys:
+            Fixture capturing command-line output.
+        failure:
+            Backend failure or reporting error to simulate.
+    """
     for relative in ("README.md", "att.md"):
         (checkout / relative).unlink()
     log_path = checkout / "validation.log"
-    monkeypatch.setattr(VALIDATOR, "ROOT", checkout)
+    monkeypatch.setattr(validator, "ROOT", checkout)
     monkeypatch.setattr(
         sys,
         "argv",
         ["validate.py", "--tests-only", "--log", str(log_path)],
     )
     with (
-        patch.object(
-            VALIDATOR,
+        unittest.mock.patch.object(
+            validator,
             "environment_report",
             return_value=False,
             side_effect=failure,
         ),
-        patch.object(VALIDATOR, "run_check", return_value=True) as checks,
+        unittest.mock.patch.object(validator, "run_check", return_value=True) as checks,
     ):
-        exit_code = VALIDATOR.main()
+        exit_code = validator.main()
     log = log_path.read_text(encoding="utf-8")
     commands = {call.args[0]: call.args[1] for call in checks.call_args_list}
     assert exit_code == 1
@@ -297,21 +287,32 @@ def test_failed_environment_check_still_runs_tests_and_writes_summary(
 
 
 def test_quality_checks_only_target_estimator_files_and_project_docs(
+    validator: types.ModuleType,
     checkout: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Avoid scanning unrelated code in a larger project's source directories."""
+    """Avoid scanning unrelated code in a larger project's source directories.
+
+    Args:
+        validator:
+            Freshly loaded standalone validation module.
+        checkout:
+            Temporary checkout containing the required validation files.
+        monkeypatch:
+            Fixture restoring temporary attribute and argument replacements.
+    """
     log_path = checkout / "validation.log"
-    monkeypatch.setattr(VALIDATOR, "ROOT", checkout)
+    monkeypatch.setattr(validator, "ROOT", checkout)
     monkeypatch.setattr(sys, "argv", ["validate.py", "--log", str(log_path)])
     with (
-        patch.object(VALIDATOR, "environment_report", return_value=True),
-        patch.object(VALIDATOR, "run_check", return_value=True) as checks,
+        unittest.mock.patch.object(validator, "environment_report", return_value=True),
+        unittest.mock.patch.object(validator, "run_check", return_value=True) as checks,
     ):
-        exit_code = VALIDATOR.main()
+        exit_code = validator.main()
     commands = {call.args[0]: call.args[1] for call in checks.call_args_list}
     files = {
         "src/labor_cost_optimization/att.py",
+        "tests/conftest.py",
         "tests/test_att.py",
         "tests/test_validate.py",
         "scripts/validate.py",
@@ -334,24 +335,35 @@ def test_quality_checks_only_target_estimator_files_and_project_docs(
 
 
 def test_missing_validator_tests_fail_without_blocking_remaining_quality_checks(
+    validator: types.ModuleType,
     checkout: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Report incomplete copies while checking the Python files that are present."""
+    """Report incomplete copies while checking the Python files that are present.
+
+    Args:
+        validator:
+            Freshly loaded standalone validation module.
+        checkout:
+            Temporary checkout containing the required validation files.
+        monkeypatch:
+            Fixture restoring temporary attribute and argument replacements.
+    """
     missing = "tests/test_validate.py"
     (checkout / missing).unlink()
     log_path = checkout / "validation.log"
-    monkeypatch.setattr(VALIDATOR, "ROOT", checkout)
+    monkeypatch.setattr(validator, "ROOT", checkout)
     monkeypatch.setattr(sys, "argv", ["validate.py", "--log", str(log_path)])
     with (
-        patch.object(VALIDATOR, "environment_report", return_value=True),
-        patch.object(VALIDATOR, "run_check", return_value=True) as checks,
+        unittest.mock.patch.object(validator, "environment_report", return_value=True),
+        unittest.mock.patch.object(validator, "run_check", return_value=True) as checks,
     ):
-        exit_code = VALIDATOR.main()
+        exit_code = validator.main()
     log = log_path.read_text(encoding="utf-8")
     commands = {call.args[0]: call.args[1] for call in checks.call_args_list}
     present = {
         "src/labor_cost_optimization/att.py",
+        "tests/conftest.py",
         "tests/test_att.py",
         "scripts/validate.py",
     }
@@ -366,18 +378,28 @@ def test_missing_validator_tests_fail_without_blocking_remaining_quality_checks(
 
 
 def test_no_expected_python_files_never_runs_unscoped_quality_commands(
+    validator: types.ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An empty checkout must fail without letting tools scan unrelated files."""
+    """Fail an empty checkout without scanning unrelated files.
+
+    Args:
+        validator:
+            Freshly loaded standalone validation module.
+        tmp_path:
+            Temporary directory used as an incomplete project checkout.
+        monkeypatch:
+            Fixture restoring temporary attribute and argument replacements.
+    """
     log_path = tmp_path / "validation.log"
-    monkeypatch.setattr(VALIDATOR, "ROOT", tmp_path)
+    monkeypatch.setattr(validator, "ROOT", tmp_path)
     monkeypatch.setattr(sys, "argv", ["validate.py", "--log", str(log_path)])
     with (
-        patch.object(VALIDATOR, "environment_report", return_value=True),
-        patch.object(VALIDATOR, "run_check", return_value=True) as checks,
+        unittest.mock.patch.object(validator, "environment_report", return_value=True),
+        unittest.mock.patch.object(validator, "run_check", return_value=True) as checks,
     ):
-        exit_code = VALIDATOR.main()
+        exit_code = validator.main()
     log = log_path.read_text(encoding="utf-8")
     labels = {call.args[0] for call in checks.call_args_list}
     assert exit_code == 1

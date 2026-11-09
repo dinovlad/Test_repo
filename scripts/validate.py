@@ -29,6 +29,7 @@ from typing import TextIO
 ROOT = Path(__file__).resolve().parents[1]
 CHECKED_PYTHON_FILES = [
     "src/labor_cost_optimization/att.py",
+    "tests/conftest.py",
     "tests/test_att.py",
     "tests/test_validate.py",
     "scripts/validate.py",
@@ -43,17 +44,32 @@ except ImportError:
     SpecifierSet = None
 
 
-def emit(message: str, log: TextIO) -> None:
-    """Write the same message to the terminal and the validation log."""
+def emit(message: str, file: TextIO) -> None:
+    """Write the same message to the terminal and the validation log.
+
+    Args:
+        message:
+            Text written with a trailing newline to both output streams.
+        file:
+            Open UTF-8 output log.
+
+    Raises:
+        OSError:
+            An output stream cannot be written or flushed.
+        ValueError:
+            An output stream is closed.
+        UnicodeError:
+            An output stream cannot encode the message.
+    """
     sys.stdout.write(message + "\n")
     sys.stdout.flush()
-    log.write(message + "\n")
-    log.flush()
+    file.write(message + "\n")
+    file.flush()
 
 
 def requirement_report(
     requirement: object,
-    log: TextIO,
+    file: TextIO,
     *,
     development: bool = False,
 ) -> bool:
@@ -62,7 +78,7 @@ def requirement_report(
     Args:
         requirement:
             Requirement from project metadata, with optional extras and markers.
-        log:
+        file:
             Open UTF-8 output log.
         development:
             Whether to label the entry as a development tool.
@@ -71,11 +87,20 @@ def requirement_report(
         Whether an applicable requirement's installed distribution version
         satisfies its constraint, or its marker makes it inapplicable. Extras
         are accepted but their transitive dependencies are not checked here.
-        Invalid or unverified requirements return False without stopping checks.
+        Invalid or unverified requirements return `False` without stopping checks.
+
+    Raises:
+        OSError:
+            Distribution metadata cannot be read or an output stream cannot be
+            written or flushed.
+        ValueError:
+            An output stream is closed.
+        UnicodeError:
+            An output stream cannot encode a diagnostic message.
     """
     prefix = "Development tool " if development else ""
     if not isinstance(requirement, str):
-        emit(f"{prefix}UNVERIFIED: dependency entry is not a requirement string.", log)
+        emit(f"{prefix}UNVERIFIED: dependency entry is not a requirement string.", file)
         return False
     if Requirement is None:
         match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
@@ -84,16 +109,16 @@ def requirement_report(
             actual = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             actual = "NOT INSTALLED"
-        emit(f"{prefix}{name}: {actual}; UNVERIFIED without packaging.", log)
+        emit(f"{prefix}{name}: {actual}; UNVERIFIED without packaging.", file)
         return False
     try:
         parsed = Requirement(requirement)
         if parsed.marker is not None and not parsed.marker.evaluate({"extra": ""}):
-            emit(f"{prefix}{parsed.name}: SKIP (environment marker is false).", log)
+            emit(f"{prefix}{parsed.name}: SKIP (environment marker is false).", file)
             return True
     except Exception:
         # Parser exceptions can contain private URLs from the original string.
-        emit(f"{prefix}INVALID dependency requirement; continuing validation.", log)
+        emit(f"{prefix}INVALID dependency requirement; continuing validation.", file)
         return False
     try:
         actual = importlib.metadata.version(parsed.name)
@@ -102,7 +127,7 @@ def requirement_report(
     if parsed.url is not None:
         emit(
             f"{prefix}{parsed.name}: {actual}; direct reference; provenance UNVERIFIED.",
-            log,
+            file,
         )
         return False
     expected = str(parsed.specifier) or "any installed version"
@@ -112,20 +137,20 @@ def requirement_report(
         try:
             ok = not parsed.specifier or parsed.specifier.contains(actual)
         except Exception:
-            emit(f"{prefix}{parsed.name}: {actual}; INVALID installed version.", log)
+            emit(f"{prefix}{parsed.name}: {actual}; INVALID installed version.", file)
             return False
     emit(
         f"{prefix}{parsed.name}: {actual}; required {expected}; {'OK' if ok else 'MISMATCH'}",
-        log,
+        file,
     )
     return bool(ok)
 
 
-def environment_report(log: TextIO) -> bool:
+def environment_report(file: TextIO) -> bool:
     """Report whether the configured runtime requirements are satisfied.
 
     Args:
-        log:
+        file:
             Open UTF-8 output log.
 
     Returns:
@@ -133,25 +158,35 @@ def environment_report(log: TextIO) -> bool:
         metadata. Development tools are reported separately. The optional
         packaging library interprets ranges, markers, extras, and version rules;
         without it, verification is marked incomplete and other checks continue.
+
+    Raises:
+        OSError:
+            Distribution metadata cannot be read or an output stream cannot be
+            written or flushed.
+        ValueError:
+            An output stream is closed.
+        UnicodeError:
+            Project metadata cannot be decoded or an output stream cannot encode
+            a diagnostic message.
     """
-    emit(f"Python: {sys.version.replace(chr(10), ' ')}", log)
-    emit(f"Interpreter: {sys.executable}", log)
-    emit(f"Platform: {platform.platform()}", log)
-    emit(f"Repository: {ROOT}", log)
+    emit(f"Python: {sys.version.replace(chr(10), ' ')}", file)
+    emit(f"Interpreter: {sys.executable}", file)
+    emit(f"Platform: {platform.platform()}", file)
+    emit(f"Repository: {ROOT}", file)
     try:
         config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        emit(f"UNVERIFIED: cannot read project metadata ({type(exc).__name__}).", log)
+        emit(f"UNVERIFIED: cannot read project metadata ({type(exc).__name__}).", file)
         return False
     project = config.get("project", {})
     required_python = project.get("requires-python")
     matches = False
     if SpecifierSet is None:
-        emit("Python requirement UNVERIFIED: packaging is not installed.", log)
+        emit("Python requirement UNVERIFIED: packaging is not installed.", file)
     elif not isinstance(required_python, str):
         emit(
             "Python requirement UNVERIFIED: requires-python is missing or invalid.",
-            log,
+            file,
         )
     else:
         try:
@@ -159,15 +194,15 @@ def environment_report(log: TextIO) -> bool:
             matches = specifier.contains(platform.python_version())
             emit(
                 f"Required Python: {specifier}; {'OK' if matches else 'MISMATCH'}",
-                log,
+                file,
             )
         except Exception:
-            emit("INVALID requires-python constraint; continuing validation.", log)
+            emit("INVALID requires-python constraint; continuing validation.", file)
     for requirement in project.get("dependencies", []):
-        ok = requirement_report(requirement, log)
+        ok = requirement_report(requirement, file)
         matches = matches and ok
     for requirement in config.get("dependency-groups", {}).get("dev", []):
-        requirement_report(requirement, log, development=True)
+        requirement_report(requirement, file, development=True)
     for args in (["rev-parse", "HEAD"], ["status", "--short", "--branch"]):
         try:
             result = subprocess.run(
@@ -181,22 +216,22 @@ def environment_report(log: TextIO) -> bool:
             )
             emit(
                 f"git {' '.join(args)}:\n{result.stdout or result.stderr}".rstrip(),
-                log,
+                file,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            emit(f"Git metadata unavailable: {exc}", log)
+            emit(f"Git metadata unavailable: {exc}", file)
     return matches
 
 
-def run_check(label: str, command: list[str], log: TextIO, timeout: float) -> bool:
+def run_check(label: str, command: list[str], file: TextIO, timeout: float) -> bool:
     """Run one read-only check and retain its output, even when it fails.
 
     Args:
         label:
             Human-readable check name.
         command:
-            Argument list passed directly to subprocess without a shell.
-        log:
+            Argument list passed directly to `subprocess.run()` without a shell.
+        file:
             Open UTF-8 output log.
         timeout:
             Maximum seconds allowed for this command.
@@ -204,8 +239,16 @@ def run_check(label: str, command: list[str], log: TextIO, timeout: float) -> bo
     Returns:
         Whether the command completed with exit status zero. Errors and timeouts
         are recorded as failed checks without preventing the remaining checks.
+
+    Raises:
+        OSError:
+            An output stream cannot be written or flushed.
+        ValueError:
+            An output stream is closed or the subprocess arguments are invalid.
+        UnicodeError:
+            An output stream cannot encode a diagnostic message.
     """
-    emit(f"\n=== {label} ===\n$ {shlex.join(command)}", log)
+    emit(f"\n=== {label} ===\n$ {shlex.join(command)}", file)
     started = time.monotonic()
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
@@ -232,10 +275,10 @@ def run_check(label: str, command: list[str], log: TextIO, timeout: float) -> bo
         output = f"Unable to launch command: {exc}"
         exit_code = 127
     if output:
-        emit(output.rstrip(), log)
+        emit(output.rstrip(), file)
     emit(
         f"{'PASS' if exit_code == 0 else 'FAIL'}: {label}; exit={exit_code}; elapsed={time.monotonic() - started:.2f}s",
-        log,
+        file,
     )
     return exit_code == 0
 
@@ -246,6 +289,17 @@ def main() -> int:
     Returns:
         Zero only when every requested check passes and runtime requirements match.
         Nonzero results still leave a complete diagnostic log to share.
+
+    Raises:
+        OSError:
+            The log directory or file cannot be created, or an output stream
+            cannot be written or flushed.
+        ValueError:
+            The log path is invalid or an output stream is closed.
+        UnicodeError:
+            An output stream cannot encode a diagnostic message.
+        SystemExit:
+            Argument parsing requests help or rejects invalid command-line values.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log", type=Path, default=ROOT / "validation.log")
@@ -269,14 +323,14 @@ def main() -> int:
             "--log must have a .log suffix to protect source and configuration files",
         )
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as log:
-        emit("Labor cost optimization validation", log)
-        emit("Each command's output is printed after it finishes or times out.", log)
-        emit("No packages are installed and source files are not reformatted.", log)
+    with log_path.open("w", encoding="utf-8") as file:
+        emit("Labor cost optimization validation", file)
+        emit("Each command's output is printed after it finishes or times out.", file)
+        emit("No packages are installed and source files are not reformatted.", file)
         try:
-            environment_ok = environment_report(log)
+            environment_ok = environment_report(file)
         except Exception:
-            emit("Environment reporting failed:\n" + traceback.format_exc(), log)
+            emit("Environment reporting failed:\n" + traceback.format_exc(), file)
             environment_ok = False
         results = [("Runtime requirements", environment_ok)]
         required_docs = [] if args.tests_only else ["README.md", "att.md"]
@@ -285,11 +339,11 @@ def main() -> int:
         missing = [path for path in [*CHECKED_PYTHON_FILES, *required_docs] if not (ROOT / path).is_file()]
         results.append(("Required validation files", not missing))
         if missing:
-            emit("Missing required validation files:\n" + "\n".join(missing), log)
+            emit("Missing required validation files:\n" + "\n".join(missing), file)
             emit(
                 "Copy the listed files from cgbs-att into this checkout. "
                 "Checks on available files will continue; overall validation will fail.",
-                log,
+                file,
             )
         source_check = (
             "import hashlib; from pathlib import Path; import sys; "
@@ -348,18 +402,18 @@ def main() -> int:
         elif not args.tests_only:
             emit(
                 "Quality checks skipped: no expected Python files are present.",
-                log,
+                file,
             )
         for label, command in checks:
-            results.append((label, run_check(label, command, log, args.timeout)))
-        emit("\n=== Summary ===", log)
+            results.append((label, run_check(label, command, file, args.timeout)))
+        emit("\n=== Summary ===", file)
         for label, passed in results:
-            emit(f"{'PASS' if passed else 'FAIL'}: {label}", log)
+            emit(f"{'PASS' if passed else 'FAIL'}: {label}", file)
         if args.tests_only:
-            emit("Quality checks were skipped with --tests-only.", log)
+            emit("Quality checks were skipped with --tests-only.", file)
         success = all(passed for _, passed in results)
-        emit(f"Overall result: {'PASS' if success else 'FAIL'}", log)
-        emit(f"Share this log: {log_path}", log)
+        emit(f"Overall result: {'PASS' if success else 'FAIL'}", file)
+        emit(f"Share this log: {log_path}", file)
     return 0 if success else 1
 
 

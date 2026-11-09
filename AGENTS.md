@@ -24,6 +24,24 @@ Do not scaffold a Python project or create an environment solely to load these
 instructions. Follow the user's current request and higher-priority instructions
 if they conflict with the shared conventions.
 
+## Project-Specific Exceptions
+
+The user has explicitly retained the following project conventions:
+
+- Keep development dependencies in `[dependency-groups].dev` and the documented
+  `uv` workflow. Do not replace them with a `dev` extra, add the shared pytest
+  plugin suite, or introduce conda, Makefile, or editor setup solely for rule
+  compliance.
+- Unit tests may use assertions without messages, as stated in the code-style
+  rule. Production assertions still require messages.
+- Follow the supplied Google-style docstring layout: put section content
+  immediately after its heading, with argument or exception names and their
+  descriptions on separate lines. Keep blank lines between sections. Exception
+  conditions may use complete prose rather than mandatory bullet lists.
+- Keep estimator logic in the single `src/labor_cost_optimization/att.py` module
+  and its design document in the root `att.md`; do not scaffold the generic
+  project-layout example solely for compliance.
+
 ## Skills
 
 Repository skills live in `.agents/skills/`. When the user names a skill or the

@@ -19,7 +19,7 @@ jobs:
           python-version: "3.11"
       - name: Install project and validation tools
         run: >-
-          python -m pip install -e . pytest codespell
+          python -m pip install -e . pytest codespell orjson
           "ruff>=0.15.0" "mypy>=1.19.0"
           "pandas-stubs==1.5.3.*" "scipy-stubs==1.15.*"
       - name: Run validation
@@ -29,4 +29,4 @@ jobs:
         run: >-
           python -m ruff format --diff
           src/labor_cost_optimization/att.py
-          tests/test_att.py tests/test_validate.py scripts/validate.py
+          tests/conftest.py tests/test_att.py tests/test_validate.py scripts/validate.py
