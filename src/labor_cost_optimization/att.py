@@ -50,11 +50,15 @@ _Integer = Annotated[
 _PositiveInteger = Annotated[_Integer, pydantic.Field(ge=1)]
 _ColumnName = Annotated[str, pydantic.Field(strict=True, min_length=1)]
 # Instance checks prevent scalar-convertible arrays or objects from becoming grid entries.
-_REAL_SCALAR = pydantic.TypeAdapter(
+_RealScalar = (
     pydantic.InstanceOf[int]
     | pydantic.InstanceOf[float]
     | pydantic.InstanceOf[np.integer]
-    | pydantic.InstanceOf[np.floating],
+    | pydantic.InstanceOf[np.floating]
+)
+# Older Pydantic annotations express schema inputs as type[T], which excludes union objects.
+_REAL_SCALAR: pydantic.TypeAdapter[_RealScalar] = pydantic.TypeAdapter(
+    cast(type[_RealScalar], _RealScalar),
     config=_VALIDATION_CONFIG,
 )
 _Real = Annotated[
@@ -64,10 +68,12 @@ _Real = Annotated[
     pydantic.BeforeValidator(_REAL_SCALAR.validate_python),
 ]
 _PositiveReal = Annotated[_Real, pydantic.Field(gt=0)]
-_COLUMN_NAMES = pydantic.TypeAdapter(list[_ColumnName])
-_DATAFRAME = pydantic.TypeAdapter(pd.DataFrame, config=_VALIDATION_CONFIG)
-_EVENT_TIMES = pydantic.TypeAdapter(Annotated[list[_Integer], pydantic.Field(min_length=1)])
-_FIRM_LIST = pydantic.TypeAdapter(Annotated[list[object], pydantic.Field(min_length=1)])
+_EventTimes = Annotated[list[_Integer], pydantic.Field(min_length=1)]
+_FirmList = Annotated[list[object], pydantic.Field(min_length=1)]
+_COLUMN_NAMES: pydantic.TypeAdapter[list[str]] = pydantic.TypeAdapter(list[_ColumnName])
+_DATAFRAME: pydantic.TypeAdapter[pd.DataFrame] = pydantic.TypeAdapter(pd.DataFrame, config=_VALIDATION_CONFIG)
+_EVENT_TIMES: pydantic.TypeAdapter[list[int]] = pydantic.TypeAdapter(_EventTimes)
+_FIRM_LIST: pydantic.TypeAdapter[list[object]] = pydantic.TypeAdapter(_FirmList)
 
 
 class _ATTOptions(pydantic.BaseModel):
@@ -136,9 +142,8 @@ def _distinct_grid(values: list[float]) -> list[float]:
     return values
 
 
-_POSITIVE_GRID = pydantic.TypeAdapter(
-    Annotated[list[_PositiveReal], pydantic.Field(min_length=1), pydantic.AfterValidator(_distinct_grid)],
-)
+_PositiveGrid = Annotated[list[_PositiveReal], pydantic.Field(min_length=1), pydantic.AfterValidator(_distinct_grid)]
+_POSITIVE_GRID: pydantic.TypeAdapter[list[float]] = pydantic.TypeAdapter(_PositiveGrid)
 # Decorated functions skip lazy Iterable validation and use these eager adapters in their bodies.
 
 
