@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Iterable
-from typing import Annotated, Any, Self, cast
+from typing import Annotated, Any, Literal, Self, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -1912,8 +1912,8 @@ def _bootstrap_merge(
     mean: FloatArray,
     anchor: FloatArray,
     mass: FloatArray,
-    log_kernel: FloatArray,
-    counts: IntArray,
+    local_anchor: FloatArray,
+    local_mass: FloatArray,
     effect: FloatArray,
 ) -> None:
     """Accumulate one positive-mass cohort using stable sampled-support anchors.
@@ -1925,10 +1925,10 @@ def _bootstrap_merge(
             Running maximum raw log-kernel values to update in place.
         mass:
             Running kernel masses scaled to `anchor`, updated in place.
-        log_kernel:
-            Raw Gaussian log kernels for sampled treated firms and requested doses.
-        counts:
-            Positive frequency counts for these treated firms.
+        local_anchor:
+            Maximum raw log kernel of sampled treated firms at each requested dose.
+        local_mass:
+            This cohort's frequency-weighted kernel mass scaled to `local_anchor`.
         effect:
             This cohort's weighted polynomial treatment effects at requested doses.
 
@@ -1936,8 +1936,6 @@ def _bootstrap_merge(
         RuntimeError:
             Kernel accumulation produces nonfinite masses or predictions.
     """
-    local_anchor = np.max(log_kernel, axis=0)
-    local_mass = counts @ np.exp(log_kernel - local_anchor)
     next_anchor = np.maximum(anchor, local_anchor)
     old_mass = mass * np.exp(anchor - next_anchor)
     added_mass = local_mass * np.exp(local_anchor - next_anchor)
@@ -1963,7 +1961,8 @@ def _bootstrap_horizon(
     doses: FloatArray,
     bandwidth: float,
     failures: dict[tuple[pd.Timestamp | None, int, str], int],
-) -> FloatArray:
+    failure_policy: Literal["strict", "available_cohorts"],
+) -> tuple[FloatArray, IntArray, IntArray, FloatArray]:
     """Re-estimate one horizon for a bounded batch of firm bootstrap draws.
 
     Args:
@@ -1983,9 +1982,15 @@ def _bootstrap_horizon(
             Fixed positive Gaussian-kernel bandwidth.
         failures:
             Aggregate comparison failure counts to update in place.
+        failure_policy:
+            Whether any positive-mass failed cell invalidates the draw or only
+            estimable cohorts enter its normalized aggregation.
 
     Returns:
-        Batch-by-dose bootstrap estimates, with entire failed rows set to NaN.
+        Batch-by-dose estimates, available and failed cohort counts per draw, and
+        the batch-by-dose share of full sampled kernel mass in available cohorts.
+        Unavailable estimates are NaN. Shares are zero when all positive-mass
+        cohorts fail and NaN when no treated firms are sampled.
 
     Raises:
         ValueError:
@@ -1997,8 +2002,11 @@ def _bootstrap_horizon(
     estimates = np.zeros((batch_size, len(doses)), dtype=float)
     anchors = np.full_like(estimates, -np.inf)
     masses = np.zeros_like(estimates)
+    full_anchors = np.full_like(estimates, -np.inf)
+    full_masses = np.zeros_like(estimates)
     total_treated = np.zeros(batch_size, dtype=np.int64)
-    failed = np.zeros(batch_size, dtype=bool)
+    n_available = np.zeros(batch_size, dtype=np.int64)
+    n_failed = np.zeros(batch_size, dtype=np.int64)
     reason: tuple[pd.Timestamp | None, int, str]
     for cohort in model.retained_cohorts_[event_time]:
         key = (cohort, event_time)
@@ -2008,7 +2016,9 @@ def _bootstrap_horizon(
             )
             if (treated < 0).any():
                 raise ValueError("Saved treated firms must belong to the original outcome panel.")
-            total_treated += counts[:, treated].sum(axis=1)
+            treated_totals = counts[:, treated].sum(axis=1)
+            total_treated += treated_totals
+            n_available += treated_totals > 0
             continue
         treated, design, changes, controls, control_changes, prediction = _bootstrap_cell_arrays(
             model,
@@ -2026,7 +2036,7 @@ def _bootstrap_horizon(
         if no_controls.any():
             reason = (cohort, event_time, "no_controls")
             failures[reason] = failures.get(reason, 0) + int(no_controls.sum())
-            failed |= no_controls
+            n_failed += no_controls
         try:
             with np.errstate(over="raise", invalid="raise", divide="raise"):
                 log_kernel = -0.5 * np.square((firm_doses[treated, None] - doses) / bandwidth)
@@ -2034,9 +2044,19 @@ def _bootstrap_horizon(
             raise ValueError("Gaussian-kernel calculations overflowed.") from exc
         if not np.isfinite(log_kernel).all():
             raise ValueError("Gaussian-kernel calculations must remain finite.")
-        for draw in np.flatnonzero((treated_totals > 0) & ~no_controls):
+        for draw in np.flatnonzero(treated_totals > 0):
             present = treated_counts[draw] > 0
             weights = treated_counts[draw, present]
+            sampled_kernel = log_kernel[present]
+            local_anchor = np.max(sampled_kernel, axis=0)
+            local_mass = weights @ np.exp(sampled_kernel - local_anchor)
+            next_anchor = np.maximum(full_anchors[draw], local_anchor)
+            full_masses[draw] = full_masses[draw] * np.exp(full_anchors[draw] - next_anchor) + local_mass * np.exp(
+                local_anchor - next_anchor,
+            )
+            full_anchors[draw] = next_anchor
+            if no_controls[draw]:
+                continue
             weighted_design = design[present] * np.sqrt(weights[:, None])
             try:
                 with np.errstate(over="raise", invalid="raise", divide="raise"):
@@ -2051,7 +2071,7 @@ def _bootstrap_horizon(
             if rank < design.shape[1]:
                 reason = (cohort, event_time, "rank_deficient")
                 failures[reason] = failures.get(reason, 0) + 1
-                failed[draw] = True
+                n_failed[draw] += 1
                 continue
             try:
                 with np.errstate(over="raise", invalid="raise", divide="raise"):
@@ -2061,21 +2081,47 @@ def _bootstrap_horizon(
                 raise RuntimeError("Bootstrap polynomial predictions overflowed.") from exc
             if not np.isfinite(coefficient).all() or not np.isfinite(effect).all():
                 raise RuntimeError("Bootstrap regression coefficients and predictions must remain finite.")
+            n_available[draw] += 1
             _bootstrap_merge(
                 estimates[draw],
                 anchors[draw],
                 masses[draw],
-                log_kernel[present],
-                weights,
+                local_anchor,
+                local_mass,
                 effect,
             )
     no_treated = total_treated == 0
     if no_treated.any():
         reason = (None, event_time, "no_treated_firms")
         failures[reason] = failures.get(reason, 0) + int(no_treated.sum())
-        failed |= no_treated
-    estimates[failed] = np.nan
-    return estimates
+    unavailable = n_available == 0
+    if failure_policy == "available_cohorts" and (unavailable & ~no_treated).any():
+        reason = (None, event_time, "no_available_cohorts")
+        failures[reason] = failures.get(reason, 0) + int((unavailable & ~no_treated).sum())
+    retained_share = np.full_like(estimates, np.nan)
+    retained_share[~no_treated] = 0.0
+    available = ~unavailable
+    if event_time == -1:
+        retained_share[available] = 1.0
+    elif available.any():
+        try:
+            with np.errstate(over="raise", invalid="raise", divide="raise"):
+                # Subtract anchors first to preserve counts at extreme common log offsets.
+                log_share = (
+                    anchors[available]
+                    - full_anchors[available]
+                    + np.log(masses[available])
+                    - np.log(full_masses[available])
+                )
+                retained_share[available] = np.exp(np.minimum(log_share, 0.0))
+        except FloatingPointError as exc:
+            raise RuntimeError("Bootstrap retained kernel weight calculations failed.") from exc
+        if not np.isfinite(retained_share[available]).all():
+            raise RuntimeError("Bootstrap retained kernel weights must remain finite.")
+    if failure_policy == "strict":
+        unavailable |= n_failed > 0
+    estimates[unavailable] = np.nan
+    return estimates, n_available, n_failed, retained_share
 
 
 @pydantic.validate_call(config=_VALIDATION_CONFIG)
@@ -2089,15 +2135,18 @@ def bootstrap_theta(
     n_bootstrap: Annotated[_Integer, pydantic.Field(ge=2)] = 1999,
     confidence_level: Annotated[_Real, pydantic.Field(gt=0, lt=1)] = 0.95,
     random_state: Annotated[_Integer, pydantic.Field(ge=0)] | None = None,
+    failure_policy: Literal["strict", "available_cohorts"] = "strict",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Bootstrap dose-specific event-study effects by resampling entire firms.
 
     Sample the complete original firm population with replacement and reuse each
     firm's count across every comparison, horizon, dose, and kernel calculation.
     Keep the fitted comparison membership, polynomial bases, and bandwidth fixed.
-    Percentile intervals and standard errors use successful draws at each horizon;
-    excluding failures does not establish conditional frequentist coverage. Kernel
-    smoothing bias and uncertainty from bandwidth selection are not corrected.
+    Percentile intervals and standard errors use available draws for each dose
+    and horizon. The available-cohort policy renormalizes kernel weights over
+    estimable cells in each draw, allowing its cohort composition to change.
+    Exclusions do not establish nominal or conditional frequentist coverage.
+    Kernel smoothing bias and bandwidth selection uncertainty are not corrected.
     The fitted model and supplied outcomes are not modified.
 
     Args:
@@ -2121,19 +2170,30 @@ def bootstrap_theta(
             Nominal interval coverage strictly between zero and one.
         random_state:
             Nonnegative integer seed, or None for nondeterministic local sampling.
+        failure_policy:
+            With "strict", any failed positive-mass cell makes that horizon draw
+            unavailable. With "available_cohorts", aggregate the estimable cells
+            using kernel weights normalized over those cohorts; no available
+            cohorts means a missing estimate.
 
     Returns:
         Three DataFrames: the original `evaluate_theta()` summary with bootstrap
         standard errors, percentile bounds, attempted/successful/failed counts,
-        success rates, and inference status; all attempted draws with columns
-        `replicate`, `event_time`, `dose`, `theta`, and `success`; and aggregated
-        failures with `cohort`, `event_time`, `reason`, and `n_failures` columns.
+        success rates, `failure_policy`, `n_partial`, retained-weight summaries,
+        and inference status; all attempted draws; and aggregated failures with
+        `cohort`, `event_time`, `reason`, and `n_failures` columns. Draw columns are
+        `replicate`, `event_time`, `dose`, `theta`, `success`, `n_cohorts_available`,
+        `n_cohorts_failed`, and `retained_weight_share`.
         Replicate numbers start at one. Failed draws retain NaN estimates. Fewer
         than two successful draws yield missing standard errors and intervals.
-        `conditional_on_success` is true whenever failures were excluded, and
-        `inference_status` is `ok`, `successful_draws_only`, or
-        `insufficient_successful_draws`. Global empty-sample failures use NaT for
-        `cohort`; several cell failures may belong to the same failed horizon draw.
+        `n_partial` counts successful values omitting positive-mass failed cohorts.
+        `mean_retained_weight_share` and `min_retained_weight_share` summarize the
+        available share of full sampled kernel mass among successful pair draws.
+        `conditional_on_success` is true when some pair draws are unavailable.
+        `inference_status` is `ok`, `successful_draws_only`, `available_cohorts`,
+        or `insufficient_successful_draws`, with insufficient draws taking priority.
+        Horizon-wide failures use NaT for `cohort`; multiple cell failures can
+        belong to one draw and are recorded even when its aggregation succeeds.
         At most one aggregated warning covers failures and original support flags.
 
     Raises:
@@ -2159,12 +2219,20 @@ def bootstrap_theta(
     firm_doses[event_codes] = model.events_["dose"].to_numpy(dtype=float)
     rng = np.random.default_rng(random_state)
     estimates = np.full((n_bootstrap, len(horizons), len(dose_values)), np.nan)
+    retained_shares = np.full_like(estimates, np.nan)
+    available_cohorts = np.zeros((n_bootstrap, len(horizons)), dtype=np.int64)
+    failed_cohorts = np.zeros_like(available_cohorts)
     failures: dict[tuple[pd.Timestamp | None, int, str], int] = {}
     for start in range(0, n_bootstrap, 32):
         stop = min(start + 32, n_bootstrap)
         counts = _bootstrap_counts(rng, n_firms, stop - start)
         for horizon_index, event_time in enumerate(horizons):
-            estimates[start:stop, horizon_index] = _bootstrap_horizon(
+            (
+                estimates[start:stop, horizon_index],
+                available_cohorts[start:stop, horizon_index],
+                failed_cohorts[start:stop, horizon_index],
+                retained_shares[start:stop, horizon_index],
+            ) = _bootstrap_horizon(
                 model,
                 event_time,
                 counts,
@@ -2173,50 +2241,69 @@ def bootstrap_theta(
                 dose_values,
                 kernel_bandwidth,
                 failures,
+                failure_policy,
             )
-    successful = np.isfinite(estimates).all(axis=2)
+    successful = np.isfinite(estimates)
     n_success = successful.sum(axis=0)
     n_failed = n_bootstrap - n_success
+    n_partial = (successful & (failed_cohorts[:, :, None] > 0)).sum(axis=0)
     standard_errors = np.full((len(horizons), len(dose_values)), np.nan)
     lower = np.full_like(standard_errors, np.nan)
     upper = np.full_like(standard_errors, np.nan)
+    mean_retained = np.full_like(standard_errors, np.nan)
+    min_retained = np.full_like(standard_errors, np.nan)
     tail = (1.0 - level) / 2.0
     for horizon_index in range(len(horizons)):
-        if n_success[horizon_index] < 2:
-            continue
-        selected = estimates[successful[:, horizon_index], horizon_index]
-        try:
-            with np.errstate(over="raise", invalid="raise", divide="raise"):
-                standard_errors[horizon_index] = np.std(selected, axis=0, ddof=1)
-                lower[horizon_index], upper[horizon_index] = np.quantile(selected, [tail, 1.0 - tail], axis=0)
-        except FloatingPointError as exc:
-            raise RuntimeError("Bootstrap interval calculations overflowed.") from exc
-        if not all(np.isfinite(values[horizon_index]).all() for values in (standard_errors, lower, upper)):
-            raise RuntimeError("Bootstrap standard errors and interval bounds must remain finite.")
+        for dose_index in range(len(dose_values)):
+            key = (horizon_index, dose_index)
+            usable = successful[:, horizon_index, dose_index]
+            if n_success[key]:
+                shares = retained_shares[usable, horizon_index, dose_index]
+                mean_retained[key] = np.mean(shares)
+                min_retained[key] = np.min(shares)
+            if n_success[key] < 2:
+                continue
+            selected = estimates[usable, horizon_index, dose_index]
+            try:
+                with np.errstate(over="raise", invalid="raise", divide="raise"):
+                    standard_errors[key] = np.std(selected, ddof=1)
+                    lower[key], upper[key] = np.quantile(selected, [tail, 1.0 - tail])
+            except FloatingPointError as exc:
+                raise RuntimeError("Bootstrap interval calculations overflowed.") from exc
+            if not all(np.isfinite(values[key]) for values in (standard_errors, lower, upper)):
+                raise RuntimeError("Bootstrap standard errors and interval bounds must remain finite.")
     summary["standard_error"] = standard_errors.ravel()
     summary["ci_lower"] = lower.ravel()
     summary["ci_upper"] = upper.ravel()
     summary["confidence_level"] = level
     summary["n_bootstrap"] = n_bootstrap
-    summary["n_success"] = np.repeat(n_success, len(dose_values))
-    summary["n_failed"] = np.repeat(n_failed, len(dose_values))
+    summary["failure_policy"] = failure_policy
+    summary["n_success"] = n_success.ravel()
+    summary["n_failed"] = n_failed.ravel()
+    summary["n_partial"] = n_partial.ravel()
+    summary["mean_retained_weight_share"] = mean_retained.ravel()
+    summary["min_retained_weight_share"] = min_retained.ravel()
     summary["success_rate"] = summary["n_success"] / n_bootstrap
     summary["conditional_on_success"] = summary["n_failed"] > 0
-    summary["inference_status"] = np.repeat(
+    summary["inference_status"] = np.where(
+        n_success < 2,
+        "insufficient_successful_draws",
         np.where(
-            n_success < 2,
-            "insufficient_successful_draws",
+            n_partial > 0,
+            "available_cohorts",
             np.where(n_failed > 0, "successful_draws_only", "ok"),
         ),
-        len(dose_values),
-    )
+    ).ravel()
     draws = pd.DataFrame(
         {
             "replicate": np.repeat(np.arange(1, n_bootstrap + 1), len(horizons) * len(dose_values)),
             "event_time": np.tile(np.repeat(horizons, len(dose_values)), n_bootstrap),
             "dose": np.tile(dose_values, n_bootstrap * len(horizons)),
             "theta": estimates.ravel(),
-            "success": np.repeat(successful.ravel(), len(dose_values)),
+            "success": successful.ravel(),
+            "n_cohorts_available": np.repeat(available_cohorts.ravel(), len(dose_values)),
+            "n_cohorts_failed": np.repeat(failed_cohorts.ravel(), len(dose_values)),
+            "retained_weight_share": retained_shares.ravel(),
         },
     )
     diagnostics = pd.DataFrame(
@@ -2238,15 +2325,20 @@ def bootstrap_theta(
     )
     restricted = int(summary.loc[summary["restricted_target"], "event_time"].nunique())
     extrapolated = int(summary["extrapolated"].sum())
-    if n_failed.any() or omitted or restricted or extrapolated:
+    if n_failed.any() or failed_cohorts.any() or omitted or restricted or extrapolated:
         logging.warning(
-            "Bootstrap summary: %d of %d attempted horizon draws failed; "
-            "%d horizons have fewer than two successful draws. Intervals use successful draws only "
-            "and do not establish conditional coverage. Original aggregation has %d unavailable comparisons, "
+            "Bootstrap summary (%s): %d of %d attempted dose-horizon draws failed; "
+            "%d dose-horizon pairs have fewer than two successful draws. "
+            "%d positive-mass cell fits failed; %d successful dose-horizon draws use available cohorts only. "
+            "Intervals do not establish nominal or conditional coverage. "
+            "Original aggregation has %d unavailable comparisons, "
             "%d restricted horizons, and %d extrapolated dose-horizon estimates. Inspect summary and diagnostics.",
+            failure_policy,
             int(n_failed.sum()),
-            n_bootstrap * len(horizons),
+            n_bootstrap * len(horizons) * len(dose_values),
             int((n_success < 2).sum()),
+            int(failed_cohorts.sum()),
+            int(n_partial.sum()),
             omitted,
             restricted,
             extrapolated,

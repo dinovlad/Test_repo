@@ -55,6 +55,7 @@ summary, draws, diagnostics = att.bootstrap_theta(
     n_bootstrap=1999,
     confidence_level=0.95,
     random_state=42,
+    failure_policy="available_cohorts",
 )
 ```
 
@@ -602,6 +603,7 @@ bootstrap_theta(
     n_bootstrap=1999,
     confidence_level=0.95,
     random_state=None,
+    failure_policy="strict",
 ) -> tuple[pandas.DataFrame, pandas.DataFrame, pandas.DataFrame]
 ```
 
@@ -609,7 +611,7 @@ Return `(summary, draws, diagnostics)`. The original fitted `ATT` object and the
 
 **Bootstrap Inputs and Fixed Specification.** `outcomes` must contain the complete original outcome panel using the model's column mappings. Reuse the same period normalization and numeric validation as fitting. Ignore input row order, within-period time components, and additional unmapped columns. Require all normalized store-period outcome values and all original stores to match `outcome_fingerprint_` and `bootstrap_firms_`, including rows and stores unused by any retained comparison. A matching set of unweighted fitted coefficients is not sufficient: changes to individual control outcomes can preserve their mean while changing bootstrap variation. Models without the required fitted metadata must be fitted before bootstrap evaluation. No event table is supplied again; the selected event labels, retained comparisons, memberships, and history-based decisions are already recorded by `fit()`.
 
-Require a fitted model, a nonempty collection of distinct positive finite doses, a positive finite bandwidth, and distinct requested horizons inside the fitted interval. `event_times=None` selects the entire fitted interval. `n_bootstrap` is an integer of at least two; `confidence_level` is finite and strictly between zero and one; `random_state` is either `None` or a nonnegative integer. Invalid inputs and an unavailable required original comparison raise errors before resampling. The point estimates in `summary` must match `evaluate_theta()` at the supplied grid and bandwidth.
+Require a fitted model, a nonempty collection of distinct positive finite doses, a positive finite bandwidth, and distinct requested horizons inside the fitted interval. `event_times=None` selects the entire fitted interval. `n_bootstrap` is an integer of at least two; `confidence_level` is finite and strictly between zero and one; `random_state` is either `None` or a nonnegative integer. `failure_policy` is either `"strict"` (the default) or `"available_cohorts"`. Invalid inputs and an unavailable required original comparison raise errors before resampling. The point estimates in `summary` must match `evaluate_theta()` at the supplied grid and bandwidth under either policy.
 
 Fix the original horizon-specific retained sets $\mathcal R_e$, exact treated and control memberships, polynomial degrees and saved dose transformations, requested grid, and bandwidth. Do not rerun first-event selection, isolation screening, endpoint screening, bandwidth CV, or the original `min_cohort_size` screen. Sampling counts can change the number of represented stores and distinct doses in a cell; its weighted regression must still be identifiable. Keeping the specification fixed does not establish inference conditional on a data-dependent selection event and does not account for changing screening or tuning decisions across samples.
 
@@ -645,7 +647,7 @@ $$
 
 Use a stable weighted least-squares solve, not an explicit matrix inverse. This decomposition is algebraically equivalent to the original treatment-interacted regression fitted to duplicated comparison rows. Subtract the control mean once. Bootstrap does not call `pyfixest.feols()` or `ATT.fit()` again, and it does not change any stored models, coefficients, bases, or diagnostics. Evaluate each solved polynomial at all requested doses.
 
-**Bootstrap Cohort Weights and Aggregation.** Re-estimate the Gaussian-kernel weights with the same sampling counts:
+**Bootstrap Cohort Weights and Aggregation.** Re-estimate the Gaussian-kernel weights with the same sampling counts. For `failure_policy="strict"`, the full retained-cohort aggregation is:
 
 $$
 \widehat\pi_{g,e}^{*(b)}(d)
@@ -661,32 +663,68 @@ $$
 \widehat\tau_{g,e}^{*(b)}(d).
 $$
 
+For `failure_policy="available_cohorts"`, let $\mathcal A_e^{(b)}\subseteq\mathcal R_e$ contain the positive-treated-mass cohorts whose comparison is estimable in draw $b$. Define the cohort kernel mass and its normalized weight on this available set by
+
+$$
+q_{g,e}^{(b)}(d)
+=\sum_{i\in T_{g,e}}M_i^{(b)}K_h(D_i-d),
+\qquad
+\widehat\pi_{g,e}^{*(b),\mathrm{available}}(d)
+=\frac{q_{g,e}^{(b)}(d)}{
+\sum_{h\in\mathcal A_e^{(b)}}q_{h,e}^{(b)}(d)
+}.
+$$
+
+The available-cohort aggregate is simply
+
+$$
+\widehat\theta_{\mathrm{available}}^{*(b)}(d,e)
+=\sum_{g\in\mathcal A_e^{(b)}}
+\widehat\pi_{g,e}^{*(b),\mathrm{available}}(d)
+\widehat\tau_{g,e}^{*(b)}(d).
+$$
+
+These weights already sum to one, so the aggregate has no additional denominator. A failed positive-weight cohort is excluded from both the numerator and denominator of the kernel weights; its missing effect is not replaced by zero. With one available cohort, its ATT is the aggregate. With no available cohorts, the draw is missing. The polynomial regressions define cell availability by cohort and horizon; the Gaussian kernel is positive at every finite requested dose, so availability normally agrees across doses at a horizon. Still represent draw validity and construct intervals independently for each requested dose–horizon pair.
+
+The available-cohort procedure can change the cohort mixture in each draw. If small or weakly identified cohorts fail more frequently and have different effects, its distribution can shift away from the original point-estimate target. This option does not automatically provide ordinary bootstrap coverage for the full retained-cohort target. Report the fraction of the original bootstrap kernel mass carried by available cohorts:
+
+$$
+\rho_b(d,e)
+=\frac{
+\sum_{g\in\mathcal A_e^{(b)}}q_{g,e}^{(b)}(d)
+}{
+\sum_{g\in\mathcal R_e}q_{g,e}^{(b)}(d)
+}.
+$$
+
+This share distinguishes exclusions with negligible weight at a dose from exclusions carrying most of its weight. A lack of sampled treated mass makes the share undefined; positive sampled mass with no estimable cohorts gives a share of zero. A successful reference draw has share one. The share can vary across doses even when the available cohort set does not. Its finite-precision value may underflow to zero for an extremely small available share; this alone must not make an estimable aggregate unavailable.
+
 Compute kernel masses stably in the log domain, excluding zero sampling counts before taking logarithms. A Gaussian cohort mass is mathematically zero only when the cohort has no sampled treated stores; numerical underflow must not create an apparent zero-mass cohort. Re-estimating both effects and weights in the same draw retains their covariance and the full nonlinear product; there is no delta-method or influence-function approximation in this procedure.
 
 Process sampling counts in batches of at most 32 replications and reconstruct comparison arrays from a shared indexed outcome panel as needed. Do not retain a full $B\times N$ count matrix, duplicate the outcome panel for every draw, or cache all repeated control panels on the fitted model. Temporary kernel work is comparison-specific. The returned draw table necessarily retains the requested replication-by-horizon-by-dose results.
 
 **Successful Draws and Failures.** A draw can be defined at one horizon and unavailable at another. Apply the following rules to each horizon:
 
-| Condition | Bootstrap behavior |
-| --- | --- |
-| No sampled treated stores in one retained cohort, but positive treated mass elsewhere | Define that cohort's aggregate contribution as zero; do not fit its ATT or require sampled controls for it |
-| No sampled treated stores in any retained cohort | Mark the horizon unavailable with reason `no_treated_firms` |
-| Positive treated mass in a non-reference comparison, but no sampled controls | Mark the horizon unavailable with reason `no_controls` |
-| Positive treated mass in a non-reference comparison, but insufficient weighted polynomial rank | Mark the horizon unavailable with reason `rank_deficient` |
-| Reference horizon $e=-1$ with positive overall treated mass | Return zero without fitting regressions or checking sampled controls and polynomial rank |
+| Condition | `strict` | `available_cohorts` |
+| --- | --- | --- |
+| No sampled treated stores in one retained cohort, but positive treated mass elsewhere | Zero aggregate contribution; no ATT fit or sampled-control requirement | Same |
+| No sampled treated stores in any retained cohort | Mark the horizon unavailable with reason `no_treated_firms` | Same |
+| Positive treated mass in a non-reference comparison, but no sampled controls | Mark the horizon unavailable and record `no_controls` for that cohort | Exclude that cohort and record `no_controls`; retain other estimable cohorts |
+| Positive treated mass in a non-reference comparison, but insufficient weighted polynomial rank | Mark the horizon unavailable and record `rank_deficient` for that cohort | Exclude that cohort and record `rank_deficient`; retain other estimable cohorts |
+| Reference horizon $e=-1$ with positive overall treated mass | Exact zero without sampled-control or rank checks | Same |
 
-For a non-reference horizon, an unavailable positive-weight comparison makes the entire draw unavailable at every requested dose. Do not remove that cohort and renormalize the rest, lower the polynomial degree, replace its unknown effect with zero, or redraw until estimation succeeds. A cubic polynomial with four distinct sampled doses can be estimable even when the original sample-size screen required five stores; the original `min_cohort_size` is not a bootstrap screen. Unexpected numerical failures, nonfinite arithmetic, and implementation errors raise exceptions rather than being classified as ordinary sample-support failures.
+Under `strict`, an unavailable positive-weight comparison makes the entire non-reference draw unavailable at every requested dose. Under `available_cohorts`, exclude failed comparisons and normalize the weights over those remaining; if every positive-mass cohort fails, the horizon remains unavailable with reason `no_available_cohorts`. Under either policy, do not lower the polynomial degree, replace an unknown effect with zero, or redraw until estimation succeeds. A cubic polynomial with four distinct sampled doses can be estimable even when the original sample-size screen required five stores; the original `min_cohort_size` is not a bootstrap screen. Unexpected numerical failures, nonfinite arithmetic, and implementation errors raise exceptions rather than being classified as ordinary sample-support failures.
 
-Let $\mathcal B_e$ be the successful replication indices for horizon $e$, and let $B_e=|\mathcal B_e|$. Use all those successful draws, with no additional minimum success-rate threshold. For $B_e\ge2$, report
+Let $\mathcal B_{d,e}$ be the replication indices with a finite aggregate at dose $d$ and horizon $e$, and let $B_{d,e}=|\mathcal B_{d,e}|$. Use all those successful draws, with no additional minimum success-rate threshold. Let $\widehat\theta^{*(b)}$ denote the aggregate under the selected policy. For $B_{d,e}\ge2$, report
 
 $$
 \overline\theta_e^*(d)
-=\frac{1}{B_e}\sum_{b\in\mathcal B_e}\widehat\theta^{*(b)}(d,e),
+=\frac{1}{B_{d,e}}\sum_{b\in\mathcal B_{d,e}}\widehat\theta^{*(b)}(d,e),
 \qquad
 \widehat{\operatorname{se}}(d,e)
 =\left[
-\frac{1}{B_e-1}
-\sum_{b\in\mathcal B_e}
+\frac{1}{B_{d,e}-1}
+\sum_{b\in\mathcal B_{d,e}}
 \left(\widehat\theta^{*(b)}(d,e)-\overline\theta_e^*(d)\right)^2
 \right]^{1/2}.
 $$
@@ -702,7 +740,7 @@ $$
 
 With fewer than two successful draws, leave the standard error and both bounds missing, including at the reference horizon. With at least two successful reference draws, all three values equal zero exactly. Keep the original point estimate regardless of bootstrap failures; the reported center is not replaced by the mean of the successful draws.
 
-Intervals that exclude failed replications use the bootstrap distribution restricted to successful estimation. Label that restriction explicitly; it does not establish nominal or conditional frequentist coverage. A high success rate is not a coverage guarantee, and no automatic threshold converts it into one. Independent stores, adequate information in the retained comparisons, and the stated identification assumptions remain necessary. KDE smoothing bias is ignored, and the selected bandwidth and polynomial specification are held fixed. Intervals are pointwise, not simultaneous across the requested doses and horizons.
+Intervals that exclude failed replications use the bootstrap distribution restricted to successful estimation. With `available_cohorts`, successful draws can additionally exclude positive-weight cohorts and use different cohort mixtures. Label both restrictions explicitly; neither establishes nominal or conditional frequentist coverage. A high success rate is not a coverage guarantee, and no automatic threshold converts it into one. Independent stores, adequate information in the retained comparisons, and the stated identification assumptions remain necessary. KDE smoothing bias is ignored, and the selected bandwidth and polynomial specification are held fixed. Intervals are pointwise, not simultaneous across the requested doses and horizons.
 
 **Bootstrap Output Tables and Logging.** `summary` is sorted by `event_time` and `dose`. It contains all original `evaluate_theta()` columns, preserving its point estimates and sample/support flags, plus:
 
@@ -711,19 +749,22 @@ Intervals that exclude failed replications use the bootstrap distribution restri
 | `standard_error` | Sample standard deviation of the successful draws, with `ddof=1` |
 | `ci_lower`, `ci_upper` | Successful-draw percentile bounds at the requested confidence level |
 | `confidence_level` | Nominal interval level supplied to the call |
+| `failure_policy` | `strict` or `available_cohorts`, as supplied to the call |
 | `n_bootstrap` | Total attempted replications, including failures |
-| `n_success`, `n_failed` | Successful and failed replication counts at the horizon; their sum is `n_bootstrap` |
+| `n_success`, `n_failed` | Successful and failed replication counts at the dose–horizon pair; their sum is `n_bootstrap` |
 | `success_rate` | `n_success / n_bootstrap` |
-| `conditional_on_success` | True whenever at least one replication fails at that horizon |
-| `inference_status` | `ok` when all draws succeed; `successful_draws_only` when at least two succeed but some fail; `insufficient_successful_draws` when fewer than two succeed |
+| `n_partial` | Successful replications that exclude at least one failed positive-mass cohort at this dose–horizon pair |
+| `mean_retained_weight_share`, `min_retained_weight_share` | Mean and minimum of $\rho_b(d,e)$ over successful replications; missing if there are none |
+| `conditional_on_success` | True whenever at least one replication fails at that dose–horizon pair |
+| `inference_status` | `insufficient_successful_draws` if fewer than two succeed; otherwise `available_cohorts` if `n_partial > 0`, `successful_draws_only` if some draws fail, or `ok` |
 
-`draws` contains `replicate`, `event_time`, `dose`, `theta`, and `success`, sorted by replication, horizon, and dose. Replications are numbered from 1 through `n_bootstrap`. Keep every requested row, including unavailable estimates as `NaN` with `success=False`. Validity and counts are common across doses at a horizon.
+`draws` contains `replicate`, `event_time`, `dose`, `theta`, `success`, `n_cohorts_available`, `n_cohorts_failed`, and `retained_weight_share`, sorted by replication, horizon, and dose. Replications are numbered from 1 through `n_bootstrap`. Keep every requested row, including unavailable estimates as `NaN` with `success=False`. Determine validity independently for each dose–horizon pair; retain a finite value even if another requested pair is unavailable. Available and failed cohort counts concern only originally retained cohorts with positive sampled treated mass; a cohort with zero sampled treated mass is neither available nor failed. `retained_weight_share` is $\rho_b(d,e)$, including zero for positive treated mass with no available cohort and `NaN` for no treated mass. Preserve these three diagnostics even when `strict` makes the draw unavailable. `n_partial` labels exclusions among successful draws separately from `conditional_on_success`, which labels omitted whole draw values.
 
-`diagnostics` contains `cohort`, `event_time`, `reason`, and `n_failures`, aggregated by comparison and failure reason. The `cohort` column has dtype `datetime64[ns]`; `no_treated_firms` uses `NaT` because it concerns the entire horizon. Each count records the number of replications in which that comparison and reason were reported. Several comparisons can fail within one replication, so summing comparison counts need not equal the horizon's `n_failed`. A clean run returns an empty diagnostics table with the same schema.
+`diagnostics` contains `cohort`, `event_time`, `reason`, and `n_failures`, aggregated by comparison and failure reason. The `cohort` column has dtype `datetime64[ns]`; `no_treated_firms` and `no_available_cohorts` use `NaT` because they concern the entire horizon. The latter reason occurs only under `available_cohorts`, when positive sampled treated mass exists but no cohort is estimable. Each count records the number of replications in which that comparison and reason were reported. Record excluded-cell failures even when other cohorts produce a successful aggregate. Several comparisons can fail within one replication, so summing comparison counts need not equal the horizon's `n_failed`. A clean run returns an empty diagnostics table with the same schema.
 
-Use one aggregated `logging.warning()` when original aggregation restrictions or extrapolation apply, any bootstrap draws fail, or there are insufficient successful draws for inference. Report aggregate counts rather than one warning per cohort, horizon, or replication. Keep the original point-evaluation calculation quiet inside this call. A clean call emits no warning, and no bootstrap operation changes `drop_summary_` or other fitted state.
+Use one aggregated `logging.warning()` when original aggregation restrictions or extrapolation apply, any bootstrap draw values fail, positive-mass cohorts are excluded, or there are insufficient successful draws for inference. An available-cohort run can therefore warn even when every requested aggregate is available. Report aggregate counts rather than one warning per cohort, horizon, or replication. Keep the original point-evaluation calculation quiet inside this call. A clean call emits no warning, and no bootstrap operation changes `drop_summary_` or other fitted state.
 
-**Implementation Boundaries and Validation Plan.** Put the class, all five public functions, and a few private validation, window-selection, polynomial, bandwidth, and cell-regression helpers in the single `src/labor_cost_optimization/att.py` file. Use the `labor_cost_optimization` package under the `src` directory; keep estimator logic in that module. Use `firm` and `period` consistently in all Python identifiers, canonical column names, docstrings, and error/log messages, including private helpers. Use `period_col`, `origin_period_`, `last_period_`, `last_period_index_`, and output column `period`; preserve literal third-party API/type names such as `datetime64[ns]` and `.dt.normalize()`. This plan keeps the application term “store” in explanatory prose; code examples and public schema names follow the general `firm` and `period` terminology. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. Private Pydantic v2 input models use `ConfigDict(arbitrary_types_allowed=True, strict=True)` for runtime type validation. Preserve accepted NumPy integer values and the existing public `ValueError` behavior; numerical, period, isolation, and sample checks remain explicit domain validation. These private models stay in the same module and do not extend the public API. No generic estimator framework or serialization layer is needed. Include the package's `py.typed` marker through `[tool.setuptools.package-data]` so installed consumers can use its inline annotations.
+**Implementation Boundaries and Validation Plan.** Put the class, all five public functions, and a few private validation, window-selection, polynomial, bandwidth, and cell-regression helpers in the single `src/labor_cost_optimization/att.py` file. Use the `labor_cost_optimization` package under the `src` directory; keep estimator logic in that module. Use `firm` and `period` consistently in all Python identifiers, canonical column names, docstrings, and error/log messages, including private helpers. Use `period_col`, `origin_period_`, `last_period_`, `last_period_index_`, and output column `period`; preserve literal third-party API/type names such as `datetime64[ns]` and `.dt.normalize()`. This plan keeps the application term “store” in explanatory prose; code examples and public schema names follow the general `firm` and `period` terminology. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. Pydantic v2 `Field` constraints, cached `TypeAdapter` instances, and `validate_call` enforce scalar and collection types and bounds; private input models use `ConfigDict(arbitrary_types_allowed=True)`. Named schema aliases and explicit adapter annotations support older Pydantic typing signatures. Preserve accepted NumPy scalar values and the public `ValueError` contract, including its `ValidationError` subclass; numerical, period, isolation, and sample checks remain explicit domain validation. These schemas stay in the same module and do not extend the public API. No generic estimator framework or serialization layer is needed. Include the package's `py.typed` marker through `[tool.setuptools.package-data]` so installed consumers can use its inline annotations.
 
 **Docstring Convention.** Use Google-style docstrings throughout `src/labor_cost_optimization/att.py`, including the module, `ATT`, its constructor and public methods, all five public functions, and private helpers. Start with a concise summary followed by a blank line before any extended description or sections. Use `Args:`, `Returns:`, and `Raises:` where applicable; omit empty or inapplicable sections. Document constructor arguments in `__init__` and fitted public attributes in the class docstring's `Attributes:` section. Include `Args:` whenever a function or method accepts arguments other than `self` or `cls`, `Returns:` whenever its return annotation is not `None`, and `Raises:` for explicit or relevant unhandled exceptions. A one-line helper docstring is appropriate only when none of these sections is required. Wrap references to functions, methods, attributes, and schema columns in backticks.
 
@@ -795,11 +836,11 @@ The pytest suites in [tests/test_att.py](tests/test_att.py) and [tests/test_boot
 
 - Bootstrap sampling counts produce the same cohort curves, kernel weights, and aggregates as explicitly duplicated comparison rows; all-one counts reproduce the original point estimates.
 - One count per original outcome store is shared across every treated/control role and all requested doses and horizons, including stores unused by the requested comparisons. A fixed seed reproduces draws without mutating the fitted model.
-- Zero-mass cohorts contribute zero, while positive-mass rank or control failures invalidate every dose at the affected horizon. No treated mass makes the whole horizon unavailable; reference draws with positive treated mass remain zero without regression checks.
-- Bootstrap does not reapply the original minimum-size screen, change the saved dose basis, refit PyFixest models, or silently drop positive-weight cohorts. Unexpected numerical errors raise instead of producing ordinary failure diagnostics.
-- Successful-only quantiles, sample standard deviations, attempted/successful/failed counts, and status flags match independent calculations. Zero or one successful draw produces missing inference values without discarding raw draws or the original point estimate.
+- Zero-mass cohorts contribute zero under both policies. Under `strict`, positive-mass rank or control failures invalidate every dose at the affected horizon. Under `available_cohorts`, retain estimable cohorts, normalize their kernel weights to one, and report missing estimates only when no cohort remains. No treated mass makes the whole horizon unavailable; reference draws with positive treated mass remain zero without regression checks.
+- Bootstrap does not reapply the original minimum-size screen, change the saved dose basis, refit PyFixest models, or omit failed-cell diagnostics. Unexpected numerical errors raise instead of producing ordinary failure diagnostics.
+- Successful-only quantiles, sample standard deviations, attempted/successful/failed counts, and status flags match independent calculations separately for each dose–horizon pair. Zero or one successful draw produces missing inference values without discarding raw draws or the original point estimate. Check available-cohort estimates against an independent calculation on explicitly duplicated rows after excluding failed cohorts; normalized weights must prevent missing effects from being treated as zero.
 - Full-panel fingerprint checks accept reordered rows, ignored time components, and extra unmapped columns, but reject changed normalized observations, missing rows, or a changed store population, including changes outside fitted comparison samples.
-- Bootstrap failures and original aggregation warnings produce a single combined warning, with aggregated diagnostics that count failed comparisons independently of the requested dose count.
+- Bootstrap failures, cohort exclusions, and original aggregation warnings produce a single combined warning, with aggregated diagnostics that count failed comparisons independently of the requested dose count. Verify `n_partial`, available and failed cohort counts, and retained kernel mass shares; underflow of a very small retained share must not discard an otherwise valid available-cohort estimate.
 
 The implementation provides point estimates through `ATT`, `estimate_pi()`, and `evaluate_theta()`, standalone bandwidth choices through `estimate_h0()` and `estimate_h_cv()`, and store-bootstrap pointwise intervals through `bootstrap_theta()`. Shared store counts preserve dependence from repeated control use and joint effect/weight estimation. Resampling does not fix contaminated controls, justify the identifying assumption, account for changing screening decisions, or remove KDE smoothing bias. Store-level independence and adequate information in the retained comparisons remain substantive requirements.
 

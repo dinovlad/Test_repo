@@ -3,7 +3,7 @@
 import copy
 import logging
 import unittest.mock
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 import numpy.testing as np_testing
@@ -97,6 +97,8 @@ def _expanded_theta(
     doses: FloatArray,
     event_time: int,
     bandwidth: float,
+    *,
+    available_cohorts: bool = False,
 ) -> FloatArray:
     """Expand repeated firms and independently fit raw-dose polynomial curves.
 
@@ -115,6 +117,8 @@ def _expanded_theta(
             Horizon to evaluate.
         bandwidth:
             Gaussian bandwidth in dose units.
+        available_cohorts:
+            Whether to exclude unestimable cells before normalizing kernel weights.
 
     Returns:
         An independently aggregated curve, or missing values when its required
@@ -136,10 +140,12 @@ def _expanded_theta(
     curves: list[FloatArray] = []
     expanded_doses: list[float] = []
     cohort_labels: list[int] = []
-    for group, (cohort, treated) in enumerate(groups):
+    for cohort, treated in groups:
         cell = model.cell_diagnostics_[(cohort, event_time)]
         controls = [firm for firm in cell["control_firms"] for _ in range(int(multiplicity[firm]))]
         if not controls:
+            if available_cohorts:
+                continue
             return np.full(len(doses), np.nan)
         baseline = cohort - pd.Timedelta(days=1)
         endpoint = cohort + pd.Timedelta(days=event_time)
@@ -149,11 +155,16 @@ def _expanded_theta(
         response = changes.reindex(treated).to_numpy(dtype=float)
         coefficients, _, rank, _ = np.linalg.lstsq(design, response, rcond=None)
         if rank < model.degree + 1:
+            if available_cohorts:
+                continue
             return np.full(len(doses), np.nan)
         control_mean = float(changes.reindex(controls).mean())
+        group = len(curves)
         curves.append(np.polynomial.polynomial.polyval(doses, coefficients) - control_mean)
         expanded_doses.extend(raw_doses)
         cohort_labels.extend([group] * len(raw_doses))
+    if not curves:
+        return np.full(len(doses), np.nan)
     distance = (np.asarray(expanded_doses)[:, None] - doses) / bandwidth
     log_kernel = -0.5 * distance**2
     kernel = np.exp(log_kernel - log_kernel.max(axis=0))
@@ -163,6 +174,51 @@ def _expanded_theta(
         numerator = kernel[np.asarray(cohort_labels) == group].sum(axis=0)
         result += numerator / denominator * curve
     return result
+
+
+def _retained_kernel_share(
+    model: att.ATT,
+    events: pd.DataFrame,
+    counts: Counts,
+    doses: FloatArray,
+    event_time: int,
+    bandwidth: float,
+    available_cohorts: list[pd.Timestamp],
+) -> FloatArray:
+    """Calculate retained kernel mass directly from repeated treated observations.
+
+    Args:
+        model:
+            Original comparison memberships.
+        events:
+            Original event table containing observed doses.
+        counts:
+            Complete firm sampling frequencies.
+        doses:
+            Requested evaluation doses.
+        event_time:
+            Horizon determining the original treated samples.
+        bandwidth:
+            Fixed Gaussian bandwidth.
+        available_cohorts:
+            Cohorts whose effects can be estimated in the supplied draw.
+
+    Returns:
+        Available kernel mass divided by all sampled cohort mass at each dose.
+    """
+    multiplicity = dict(zip(model.bootstrap_firms_, counts))
+    event_doses = events.set_index("firm")["hours"]
+    repeated_doses = []
+    available = []
+    for cohort in model.retained_cohorts_[event_time]:
+        firms = model.cell_diagnostics_[(cohort, event_time)]["treated_firms"]
+        for firm in firms:
+            copies = int(multiplicity[firm])
+            repeated_doses.extend([event_doses.loc[firm]] * copies)
+            available.extend([cohort in available_cohorts] * copies)
+    log_kernel = -0.5 * ((np.asarray(repeated_doses)[:, None] - doses) / bandwidth) ** 2
+    kernel = np.exp(log_kernel - log_kernel.max(axis=0))
+    return kernel[np.asarray(available)].sum(axis=0) / kernel.sum(axis=0)
 
 
 def test_bootstrap_matches_expanded_firms_and_reuses_global_counts(
@@ -331,12 +387,361 @@ def test_failed_horizons_use_successful_draws_without_rescreening_or_redrawing(
     assert diagnostics["n_failures"].tolist() == [1]
 
 
+def test_available_cohorts_renormalize_weights_after_rank_failure(
+    bootstrap_panel: Panel,
+    bootstrap_model: att.ATT,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep estimable cohorts and normalize their sampled kernel weights to one.
+
+    Args:
+        bootstrap_panel:
+            Heterogeneous observations and event metadata.
+        bootstrap_model:
+            Fitted model with horizon-specific treated membership.
+        monkeypatch:
+            Fixture supplying exact complete-firm resamples.
+        caplog:
+            Fixture verifying that exclusions produce one aggregate warning.
+    """
+    outcomes, events = bootstrap_panel
+    rows = np.vstack(
+        [
+            _counts(bootstrap_model),
+            _counts(bootstrap_model, {"A3": 0, "A4": 0, "B0": 2, "B1": 0}),
+            _counts(bootstrap_model, {"B3": 0, "B4": 0, "B5": 0, "B6": 0}),
+        ],
+    )
+    requests = _force_counts(monkeypatch, rows)
+    point = att.evaluate_theta(bootstrap_model, DOSES, bandwidth=BANDWIDTH, event_times=[0, 1])
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        summary, draws, diagnostics = att.bootstrap_theta(
+            bootstrap_model,
+            DOSES,
+            outcomes=outcomes,
+            bandwidth=BANDWIDTH,
+            event_times=[0, 1],
+            n_bootstrap=len(rows),
+            confidence_level=0.8,
+            failure_policy="available_cohorts",
+        )
+    assert sum(size for _, size in requests) == len(rows)
+    assert len(caplog.records) == 1
+    assert draws["success"].all()
+    assert summary["n_success"].eq(3).all()
+    assert summary["n_failed"].eq(0).all()
+    assert summary["failure_policy"].eq("available_cohorts").all()
+    assert not summary["conditional_on_success"].any()
+    assert summary["inference_status"].eq("available_cohorts").all()
+    pd_testing.assert_frame_equal(summary[point.columns], point)
+    assert diagnostics["reason"].eq("rank_deficient").all()
+    assert diagnostics["n_failures"].sum() == 3
+    for horizon in (0, 1):
+        expected = np.vstack(
+            [
+                _expanded_theta(
+                    bootstrap_model,
+                    outcomes,
+                    events,
+                    counts,
+                    DOSES,
+                    horizon,
+                    BANDWIDTH,
+                    available_cohorts=True,
+                )
+                for counts in rows
+            ],
+        )
+        actual = draws.loc[draws["event_time"].eq(horizon)].pivot(index="replicate", columns="dose", values="theta")
+        np_testing.assert_allclose(actual, expected, atol=1e-8)
+        result = summary.loc[summary["event_time"].eq(horizon)]
+        np_testing.assert_allclose(result["standard_error"], expected.std(axis=0, ddof=1), atol=1e-8)
+        np_testing.assert_allclose(result["ci_lower"], np.quantile(expected, 0.1, axis=0), atol=1e-8)
+        np_testing.assert_allclose(result["ci_upper"], np.quantile(expected, 0.9, axis=0), atol=1e-8)
+        cohorts = bootstrap_model.retained_cohorts_[horizon]
+        available = [cohorts, cohorts if horizon == 0 else cohorts[1:], cohorts[:1]]
+        shares = np.vstack(
+            [
+                _retained_kernel_share(bootstrap_model, events, counts, DOSES, horizon, BANDWIDTH, selected)
+                for counts, selected in zip(rows, available, strict=True)
+            ],
+        )
+        assert result["n_partial"].eq(1 if horizon == 0 else 2).all()
+        np_testing.assert_allclose(result["mean_retained_weight_share"], shares.mean(axis=0))
+        np_testing.assert_allclose(result["min_retained_weight_share"], shares.min(axis=0))
+        for replication, selected in enumerate(available, start=1):
+            one_draw = draws.loc[draws["event_time"].eq(horizon) & draws["replicate"].eq(replication)]
+            assert one_draw["n_cohorts_available"].eq(len(selected)).all()
+            assert one_draw["n_cohorts_failed"].eq(2 - len(selected)).all()
+            np_testing.assert_allclose(one_draw["retained_weight_share"], shares[replication - 1])
+
+
+def test_available_cohorts_skip_only_the_cell_without_controls(
+    bootstrap_panel: Panel,
+    bootstrap_model: att.ATT,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retain a valid cell when another cohort has no sampled comparison firms.
+
+    Args:
+        bootstrap_panel:
+            Original observations and event metadata.
+        bootstrap_model:
+            Model whose first cohort also supplies controls for the second cohort.
+        monkeypatch:
+            Fixture removing the first cohort's clean comparison firms.
+    """
+    outcomes, events = bootstrap_panel
+    model = bootstrap_model
+    rows = np.vstack([_counts(model, {"C0": 0, "C1": 0, "C2": 0}), _counts(model)])
+    _force_counts(monkeypatch, rows)
+    summary, draws, diagnostics = att.bootstrap_theta(
+        model,
+        DOSES,
+        outcomes=outcomes,
+        bandwidth=BANDWIDTH,
+        event_times=[0],
+        n_bootstrap=2,
+        failure_policy="available_cohorts",
+    )
+    assert draws["success"].all()
+    assert summary["n_success"].eq(2).all()
+    assert diagnostics["reason"].tolist() == ["no_controls"]
+    assert diagnostics["cohort"].tolist() == [pd.Timestamp("2024-01-08")]
+    for replication, counts in enumerate(rows, start=1):
+        expected = _expanded_theta(model, outcomes, events, counts, DOSES, 0, BANDWIDTH, available_cohorts=True)
+        np_testing.assert_allclose(draws.loc[draws["replicate"].eq(replication), "theta"], expected, atol=1e-8)
+
+
+def test_available_cohorts_keep_partial_draws_and_record_empty_aggregations(
+    bootstrap_panel: Panel,
+    bootstrap_model: att.ATT,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Build intervals from finite draws while preserving failures and reference zeros.
+
+    Args:
+        bootstrap_panel:
+            Original outcome and event tables.
+        bootstrap_model:
+            Fitted comparisons with a fixed original population.
+        monkeypatch:
+            Fixture supplying complete, partial, unsupported, and empty draws.
+    """
+    outcomes, events = bootstrap_panel
+    first_failure = {"A3": 0, "A4": 0, "A5": 0}
+    all_failures = {**first_failure, "B3": 0, "B4": 0, "B5": 0, "B6": 0}
+    empty = {**dict.fromkeys([f"A{i}" for i in range(6)], 0), **dict.fromkeys([f"B{i}" for i in range(7)], 0)}
+    rows = np.vstack(
+        [
+            _counts(bootstrap_model),
+            _counts(bootstrap_model, first_failure),
+            _counts(bootstrap_model, all_failures),
+            _counts(bootstrap_model, empty),
+        ],
+    )
+    requests = _force_counts(monkeypatch, rows)
+    summary, draws, diagnostics = att.bootstrap_theta(
+        bootstrap_model,
+        DOSES,
+        outcomes=outcomes,
+        bandwidth=BANDWIDTH,
+        event_times=[-1, 0],
+        n_bootstrap=4,
+        failure_policy="available_cohorts",
+    )
+    assert sum(size for _, size in requests) == 4
+    post = draws.loc[draws["event_time"].eq(0)]
+    assert post.loc[post["replicate"].isin([1, 2]), "success"].all()
+    assert not post.loc[post["replicate"].isin([3, 4]), "success"].any()
+    assert post.loc[post["replicate"].isin([3, 4]), "theta"].isna().all()
+    result = summary.loc[summary["event_time"].eq(0)]
+    expected = np.vstack(
+        [
+            _expanded_theta(
+                bootstrap_model,
+                outcomes,
+                events,
+                counts,
+                DOSES,
+                0,
+                BANDWIDTH,
+                available_cohorts=True,
+            )
+            for counts in rows[:2]
+        ],
+    )
+    assert result["n_success"].eq(2).all()
+    assert result["n_failed"].eq(2).all()
+    assert result["n_partial"].eq(1).all()
+    assert result["inference_status"].eq("available_cohorts").all()
+    assert post.loc[post["replicate"].eq(3), "retained_weight_share"].eq(0).all()
+    assert post.loc[post["replicate"].eq(4), "retained_weight_share"].isna().all()
+    assert post.loc[post["replicate"].isin([3, 4]), "n_cohorts_available"].eq(0).all()
+    np_testing.assert_allclose(result["standard_error"], expected.std(axis=0, ddof=1), atol=1e-8)
+    np_testing.assert_allclose(result["ci_lower"], np.quantile(expected, 0.025, axis=0), atol=1e-8)
+    np_testing.assert_allclose(result["ci_upper"], np.quantile(expected, 0.975, axis=0), atol=1e-8)
+    reference = summary.loc[summary["event_time"].eq(-1)]
+    assert reference["n_success"].eq(3).all()
+    np_testing.assert_array_equal(reference[["theta", "standard_error", "ci_lower", "ci_upper"]], 0.0)
+    assert diagnostics.loc[diagnostics["reason"].eq("rank_deficient"), "n_failures"].sum() == 3
+    unavailable = diagnostics.loc[diagnostics["reason"].eq("no_available_cohorts")]
+    assert unavailable["cohort"].isna().all()
+    assert unavailable["event_time"].tolist() == [0]
+    assert unavailable["n_failures"].tolist() == [1]
+
+
+def test_available_cohorts_preserve_survivors_when_excluded_kernel_mass_dominates(
+    bootstrap_panel: Panel,
+    bootstrap_model: att.ATT,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normalize the surviving cohort even when its full-population weight underflows.
+
+    Args:
+        bootstrap_panel:
+            Heterogeneous outcomes and doses with the first cohort nearest the query.
+        bootstrap_model:
+            Fitted curves whose first cohort will become unidentifiable.
+        monkeypatch:
+            Fixture retaining positive treated mass in the failed cohort.
+    """
+    outcomes, events = bootstrap_panel
+    partial = _counts(bootstrap_model, {"A3": 0, "A4": 0, "A5": 0})
+    rows = np.vstack([partial, _counts(bootstrap_model)])
+    _force_counts(monkeypatch, rows)
+    doses = np.asarray([4.0])
+    summary, draws, diagnostics = att.bootstrap_theta(
+        bootstrap_model,
+        doses,
+        outcomes=outcomes,
+        bandwidth=1e-150,
+        event_times=[0],
+        n_bootstrap=2,
+        failure_policy="available_cohorts",
+    )
+    assert draws["success"].all()
+    assert summary["n_success"].eq(2).all()
+    assert diagnostics["reason"].tolist() == ["rank_deficient"]
+    assert draws.loc[draws["replicate"].eq(1), "retained_weight_share"].eq(0).all()
+    assert draws.loc[draws["replicate"].eq(1), "n_cohorts_available"].eq(1).all()
+    for replication, counts in enumerate(rows, start=1):
+        expected = _expanded_theta(
+            bootstrap_model,
+            outcomes,
+            events,
+            counts,
+            doses,
+            0,
+            1e-150,
+            available_cohorts=True,
+        )
+        np_testing.assert_allclose(draws.loc[draws["replicate"].eq(replication), "theta"], expected, atol=1e-8)
+
+
+def test_available_cohorts_match_strict_when_every_sampled_cell_is_estimable(
+    bootstrap_panel: Panel,
+    bootstrap_model: att.ATT,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve complete-draw results and the existing default policy.
+
+    Args:
+        bootstrap_panel:
+            Original outcome and event tables.
+        bootstrap_model:
+            Fitted model with common resampling metadata.
+        monkeypatch:
+            Fixture repeating complete, nonuniformly weighted firm draws.
+    """
+    outcomes, _ = bootstrap_panel
+    rows = np.vstack([_counts(bootstrap_model), _counts(bootstrap_model, {"A0": 2, "A1": 0, "C0": 2, "C1": 0})])
+    results = []
+    for policy in (None, "strict", "available_cohorts"):
+        _force_counts(monkeypatch, rows)
+        options: dict[str, Any] = {} if policy is None else {"failure_policy": policy}
+        results.append(
+            att.bootstrap_theta(
+                bootstrap_model,
+                DOSES,
+                outcomes=outcomes,
+                bandwidth=BANDWIDTH,
+                n_bootstrap=2,
+                **options,
+            ),
+        )
+    for default, explicit in zip(results[0], results[1], strict=True):
+        pd_testing.assert_frame_equal(default, explicit)
+    for strict, available in zip(results[1], results[2], strict=True):
+        columns = [column for column in strict.columns if column != "failure_policy"]
+        pd_testing.assert_frame_equal(strict[columns], available[columns])
+
+
+def test_bootstrap_summarizes_availability_separately_for_each_dose(
+    bootstrap_panel: Panel,
+    bootstrap_model: att.ATT,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use each dose's finite draws rather than requiring a complete horizon row.
+
+    Args:
+        bootstrap_panel:
+            Original outcome and event tables.
+        bootstrap_model:
+            Fitted model providing the unchanged original point estimates.
+        monkeypatch:
+            Fixture supplying different missing-value patterns across doses.
+    """
+    outcomes, _ = bootstrap_panel
+    estimates = np.asarray([[1.0, 11.0, np.nan], [3.0, np.nan, 25.0], [np.nan, 17.0, np.nan]])
+    shares = np.asarray([[0.2, 0.8, np.nan], [0.4, np.nan, 0.6], [np.nan, 0.9, np.nan]])
+    counts = np.ones(3, dtype=np.int64)
+    monkeypatch.setattr(
+        att,
+        "_bootstrap_horizon",
+        unittest.mock.Mock(return_value=(estimates, counts, counts, shares)),
+    )
+    summary, draws, _ = att.bootstrap_theta(
+        bootstrap_model,
+        DOSES,
+        outcomes=outcomes,
+        bandwidth=BANDWIDTH,
+        event_times=[0],
+        n_bootstrap=3,
+        random_state=28,
+        failure_policy="available_cohorts",
+    )
+    np_testing.assert_array_equal(summary["n_success"], [2, 2, 1])
+    np_testing.assert_array_equal(summary["n_failed"], [1, 1, 2])
+    np_testing.assert_array_equal(summary["n_partial"], [2, 2, 1])
+    np_testing.assert_array_equal(draws["success"], np.isfinite(estimates).ravel())
+    np_testing.assert_allclose(draws["theta"], estimates.ravel(), equal_nan=True)
+    np_testing.assert_allclose(summary["mean_retained_weight_share"], [0.3, 0.85, 0.6])
+    np_testing.assert_allclose(summary["min_retained_weight_share"], [0.2, 0.8, 0.6])
+    for dose_index in (0, 1):
+        finite = estimates[:, dose_index][np.isfinite(estimates[:, dose_index])]
+        row = summary.iloc[dose_index]
+        assert row["standard_error"] == pytest.approx(finite.std(ddof=1))
+        assert row["ci_lower"] == pytest.approx(np.quantile(finite, 0.025))
+        assert row["ci_upper"] == pytest.approx(np.quantile(finite, 0.975))
+    assert summary.iloc[2][["standard_error", "ci_lower", "ci_upper"]].isna().all()
+    assert summary["inference_status"].tolist() == [
+        "available_cohorts",
+        "available_cohorts",
+        "insufficient_successful_draws",
+    ]
+
+
 @pytest.mark.parametrize("n_success", [0, 1])
+@pytest.mark.parametrize("failure_policy", ["strict", "available_cohorts"])
 def test_insufficient_successful_draws_keep_points_and_missing_intervals(
     bootstrap_panel: Panel,
     bootstrap_model: att.ATT,
     monkeypatch: pytest.MonkeyPatch,
     n_success: int,
+    failure_policy: Literal["strict", "available_cohorts"],
 ) -> None:
     """Return unavailable inference without replacing failed replications.
 
@@ -349,9 +754,16 @@ def test_insufficient_successful_draws_keep_points_and_missing_intervals(
             Fixture supplying too few successful draws.
         n_success:
             Number of successful draws among the two attempted replications.
+        failure_policy:
+            Rule for dealing with the loss of every cohort's sampled controls.
     """
     outcomes, _ = bootstrap_panel
-    failure = _counts(bootstrap_model, {"C0": 0, "C1": 0, "C2": 0})
+    controls = {
+        firm
+        for cohort in bootstrap_model.retained_cohorts_[0]
+        for firm in bootstrap_model.cell_diagnostics_[(cohort, 0)]["control_firms"]
+    }
+    failure = _counts(bootstrap_model, dict.fromkeys(controls, 0))
     rows = np.vstack([_counts(bootstrap_model) if n_success else failure, failure])
     _force_counts(monkeypatch, rows)
     summary, draws, diagnostics = att.bootstrap_theta(
@@ -361,6 +773,7 @@ def test_insufficient_successful_draws_keep_points_and_missing_intervals(
         bandwidth=BANDWIDTH,
         event_times=[0],
         n_bootstrap=2,
+        failure_policy=failure_policy,
     )
     assert summary["theta"].notna().all()
     assert summary[["standard_error", "ci_lower", "ci_upper"]].isna().all().all()
@@ -368,13 +781,16 @@ def test_insufficient_successful_draws_keep_points_and_missing_intervals(
     assert summary["n_failed"].eq(2 - n_success).all()
     assert summary["inference_status"].eq("insufficient_successful_draws").all()
     assert draws["success"].sum() == n_success * len(DOSES)
-    assert diagnostics["reason"].eq("no_controls").all()
+    reasons = {"no_controls", "no_available_cohorts"} if failure_policy == "available_cohorts" else {"no_controls"}
+    assert set(diagnostics["reason"]) == reasons
 
 
+@pytest.mark.parametrize("failure_policy", ["strict", "available_cohorts"])
 def test_zero_mass_cohorts_and_empty_aggregation_are_distinct(
     bootstrap_panel: Panel,
     bootstrap_model: att.ATT,
     monkeypatch: pytest.MonkeyPatch,
+    failure_policy: Literal["strict", "available_cohorts"],
 ) -> None:
     """Allow a zero-mass cohort but reject an entirely empty treated population.
 
@@ -385,6 +801,8 @@ def test_zero_mass_cohorts_and_empty_aggregation_are_distinct(
             Fitted model with two aggregation cohorts.
         monkeypatch:
             Fixture supplying empty-cohort and empty-population draws.
+        failure_policy:
+            Aggregation rule, both of which distinguish zero mass from a failed cell.
     """
     outcomes, events = bootstrap_panel
     empty_first = {f"A{index}": 0 for index in range(6)}
@@ -398,6 +816,7 @@ def test_zero_mass_cohorts_and_empty_aggregation_are_distinct(
         bandwidth=BANDWIDTH,
         event_times=[-1, 0],
         n_bootstrap=2,
+        failure_policy=failure_policy,
     )
     first = draws.loc[draws["replicate"].eq(1)]
     assert first["success"].all()
@@ -409,10 +828,12 @@ def test_zero_mass_cohorts_and_empty_aggregation_are_distinct(
     assert diagnostics["n_failures"].eq(1).all()
 
 
+@pytest.mark.parametrize("failure_policy", ["strict", "available_cohorts"])
 def test_reference_needs_no_sampled_controls_or_polynomial_rank(
     bootstrap_panel: Panel,
     bootstrap_model: att.ATT,
     monkeypatch: pytest.MonkeyPatch,
+    failure_policy: Literal["strict", "available_cohorts"],
 ) -> None:
     """Keep the normalization zero whenever any retained treated firm is drawn.
 
@@ -423,6 +844,8 @@ def test_reference_needs_no_sampled_controls_or_polynomial_rank(
             Validated fitted reference comparisons.
         monkeypatch:
             Fixture removing regression support and blocking linear solves.
+        failure_policy:
+            Aggregation rule under which the reference remains normalized to zero.
     """
     outcomes, _ = bootstrap_panel
     changes = dict.fromkeys([f"A{i}" for i in range(1, 6)] + [f"B{i}" for i in range(7)] + ["C0", "C1", "C2"], 0)
@@ -435,6 +858,7 @@ def test_reference_needs_no_sampled_controls_or_polynomial_rank(
         bandwidth=BANDWIDTH,
         event_times=[-1],
         n_bootstrap=2,
+        failure_policy=failure_policy,
     )
     np_testing.assert_array_equal(summary[["theta", "standard_error", "ci_lower", "ci_upper"]], 0.0)
     assert draws["success"].all()
@@ -731,6 +1155,9 @@ def test_placebo_bootstrap_uses_the_same_fixed_reference_period(
         ("bandwidth", 0.0),
         ("bandwidth", np.bool_(True)),
         ("bandwidth", "0.9"),
+        ("failure_policy", "unknown"),
+        ("failure_policy", None),
+        ("failure_policy", True),
     ],
 )
 def test_bootstrap_rejects_invalid_configuration_before_sampling(

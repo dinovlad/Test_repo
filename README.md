@@ -146,6 +146,7 @@ summary, draws, diagnostics = att.bootstrap_theta(
     n_bootstrap=1999,
     confidence_level=0.95,
     random_state=42,
+    failure_policy="available_cohorts",
 )
 ```
 
@@ -169,41 +170,73 @@ at every requested dose.
 The original retained comparisons, treated/control membership, dose scaling,
 polynomial degree, and selected bandwidth remain fixed. Cohort shares vary with
 the sampled firms. No minimum-size screening is repeated, and excluded
-comparisons do not enter the bootstrap aggregation.
+original comparisons do not enter the bootstrap aggregation.
+
+`failure_policy="strict"` is the default. A positive-weight cohort with
+insufficient polynomial rank or no sampled controls makes that draw unavailable
+at the affected horizon, for every requested dose.
+
+Use `failure_policy="available_cohorts"` to keep each estimable cohort instead.
+For each draw and horizon, the kernel weights are estimated over the available
+cohorts and normalized to sum to one. The aggregate is the sum of those weights
+times their ATT estimates; no additional normalization is needed after defining
+the weights this way. A single available cohort is sufficient. If none remain,
+the corresponding estimates are missing. Failed positive-weight cohorts remain
+visible in the diagnostics.
 
 `summary` preserves every `evaluate_theta()` column and adds `standard_error`,
 `ci_lower`, `ci_upper`, `confidence_level`, `n_bootstrap`, `n_success`, `n_failed`,
-`success_rate`, `conditional_on_success`, and `inference_status`. Standard errors
-use sample standard deviations, and intervals use the successful draws' empirical
+`success_rate`, `conditional_on_success`, `inference_status`, and `failure_policy`.
+It also reports `n_partial`, counting successful draws that excluded at least one
+positive-weight cohort, and `mean_retained_weight_share` and
+`min_retained_weight_share` over successful draws. Standard errors use sample
+standard deviations, and intervals use the successful draws' empirical
 percentiles separately at each dose and horizon. At least two successful draws
 are required; otherwise the standard error and bounds are missing. There is no
 additional success-rate cutoff.
 
-A positive-weight cohort with insufficient polynomial rank or no sampled
-controls makes that draw unavailable at the affected horizon, for every requested
-dose. A cohort with no sampled treated firms instead contributes zero. A draw
-with no sampled treated firms anywhere in the horizon is unavailable. At the
-reference horizon -1, positive total treated mass gives an exact zero without
-regression or control checks. With at least two successful reference draws, its
-standard error and both interval bounds are zero.
+A cohort with no sampled treated firms contributes zero under either policy.
+A draw with no sampled treated firms anywhere in the horizon is unavailable.
+At the reference horizon -1, positive total treated mass gives an exact zero
+without regression or control checks. With at least two successful reference
+draws, its standard error and both interval bounds are zero. Polynomial cell
+estimability and Gaussian support normally make availability common across
+doses at a horizon, but success counts and intervals are computed separately
+for each `(dose, event_time)` pair.
 
 `draws` contains all attempted replications, including failed estimates as
 missing values, with columns `replicate` (starting at 1), `event_time`, `dose`,
-`theta`, and `success`. `diagnostics` aggregates failures by `cohort`,
-`event_time`, and `reason`, reporting `n_failures`. A global lack of treated firms
-has a missing cohort label. Multiple comparisons can fail in one draw, so summed
-comparison failure counts can exceed the number of failed draws at a horizon.
-Failures are not replaced, and positive-weight cohorts are not dropped and
-renormalized. Unexpected numerical or implementation errors raise exceptions.
-Each bootstrap call emits at most one aggregated warning.
+`theta`, `success`, `n_cohorts_available`, `n_cohorts_failed`, and
+`retained_weight_share`. Cohort counts include only cohorts with sampled treated
+firms. The share compares their estimable cohorts' kernel mass with the mass of
+all originally retained cohorts in that draw, at that dose and horizon. It is
+zero when sampled treated firms exist but no cohort is estimable, and missing
+when there are no sampled treated firms. A successful reference draw has share
+one. These diagnostics remain present on failed strict-policy draws too.
 
-`inference_status` is `ok` when all draws succeed, `successful_draws_only` when
-an interval uses a subset of draws, and `insufficient_successful_draws` when
-fewer than two draws succeed. `conditional_on_success` is true whenever any draw
-fails. It describes the restricted resampling distribution, not guaranteed
-conditional coverage. Inspect the failure counts and reasons when using these
-intervals, especially for small cohorts. The procedure assumes independent firms,
-holds screening and tuning choices fixed, and ignores KDE smoothing bias. The
+`diagnostics` aggregates failures by `cohort`, `event_time`, and `reason`,
+reporting `n_failures`. A global lack of treated firms (`no_treated_firms`) or,
+under the available-cohort policy, a complete lack of estimable positive-mass
+cohorts (`no_available_cohorts`) has a missing cohort label. Cell failures remain
+recorded even when the aggregate is available. Multiple comparisons can fail in
+one draw, so summed comparison failure counts can exceed the number of failed
+draws at a horizon. Failures are not replaced. Unexpected numerical or
+implementation errors raise exceptions. Each bootstrap call emits at most one
+aggregated warning, including when cohorts are excluded but every aggregate
+remains available.
+
+`inference_status` is `insufficient_successful_draws` when fewer than two draws
+succeed. Otherwise it is `available_cohorts` if any successful draw excludes
+positive-weight cohorts, `successful_draws_only` if some draws fail, or `ok`.
+`conditional_on_success` is true whenever any draw fails at the dose–horizon
+pair; `n_partial` separately identifies exclusions within successful draws.
+These flags describe restrictions on the resampling distribution, not guaranteed
+conditional coverage. With `available_cohorts`, each draw can average a different
+cohort population. Frequent exclusions can shift that distribution away from the
+original point-estimate target, especially when small cohorts have different
+effects. Inspect the failure counts, reasons, and retained kernel weight when
+using these intervals. The procedure assumes independent firms, holds screening
+and tuning choices fixed, and ignores KDE smoothing bias. The
 intervals are pointwise, not a simultaneous band over doses or horizons. A short
 run can help assess failure frequency before a longer run.
 
