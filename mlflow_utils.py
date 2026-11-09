@@ -77,19 +77,24 @@ def setup_mlflow_env(
     Args:
         env_file:
             The path to a .env file to load into the environment variables.
-            If None, the existing environment variables are checked and validated.
+            If None and `env_override` is False, the existing environment variables
+            are checked and validated.
         env_override:
-            Whether variables from `env_file` should override existing env vars.
+            Whether to read settings exclusively from `env_file` and overwrite
+            existing environment variables. When True, the file must supply all
+            required settings; missing values are not read from the environment.
 
     Raises:
         pydantic.ValidationError:
             - If `env_file` is provided but does not exist.
-            - If env variables required for MLflow are missing or empty.
+            - If required MLflow settings are missing, empty, or invalid.
     """
-    config = MlflowConfig(_env_file=env_file)
     if env_override:
+        dotenv_source = pydantic_settings.DotEnvSettingsSource(MlflowConfig, env_file=env_file)
+        config = MlflowConfig(_build_sources=((dotenv_source,), {}))
         os.environ.update(config.model_dump())
     else:
+        config = MlflowConfig(_env_file=env_file)
         os.environ.update(config.model_dump() | os.environ)
 
 

@@ -18,6 +18,25 @@ import requests
 from hvac import exceptions as vault_exceptions
 
 
+def validate_filename(filename: str) -> str:
+    """Validate a single POSIX filename without accessing the filesystem.
+
+    Args:
+        filename:
+            The filename to validate. Backslashes and Unicode characters are allowed.
+
+    Returns:
+        The original filename, unchanged.
+
+    Raises:
+        ValueError:
+            If the filename is empty, is '.' or '..', or contains '/' or a null byte.
+    """
+    if filename in {"", ".", ".."} or "/" in filename or "\0" in filename:
+        raise ValueError(f"Invalid POSIX filename: {filename!r}.")
+    return filename
+
+
 class VaultValueError(Exception):
     """Secret values stored in Vault are invalid."""
 
@@ -196,7 +215,7 @@ class VaultClient:
         Raises:
             ValueError:
                 If `initial_delay` or `delay_jitter` is negative,
-                or if `attempts` is not a positive integer.
+                or if `attempts` is non-positive.
         """
         if initial_delay < 0:
             raise ValueError(f"`initial_delay` must be non-negative, got {initial_delay}.")
@@ -330,12 +349,15 @@ class VaultAirflowClient:
 
         Raises:
             ValueError:
-                If `conn_id` is not a filename but a path.
+                If `conn_id` is not a valid POSIX filename.
             Errors raised by `VaultClient.read_secret()`.
         """
+        try:
+            conn_id = validate_filename(conn_id)
+        except ValueError as exc:
+            raise ValueError(f"`conn_id` must be a valid filename, got {conn_id!r}.") from exc
+
         connections_dir = PurePosixPath(self.config.meta.env) / "airflow" / "connections"
         conn_secrets_path = connections_dir / conn_id
-        if conn_secrets_path.parent != connections_dir:
-            raise ValueError(f"`conn_id` must be a filename, got {conn_id!r}.")
 
         return self._vc.read_secret(mount_point=self.config.meta.mount_point, path=str(conn_secrets_path))

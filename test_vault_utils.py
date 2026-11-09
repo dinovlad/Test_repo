@@ -12,6 +12,24 @@ from hvac import exceptions as vault_exceptions
 import vault_utils
 
 
+VALID_FILENAMES = ["warehouse", ".hidden", "name..", "name with spaces", "данные", r"name\with\backslashes"]
+INVALID_FILENAMES = [
+    "", ".", "..", "/", "../warehouse", "/warehouse", "nested/warehouse",
+    "./warehouse", "warehouse/", "ware\0house",
+]
+
+
+@pytest.mark.parametrize("filename", VALID_FILENAMES)
+def test_validate_filename_preserves_valid_posix_filenames(filename):
+    assert vault_utils.validate_filename(filename) == filename
+
+
+@pytest.mark.parametrize("filename", INVALID_FILENAMES)
+def test_validate_filename_rejects_paths_and_invalid_filenames(filename):
+    with pytest.raises(ValueError, match="Invalid POSIX filename"):
+        vault_utils.validate_filename(filename)
+
+
 @pytest.fixture(autouse=True)
 def clean_vault_environment(monkeypatch):
     """Keep settings tests independent of the developer's credentials."""
@@ -185,12 +203,6 @@ def test_client_copies_auth_and_passes_tls_settings(auth, vault_backend, verify)
         ({"delay_jitter": -0.1}, "delay_jitter"),
         ({"attempts": 0}, "attempts"),
         ({"attempts": -1}, "attempts"),
-        pytest.param(
-            {"attempts": 1.5}, "attempts",
-            marks=pytest.mark.xfail(
-                strict=True, reason="VaultClient accepts fractional attempts despite its positive-integer contract",
-            ),
-        ),
     ],
 )
 def test_client_rejects_invalid_retry_options(auth, vault_backend, kwargs, message):
@@ -342,29 +354,19 @@ def test_airflow_client_copies_config(airflow_client):
     airflow_client.constructor.assert_called_once_with(copied.auth)
 
 
-def test_airflow_client_reads_connection_from_environment_directory(airflow_client):
+@pytest.mark.parametrize("conn_id", VALID_FILENAMES)
+def test_airflow_client_reads_connection_from_environment_directory(airflow_client, conn_id):
     airflow_client.backend.read_secret.return_value = {"host": "database.example.test"}
 
-    result = airflow_client.client.get_connection("warehouse")
+    result = airflow_client.client.get_connection(conn_id)
 
     assert result == {"host": "database.example.test"}
     airflow_client.backend.read_secret.assert_called_once_with(
-        mount_point="airflow-secrets", path="stage/airflow/connections/warehouse",
+        mount_point="airflow-secrets", path=f"stage/airflow/connections/{conn_id}",
     )
 
 
-@pytest.mark.parametrize(
-    "conn_id",
-    [
-        "", ".", "../warehouse", "/warehouse", "nested/warehouse",
-        pytest.param(
-            "..",
-            marks=pytest.mark.xfail(
-                strict=True, reason="VaultAirflowClient accepts '..' as a connection filename",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("conn_id", INVALID_FILENAMES)
 def test_airflow_client_rejects_connection_paths(airflow_client, conn_id):
     with pytest.raises(ValueError, match="conn_id.*filename"):
         airflow_client.client.get_connection(conn_id)

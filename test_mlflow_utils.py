@@ -127,16 +127,52 @@ def test_setup_environment_preserves_existing_values(env_file, config_values, mo
     assert os.environ["UNRELATED_SETTING"] == "keep-me"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BaseSettings gives environment variables precedence even when env_override=True",
-)
 def test_setup_environment_can_override_existing_values(env_file, config_values, monkeypatch):
-    monkeypatch.setenv("MLFLOW_TRACKING_USERNAME", "existing-user")
+    for name in config_values:
+        monkeypatch.setenv(name, "existing-value")
+    monkeypatch.setenv("UNRELATED_SETTING", "keep-me")
 
     mlflow_utils.setup_mlflow_env(env_file=env_file, env_override=True)
 
-    assert os.environ["MLFLOW_TRACKING_USERNAME"] == config_values["MLFLOW_TRACKING_USERNAME"]
+    assert {name: os.environ[name] for name in config_values} == config_values
+    assert os.environ["UNRELATED_SETTING"] == "keep-me"
+
+
+@pytest.mark.parametrize("field", list(mlflow_utils.MlflowConfig.model_fields))
+@pytest.mark.parametrize("invalid", [None, ""])
+def test_setup_environment_override_requires_valid_dotenv_values(
+    env_file, config_values, monkeypatch, field, invalid,
+):
+    for name, value in config_values.items():
+        monkeypatch.setenv(name, value)
+    file_values = dict(config_values)
+    if invalid is None:
+        file_values.pop(field)
+    else:
+        file_values[field] = invalid
+    env_file.write_text(
+        "".join(f"{name}={value}\n" for name, value in file_values.items()),
+        encoding="utf-8",
+    )
+    before = dict(os.environ)
+
+    with pytest.raises(pydantic.ValidationError) as error:
+        mlflow_utils.setup_mlflow_env(env_file=env_file, env_override=True)
+
+    assert field in {entry["loc"][0] for entry in error.value.errors()}
+    assert dict(os.environ) == before
+
+
+def test_setup_environment_override_requires_env_file(config_values, monkeypatch):
+    for name, value in config_values.items():
+        monkeypatch.setenv(name, value)
+    before = dict(os.environ)
+
+    with pytest.raises(pydantic.ValidationError) as error:
+        mlflow_utils.setup_mlflow_env(env_override=True)
+
+    assert {entry["loc"][0] for entry in error.value.errors()} == set(config_values)
+    assert dict(os.environ) == before
 
 
 def test_setup_environment_validates_existing_variables(config_values, monkeypatch):
