@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import numbers
 from collections.abc import Iterable
 from typing import Annotated, Any, Self, cast
 
@@ -42,144 +41,105 @@ _PREDICTION_COLUMNS = [
 ]
 
 
-class _ValidatedInput(pydantic.BaseModel):
-    """Validate runtime types strictly while accepting pandas input objects."""
-
-    model_config = pydantic.ConfigDict(arbitrary_types_allowed=True, strict=True)
-
-
-class _IntegerInput(_ValidatedInput):
-    """Validate an integer and its named lower bound without numeric coercion.
-
-    Attributes:
-        name:
-            Argument name used in validation messages.
-        minimum:
-            Inclusive lower bound, or None when no bound is required.
-        value:
-            Validated built-in integer, including accepted NumPy integers.
-    """
-
-    name: str
-    minimum: int | None
-    value: int
-
-    @pydantic.field_validator("value", mode="before")
-    @classmethod
-    def _validate_integer(cls, value: Any, info: pydantic.ValidationInfo) -> int:
-        """Preserve accepted integer types and reject Boolean values.
-
-        Args:
-            value:
-                Supplied integer argument before Pydantic type validation.
-            info:
-                Validated argument name and lower bound.
-
-        Returns:
-            The supplied value represented as a built-in integer.
-
-        Raises:
-            ValueError:
-                The value is not an integer or violates its lower bound.
-        """
-        name = info.data["name"]
-        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Integral):
-            raise ValueError(f"{name} must be an integer.")
-        result = int(value)
-        minimum = info.data["minimum"]
-        if minimum is not None and result < minimum:
-            raise ValueError(f"{name} must be at least {minimum}.")
-        return result
+_VALIDATION_CONFIG = pydantic.ConfigDict(arbitrary_types_allowed=True)
+_Integer = Annotated[
+    int,
+    pydantic.Field(strict=True),
+    pydantic.BeforeValidator(lambda value: int(value) if isinstance(value, np.integer) else value),
+]
+_PositiveInteger = Annotated[_Integer, pydantic.Field(ge=1)]
+_ColumnName = Annotated[str, pydantic.Field(strict=True, min_length=1)]
+# Instance checks prevent scalar-convertible arrays or objects from becoming grid entries.
+_REAL_SCALAR = pydantic.TypeAdapter(
+    pydantic.InstanceOf[int]
+    | pydantic.InstanceOf[float]
+    | pydantic.InstanceOf[np.integer]
+    | pydantic.InstanceOf[np.floating],
+    config=_VALIDATION_CONFIG,
+)
+_Real = Annotated[
+    float,
+    pydantic.Field(strict=True, allow_inf_nan=False),
+    pydantic.BeforeValidator(lambda value: float(value) if isinstance(value, (np.integer, np.floating)) else value),
+    pydantic.BeforeValidator(_REAL_SCALAR.validate_python),
+]
+_PositiveReal = Annotated[_Real, pydantic.Field(gt=0)]
+_COLUMN_NAMES = pydantic.TypeAdapter(list[_ColumnName])
+_DATAFRAME = pydantic.TypeAdapter(pd.DataFrame, config=_VALIDATION_CONFIG)
+_EVENT_TIMES = pydantic.TypeAdapter(Annotated[list[_Integer], pydantic.Field(min_length=1)])
+_FIRM_LIST = pydantic.TypeAdapter(Annotated[list[object], pydantic.Field(min_length=1)])
 
 
-class _ColumnNames(_ValidatedInput):
-    """Validate mapped column names without coercing non-string values.
+class _ATTOptions(pydantic.BaseModel):
+    """Validate constructor configuration without coercing its scalar types.
 
     Attributes:
-        names:
-            Nonempty string column names in their supplied order.
+        firm_col:
+            Nonempty firm identifier column name.
+        period_col:
+            Nonempty period column name.
+        outcome_col:
+            Nonempty outcome column name.
+        dose_col:
+            Nonempty dose column name.
+        degree:
+            Positive polynomial degree.
+        min_cohort_size:
+            Optional positive treated-sample minimum.
     """
 
-    names: tuple[Annotated[str, pydantic.Field(min_length=1)], ...]
+    model_config = _VALIDATION_CONFIG
+
+    firm_col: _ColumnName
+    period_col: _ColumnName
+    outcome_col: _ColumnName
+    dose_col: _ColumnName
+    degree: _PositiveInteger
+    min_cohort_size: _PositiveInteger | None
 
 
-class _DataFrameInput(_ValidatedInput):
-    """Validate a pandas table without copying or coercing its contents.
+class _FitInputs(pydantic.BaseModel):
+    """Validate table types and isolation offsets after clearing fitted state.
 
     Attributes:
-        frame:
-            The supplied DataFrame, including supported DataFrame subclasses.
+        outcomes:
+            Original outcome table, retained without copying or coercion.
+        events:
+            Original event table, retained without copying or coercion.
+        isolation_window:
+            Two integer offsets spanning the reference and treatment periods.
     """
 
-    frame: pd.DataFrame
+    model_config = _VALIDATION_CONFIG
+
+    outcomes: pd.DataFrame
+    events: pd.DataFrame
+    isolation_window: tuple[Annotated[_Integer, pydantic.Field(le=-1)], Annotated[_Integer, pydantic.Field(ge=0)]]
 
 
-class _BootstrapOptions(_ValidatedInput):
-    """Validate the requested bootstrap confidence level without string coercion.
-
-    Attributes:
-        confidence_level:
-            Finite interval coverage strictly between zero and one.
-    """
-
-    confidence_level: Annotated[float, pydantic.Field(gt=0, lt=1, allow_inf_nan=False)]
-
-
-def _integer(value: Any, name: str, minimum: int | None = None) -> int:
-    """Validate an integer, excluding Boolean values.
+def _distinct_grid(values: list[float]) -> list[float]:
+    """Enforce grid uniqueness after Pydantic validates each numeric element.
 
     Args:
-        value:
-            Supplied integer, including NumPy integer scalars.
-        name:
-            Argument name used in validation messages.
-        minimum:
-            Inclusive lower bound, or None when no bound is required.
+        values:
+            Positive finite numeric values in their supplied order.
 
     Returns:
-        The validated value as a built-in integer.
+        The supplied values without sorting or deduplication.
 
     Raises:
         ValueError:
-            The value is not an integer or is below the specified minimum.
+            The grid contains duplicate values.
     """
-    try:
-        return _IntegerInput(name=name, minimum=minimum, value=value).value
-    except pydantic.ValidationError as exc:
-        error = exc.errors(include_input=False, include_url=False)[0]
-        message = str(error.get("ctx", {}).get("error", error["msg"]))
-        raise ValueError(message) from None
+    if len(set(values)) != len(values):
+        raise ValueError("Grid values must be distinct.")
+    return values
 
 
-def _validate_doses(doses: Iterable[float]) -> FloatArray:
-    """Validate a nonempty collection of distinct positive finite doses.
-
-    Args:
-        doses:
-            Numeric dose values to materialize without coercing strings or objects.
-
-    Returns:
-        A one-dimensional floating-point array in the supplied order.
-
-    Raises:
-        ValueError:
-            The values are not a nonempty collection of distinct positive finite
-            real numbers.
-    """
-    if isinstance(doses, (str, bytes)):
-        raise ValueError("doses must be a collection of numbers.")
-    try:
-        values = np.asarray(list(doses))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("doses must be a collection of numbers.") from exc
-    if values.ndim != 1 or not len(values) or values.dtype.kind not in "iuf":
-        raise ValueError("doses must be a nonempty one-dimensional numeric collection.")
-    result = values.astype(float, copy=False)
-    if not np.isfinite(result).all() or (result <= 0).any():
-        raise ValueError("doses must be positive and finite.")
-    if len(np.unique(result)) != len(result):
-        raise ValueError("doses must be distinct.")
-    return result
+_POSITIVE_GRID = pydantic.TypeAdapter(
+    Annotated[list[_PositiveReal], pydantic.Field(min_length=1), pydantic.AfterValidator(_distinct_grid)],
+)
+# Decorated functions skip lazy Iterable validation and use these eager adapters in their bodies.
 
 
 def _require_columns(frame: pd.DataFrame, columns: list[str], name: str) -> None:
@@ -199,7 +159,7 @@ def _require_columns(frame: pd.DataFrame, columns: list[str], name: str) -> None
             columns are absent.
     """
     try:
-        _DataFrameInput(frame=frame)
+        _DATAFRAME.validate_python(frame)
     except pydantic.ValidationError:
         raise ValueError(f"{name} must be a pandas DataFrame.") from None
     if not frame.columns.is_unique:
@@ -387,19 +347,23 @@ class ATT:
                 A mapping is empty or conflicts within a table, or a numerical
                 configuration value is invalid.
         """
-        names = (firm_col, period_col, outcome_col, dose_col)
-        try:
-            _ColumnNames(names=names)
-        except pydantic.ValidationError:
-            raise ValueError("All four column-name arguments must be nonempty strings.") from None
+        options = _ATTOptions(
+            firm_col=firm_col,
+            period_col=period_col,
+            outcome_col=outcome_col,
+            dose_col=dose_col,
+            degree=degree,
+            min_cohort_size=min_cohort_size,
+        )
+        names = (options.firm_col, options.period_col, options.outcome_col, options.dose_col)
         if len(set(names[:3])) != 3 or len({firm_col, period_col, dose_col}) != 3:
             raise ValueError("Mapped column names must be distinct within each table.")
-        self.firm_col = firm_col
-        self.period_col = period_col
-        self.outcome_col = outcome_col
-        self.dose_col = dose_col
-        self.degree = _integer(degree, "degree", 1)
-        self.min_cohort_size = None if min_cohort_size is None else _integer(min_cohort_size, "min_cohort_size", 1)
+        self.firm_col = options.firm_col
+        self.period_col = options.period_col
+        self.outcome_col = options.outcome_col
+        self.dose_col = options.dose_col
+        self.degree = options.degree
+        self.min_cohort_size = options.min_cohort_size
         self._reset()
 
     def _reset(self) -> None:
@@ -635,20 +599,12 @@ class ATT:
                 Singular-value decomposition fails while screening a comparison.
         """
         self._reset()
-        try:
-            lower, upper = isolation_window
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "isolation_window must contain two signed integer offsets.",
-            ) from exc
-        lower = _integer(lower, "lower isolation offset")
-        upper = _integer(upper, "upper isolation offset")
-        if lower > -1 or upper < 0:
-            raise ValueError("isolation_window requires lower <= -1 and upper >= 0.")
+        inputs = _FitInputs(outcomes=outcomes, events=events, isolation_window=isolation_window)
+        lower, upper = inputs.isolation_window
         self.isolation_window_ = (lower, upper)
         self.event_times_ = list(range(lower, upper + 1))
         self.retained_cohorts_ = {e: [] for e in self.event_times_}
-        outcome, event = self._inputs(outcomes, events)
+        outcome, event = self._inputs(inputs.outcomes, inputs.events)
         self.bootstrap_firms_ = pd.Index(outcome["firm_id"].drop_duplicates().to_numpy(copy=True), tupleize_cols=False)
         self.outcome_fingerprint_ = _panel_fingerprint(outcome, self.bootstrap_firms_)
         try:
@@ -956,13 +912,8 @@ class ATT:
         """
         if event_times is None:
             return list(self.event_times_)
-        try:
-            values = [_integer(e, "event_time") for e in event_times]
-        except TypeError as exc:
-            raise ValueError(
-                "event_times must be a nonempty collection of integers.",
-            ) from exc
-        if not values or len(set(values)) != len(values):
+        values = _EVENT_TIMES.validate_python(event_times)
+        if len(set(values)) != len(values):
             raise ValueError("event_times must be nonempty and distinct.")
         if not set(values).issubset(self.event_times_):
             raise ValueError(
@@ -999,7 +950,7 @@ class ATT:
                 Doses or horizons are invalid, or polynomial prediction is nonfinite.
         """
         self._require_fitted()
-        dose_values = np.sort(_validate_doses(doses))
+        dose_values = np.sort(np.asarray(_POSITIVE_GRID.validate_python(doses), dtype=float))
         horizons = self._resolve_event_times(event_times)
         failed = [
             key
@@ -1106,13 +1057,8 @@ def _validate_aggregation_firms(firms: Iterable[object], name: str) -> list[obje
             If identifiers are missing, repeated, unhashable, or not supplied
             as a nonempty collection.
     """
-    if isinstance(firms, (str, bytes)):
-        raise ValueError(f"{name} must be a collection of firm identifiers.")
-    try:
-        values = list(firms)
-    except TypeError as exc:
-        raise ValueError(f"{name} must be a collection of firm identifiers.") from exc
-    if not values or pd.Series(values, dtype=object).isna().any():
+    values = _FIRM_LIST.validate_python(firms)
+    if pd.Series(values, dtype=object).isna().any():
         raise ValueError(f"{name} must contain nonmissing firm identifiers.")
     try:
         unique = set(values)
@@ -1154,7 +1100,7 @@ def _bandwidth_events(
     """
     columns = [firm_col, period_col, dose_col]
     try:
-        _ColumnNames(names=tuple(columns))
+        _COLUMN_NAMES.validate_python(columns)
     except pydantic.ValidationError:
         raise ValueError("Bandwidth column names must be distinct nonempty strings.") from None
     if len(set(columns)) != 3:
@@ -1386,16 +1332,17 @@ def _expand_bandwidth_grid(
     return expanded, losses, messages
 
 
+@pydantic.validate_call(config=_VALIDATION_CONFIG)
 def estimate_h_cv(
     events: pd.DataFrame,
     *,
-    firm_col: str,
-    period_col: str,
-    dose_col: str,
-    eligible_firms: Iterable[object] | None = None,
-    bandwidths: Iterable[float] | None = None,
-    batch_size: int = 256,
-    max_expansions: int = 50,
+    firm_col: _ColumnName,
+    period_col: _ColumnName,
+    dose_col: _ColumnName,
+    eligible_firms: pydantic.SkipValidation[Iterable[object] | None] = None,
+    bandwidths: pydantic.SkipValidation[Iterable[float] | None] = None,
+    batch_size: _PositiveInteger = 256,
+    max_expansions: _PositiveInteger = 50,
 ) -> tuple[float, pd.DataFrame]:
     """Select a Gaussian bandwidth by leave-one-firm-out multiclass Brier loss.
 
@@ -1446,8 +1393,6 @@ def estimate_h_cv(
             invalid; fewer than two cohorts or distinct doses remain; or
             kernel arithmetic overflows or produces invalid losses.
     """
-    batch_size = _integer(batch_size, "batch_size", 1)
-    max_expansions = _integer(max_expansions, "max_expansions", 1)
     first = _bandwidth_events(events, firm_col, period_col, dose_col, eligible_firms)
     doses = first["dose"].to_numpy(dtype=float)
     if doses.min() == doses.max():
@@ -1458,13 +1403,8 @@ def estimate_h_cv(
     if bandwidths is None:
         bandwidths = _silverman_h0(doses) * np.geomspace(0.1, 10.0, 9)
     try:
-        if isinstance(bandwidths, (str, bytes)):
-            raise ValueError("A bandwidth grid must contain numbers.")
-        values = list(bandwidths)
-        if any(isinstance(value, (bool, np.bool_)) for value in values):
-            raise ValueError("Boolean bandwidths are invalid.")
-        candidates = np.sort(_validate_doses(values))
-    except (TypeError, ValueError) as exc:
+        candidates = np.sort(np.asarray(_POSITIVE_GRID.validate_python(bandwidths), dtype=float))
+    except pydantic.ValidationError as exc:
         raise ValueError("bandwidths must contain distinct positive finite numbers.") from exc
     codes = np.asarray(cohort_codes, dtype=np.int64)
     scores = _loo_brier_scores(doses, codes, candidates, batch_size)
@@ -1490,12 +1430,13 @@ def estimate_h_cv(
     return float(candidates[best]), pd.DataFrame({"bandwidth": candidates, "cv_brier": scores})
 
 
+@pydantic.validate_call(config=_VALIDATION_CONFIG)
 def estimate_pi(
     events: pd.DataFrame,
-    doses: Iterable[float],
+    doses: pydantic.SkipValidation[Iterable[float]],
     *,
-    eligible_firms: Iterable[object],
-    bandwidth: float,
+    eligible_firms: pydantic.SkipValidation[Iterable[object]],
+    bandwidth: _PositiveReal,
 ) -> pd.DataFrame:
     """Estimate dose-specific cohort weights for eligible firms.
 
@@ -1524,15 +1465,8 @@ def estimate_pi(
             the required schema or eligibility rules, or kernel calculations
             produce nonfinite intermediate values.
     """
-    dose_values = _validate_doses(doses)
-    if isinstance(bandwidth, (bool, np.bool_)):
-        raise ValueError("bandwidth must be positive and finite.")
-    try:
-        kernel_bandwidth = float(bandwidth)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("bandwidth must be positive and finite.") from exc
-    if not np.isfinite(kernel_bandwidth) or kernel_bandwidth <= 0:
-        raise ValueError("bandwidth must be positive and finite.")
+    dose_values = np.asarray(_POSITIVE_GRID.validate_python(doses), dtype=float)
+    kernel_bandwidth = bandwidth
     try:
         _require_columns(events, ["firm_id", "cohort", "dose"], "events")
     except ValueError:
@@ -1664,7 +1598,7 @@ def _evaluate_theta(
             The model has no successful current fit.
     """
     model._require_fitted()
-    dose_values = _validate_doses(doses)
+    dose_values = np.asarray(_POSITIVE_GRID.validate_python(doses), dtype=float)
     resolved_event_times = model._resolve_event_times(event_times)
     design_events = model.events_.loc[model.events_["design_eligible"]]
     n_firms_design = len(design_events)
@@ -2139,16 +2073,17 @@ def _bootstrap_horizon(
     return estimates
 
 
+@pydantic.validate_call(config=_VALIDATION_CONFIG)
 def bootstrap_theta(
     model: ATT,
-    doses: Iterable[float],
+    doses: pydantic.SkipValidation[Iterable[float]],
     *,
     outcomes: pd.DataFrame,
-    bandwidth: float,
-    event_times: Iterable[int] | None = None,
-    n_bootstrap: int = 1999,
-    confidence_level: float = 0.95,
-    random_state: int | None = None,
+    bandwidth: _PositiveReal,
+    event_times: pydantic.SkipValidation[Iterable[int] | None] = None,
+    n_bootstrap: Annotated[_Integer, pydantic.Field(ge=2)] = 1999,
+    confidence_level: Annotated[_Real, pydantic.Field(gt=0, lt=1)] = 0.95,
+    random_state: Annotated[_Integer, pydantic.Field(ge=0)] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Bootstrap dose-specific event-study effects by resampling entire firms.
 
@@ -2205,13 +2140,8 @@ def bootstrap_theta(
             unexpected regression or numerical calculations fail.
     """
     model._require_fitted()
-    n_bootstrap = _integer(n_bootstrap, "n_bootstrap", 2)
-    seed = None if random_state is None else _integer(random_state, "random_state", 0)
-    try:
-        level = _BootstrapOptions(confidence_level=confidence_level).confidence_level
-    except pydantic.ValidationError:
-        raise ValueError("confidence_level must be finite and strictly between zero and one.") from None
-    dose_values = np.sort(_validate_doses(doses))
+    level = confidence_level
+    dose_values = np.sort(np.asarray(_POSITIVE_GRID.validate_python(doses), dtype=float))
     horizons = model._resolve_event_times(event_times)
     panel = _bootstrap_panel(model, outcomes)
     summary = _evaluate_theta(model, dose_values, bandwidth=bandwidth, event_times=horizons, log_warning=False)
@@ -2222,7 +2152,7 @@ def bootstrap_theta(
         raise ValueError("Saved event firms must belong to the original outcome panel.")
     firm_doses = np.full(n_firms, np.nan)
     firm_doses[event_codes] = model.events_["dose"].to_numpy(dtype=float)
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(random_state)
     estimates = np.full((n_bootstrap, len(horizons), len(dose_values)), np.nan)
     failures: dict[tuple[pd.Timestamp | None, int, str], int] = {}
     for start in range(0, n_bootstrap, 32):

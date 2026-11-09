@@ -45,10 +45,14 @@ values, normalized at a fixed daily frequency. Missing firm-period rows are
 allowed; outcomes on present rows must be finite. The event table must contain
 the complete termination history used for isolation and control selection.
 
-Private Pydantic v2 models validate configuration and input types. Existing
-checks enforce numeric, period, and sample requirements without coercing
-invalid input values. The installed package includes a `py.typed` marker so
-type checkers can use its inline annotations.
+Pydantic v2 `Field` constraints, cached `TypeAdapter` instances, and
+`validate_call` validate configuration and input types. NumPy scalar inputs are
+supported; Boolean values and numeric strings are rejected for numeric
+parameters and dose grids. Grid validation consumes generators once. Table
+contents and sample requirements use vectorized checks. Pydantic validation
+errors are subclasses of `ValueError` and expose structured error details.
+The installed package includes a `py.typed` marker so type checkers can use its
+inline annotations.
 
 The bandwidth helpers accept the raw event table and select the first event per
 firm after normalizing periods. They need no outcome table or fitted model.

@@ -718,14 +718,19 @@ def test_placebo_bootstrap_uses_the_same_fixed_reference_period(
     [
         ("n_bootstrap", 1),
         ("n_bootstrap", True),
+        ("n_bootstrap", np.bool_(True)),
         ("n_bootstrap", 2.5),
         ("confidence_level", 0.0),
         ("confidence_level", 1.0),
         ("confidence_level", float("nan")),
         ("confidence_level", True),
+        ("confidence_level", np.bool_(True)),
         ("random_state", -1),
         ("random_state", True),
+        ("random_state", np.bool_(True)),
         ("bandwidth", 0.0),
+        ("bandwidth", np.bool_(True)),
+        ("bandwidth", "0.9"),
     ],
 )
 def test_bootstrap_rejects_invalid_configuration_before_sampling(
@@ -754,6 +759,41 @@ def test_bootstrap_rejects_invalid_configuration_before_sampling(
     monkeypatch.setattr(att, "_bootstrap_counts", unittest.mock.Mock(side_effect=AssertionError("Unexpected sampling")))
     with pytest.raises(ValueError, match=name):
         att.bootstrap_theta(bootstrap_model, DOSES, **options)
+
+
+def test_bootstrap_accepts_numpy_options_and_single_pass_grids(
+    bootstrap_panel: Panel,
+    bootstrap_model: att.ATT,
+) -> None:
+    """Preserve seeded bootstrap results after validating NumPy and iterator inputs.
+
+    Args:
+        bootstrap_panel:
+            Original outcome and event tables.
+        bootstrap_model:
+            Successfully fitted estimator with bootstrap metadata.
+    """
+    outcomes, _ = bootstrap_panel
+    expected = att.bootstrap_theta(
+        bootstrap_model,
+        DOSES.tolist(),
+        outcomes=outcomes,
+        bandwidth=BANDWIDTH,
+        event_times=[-1, 0],
+        n_bootstrap=3,
+        random_state=23,
+    )
+    options: dict[str, Any] = {
+        "outcomes": outcomes,
+        "bandwidth": np.float64(BANDWIDTH),
+        "event_times": iter(np.asarray([-1, 0], dtype=np.int64)),
+        "n_bootstrap": np.int64(3),
+        "confidence_level": np.float64(0.95),
+        "random_state": np.int64(23),
+    }
+    actual = att.bootstrap_theta(bootstrap_model, iter(DOSES), **options)
+    for observed, reference in zip(actual, expected, strict=True):
+        pd_testing.assert_frame_equal(observed, reference)
 
 
 def test_unfitted_and_legacy_models_require_a_successful_current_fit(

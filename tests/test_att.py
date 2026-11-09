@@ -10,6 +10,7 @@ import numpy.testing as np_testing
 import numpy.typing as npt
 import pandas as pd
 import pandas.testing as pd_testing
+import pydantic
 import pytest
 import scipy.interpolate
 
@@ -960,22 +961,77 @@ def test_runtime_validation_preserves_numpy_scalar_configuration(panel: Panel, m
     pd_testing.assert_frame_equal(fitted.predict([5.0, 7.0]), model.predict([5.0, 7.0]))
 
 
+def test_prediction_and_aggregation_accept_single_pass_iterables(model: att.ATT) -> None:
+    """Consume each requested dose and horizon iterator only once.
+
+    Args:
+        model:
+            Successfully fitted estimator using the reference configuration.
+    """
+    doses = np.asarray([5.0, 7.0], dtype=np.float32)
+    horizons = np.asarray([-2, 0, 2], dtype=np.int64)
+    aggregate: Callable[..., pd.DataFrame] = att.evaluate_theta
+    expected_prediction = model.predict(doses.tolist(), event_times=horizons.tolist())
+    expected_theta = att.evaluate_theta(model, doses.tolist(), event_times=horizons.tolist(), bandwidth=1.2)
+    pd_testing.assert_frame_equal(model.predict(iter(doses), event_times=iter(horizons)), expected_prediction)
+    pd_testing.assert_frame_equal(
+        aggregate(model, iter(doses), event_times=iter(horizons), bandwidth=np.float64(1.2)),
+        expected_theta,
+    )
+
+
 @pytest.mark.parametrize(
-    ("argument", "value", "message"),
-    [
-        ("degree", True, "degree must be an integer"),
-        ("degree", np.bool_(True), "degree must be an integer"),
-        ("degree", "3", "degree must be an integer"),
-        ("degree", 3.0, "degree must be an integer"),
-        ("min_cohort_size", True, "min_cohort_size must be an integer"),
-        ("min_cohort_size", "5", "min_cohort_size must be an integer"),
-        ("min_cohort_size", 5.0, "min_cohort_size must be an integer"),
-        ("firm_col", 1, "All four column-name arguments must be nonempty strings"),
-        ("dose_col", "", "All four column-name arguments must be nonempty strings"),
-        ("period_col", "firm", "Mapped column names must be distinct within each table"),
+    "doses",
+    [[], [0.0], [-1.0], [np.nan], [np.inf], [5.0, 5.0], ["5"], [True], [np.bool_(True)], [True, 5.0], [[5.0]], 5.0],
+    ids=[
+        "empty",
+        "zero",
+        "negative",
+        "nan",
+        "infinite",
+        "duplicate",
+        "text",
+        "bool",
+        "numpy_bool",
+        "mixed_bool",
+        "matrix",
+        "scalar",
     ],
 )
-def test_runtime_validation_does_not_coerce_configuration(argument: str, value: object, message: str) -> None:
+def test_invalid_prediction_grids_are_rejected_consistently(model: att.ATT, doses: object) -> None:
+    """Apply the same dose restrictions to prediction and aggregation.
+
+    Args:
+        model:
+            Successfully fitted estimator using the reference configuration.
+        doses:
+            Invalid dose collection that must not reach curve evaluation.
+    """
+    predict: Callable[..., pd.DataFrame] = model.predict
+    aggregate: Callable[..., pd.DataFrame] = att.evaluate_theta
+    with pytest.raises(ValueError, match=r"doses|validation"):
+        predict(doses, event_times=[0])
+    with pytest.raises(ValueError, match=r"doses|validation"):
+        aggregate(model, doses, event_times=[0], bandwidth=1.2)
+
+
+@pytest.mark.parametrize(
+    ("argument", "value", "error_type"),
+    [
+        ("degree", True, "int_type"),
+        ("degree", np.bool_(True), "int_type"),
+        ("degree", "3", "int_type"),
+        ("degree", 3.0, "int_type"),
+        ("degree", 0, "greater_than_equal"),
+        ("min_cohort_size", True, "int_type"),
+        ("min_cohort_size", "5", "int_type"),
+        ("min_cohort_size", 5.0, "int_type"),
+        ("min_cohort_size", 0, "greater_than_equal"),
+        ("firm_col", 1, "string_type"),
+        ("dose_col", "", "string_too_short"),
+    ],
+)
+def test_runtime_validation_does_not_coerce_configuration(argument: str, value: object, error_type: str) -> None:
     """Preserve strict constructor validation when using runtime schemas.
 
     Args:
@@ -983,13 +1039,22 @@ def test_runtime_validation_does_not_coerce_configuration(argument: str, value: 
             Configuration argument to replace with an invalid value.
         value:
             Value that must not be coerced into an accepted configuration.
-        message:
-            Existing validation error message that callers should still receive.
+        error_type:
+            Pydantic error identifying the violated field constraint.
     """
     constructor: Callable[..., att.ATT] = att.ATT
     arguments: dict[str, object] = {**MAPPINGS, argument: value}
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(pydantic.ValidationError) as error:
         constructor(**arguments)
+    assert [(item["loc"], item["type"]) for item in error.value.errors()] == [((argument,), error_type)]
+
+
+def test_runtime_validation_rejects_overlapping_column_names() -> None:
+    """Require distinct identifier and period columns within each input table."""
+    mappings = MAPPINGS.copy()
+    mappings["period_col"] = "firm"
+    with pytest.raises(ValueError, match="Mapped column names must be distinct within each table"):
+        att.ATT(**mappings)
 
 
 def test_runtime_validation_accepts_dataframe_subclasses(panel: Panel, model: att.ATT) -> None:
@@ -1012,12 +1077,19 @@ def test_runtime_validation_accepts_dataframe_subclasses(panel: Panel, model: at
 
 @pytest.mark.parametrize("argument", ["outcomes", "events"])
 @pytest.mark.parametrize("value", [{}, []], ids=["mapping", "list"])
-def test_runtime_validation_does_not_coerce_input_tables(panel: Panel, argument: str, value: object) -> None:
+def test_runtime_validation_does_not_coerce_input_tables(
+    panel: Panel,
+    model: att.ATT,
+    argument: str,
+    value: object,
+) -> None:
     """Reject mappings and row sequences instead of converting them to tables.
 
     Args:
         panel:
             Fresh synthetic outcome and event tables.
+        model:
+            Successfully fitted estimator whose state must be invalidated.
         argument:
             Input table to replace with a non-DataFrame object.
         value:
@@ -1025,10 +1097,14 @@ def test_runtime_validation_does_not_coerce_input_tables(panel: Panel, argument:
     """
     outcomes, events = panel
     inputs = {"outcomes": outcomes, "events": events, argument: value}
-    fitted = att.ATT(**MAPPINGS)
-    fit: Callable[..., att.ATT] = fitted.fit
-    with pytest.raises(ValueError, match=f"{argument} must be a pandas DataFrame"):
+    fit: Callable[..., att.ATT] = model.fit
+    with pytest.raises(pydantic.ValidationError) as error:
         fit(**inputs, isolation_window=WINDOW)
+    assert [(item["loc"], item["type"]) for item in error.value.errors()] == [((argument,), "is_instance_of")]
+    assert not model.models_
+    assert model.outcome_fingerprint_ is None
+    with pytest.raises(RuntimeError, match="successfully fitted"):
+        model.predict([7.0])
 
 
 def test_normalization_renaming_and_input_order_preserve_estimates(
@@ -1116,8 +1192,11 @@ def test_positive_isolation_lower_bound_is_rejected(panel: Panel) -> None:
             Fresh synthetic outcome and event tables.
     """
     outcomes, events = panel
-    with pytest.raises(ValueError, match="lower <= -1"):
+    with pytest.raises(pydantic.ValidationError) as error:
         att.ATT(**MAPPINGS).fit(outcomes, events, isolation_window=(2, 3))
+    assert [(item["loc"], item["type"]) for item in error.value.errors()] == [
+        (("isolation_window", 0), "less_than_equal"),
+    ]
 
 
 def test_failed_refit_invalidates_prior_predictions(panel: Panel) -> None:
@@ -1142,6 +1221,32 @@ def test_failed_refit_invalidates_prior_predictions(panel: Panel) -> None:
     assert not fitted.models_
     with pytest.raises(RuntimeError, match="successfully fitted"):
         fitted.predict([7.0])
+
+
+@pytest.mark.parametrize(
+    "invalid_window",
+    [(False, 3), (np.bool_(False), 3), (-2.0, 3), ("-2", 3), (-2,), (-2, 3, 4), None],
+    ids=["bool", "numpy_bool", "float", "text", "short", "long", "none"],
+)
+def test_invalid_refit_window_clears_fitted_state(panel: Panel, model: att.ATT, invalid_window: object) -> None:
+    """Invalidate an existing fit before rejecting malformed window inputs.
+
+    Args:
+        panel:
+            Original outcome and event tables.
+        model:
+            Estimator with a successful fit before this replacement attempt.
+        invalid_window:
+            Invalid offset types or an invalid number of endpoints.
+    """
+    outcomes, events = panel
+    fit: Callable[..., att.ATT] = model.fit
+    with pytest.raises(ValueError, match=r"isolation_window|offset|validation"):
+        fit(outcomes, events, isolation_window=invalid_window)
+    assert not model.models_
+    assert model.outcome_fingerprint_ is None
+    with pytest.raises(RuntimeError, match="successfully fitted"):
+        model.predict([7.0])
 
 
 def test_kernel_weights_count_only_the_supplied_firms_once(
@@ -1169,6 +1274,24 @@ def test_kernel_weights_count_only_the_supplied_firms_once(
         actual = weights.loc[weights["dose"] == dose].set_index("cohort")["weight"]
         np_testing.assert_allclose(actual.reindex(expected.index), expected, atol=1e-14)
         assert actual.sum() == pytest.approx(1.0, rel=0.0, abs=5e-8)
+
+
+def test_kernel_accepts_numpy_scalars_and_single_pass_iterables(kernel_events: pd.DataFrame) -> None:
+    """Preserve kernel weights for NumPy scalar and iterator inputs.
+
+    Args:
+        kernel_events:
+            Canonical first-event metadata with an explicitly excluded firm.
+    """
+    expected = att.estimate_pi(kernel_events, [4.5, 8.5], eligible_firms=["a", "b", "c"], bandwidth=1.2)
+    estimate: Callable[..., pd.DataFrame] = att.estimate_pi
+    actual = estimate(
+        kernel_events,
+        iter(np.asarray([4.5, 8.5], dtype=np.float32)),
+        eligible_firms=iter(["a", "b", "c"]),
+        bandwidth=np.float64(1.2),
+    )
+    pd_testing.assert_frame_equal(actual, expected)
 
 
 @pytest.mark.parametrize(
@@ -1635,6 +1758,28 @@ def test_bandwidth_estimators_reject_invalid_samples(
         eligible = ["unknown"]
     with pytest.raises(ValueError, match=message):
         estimator(bandwidth_events, **EVENT_MAPPINGS, eligible_firms=eligible)
+
+
+@pytest.mark.parametrize("estimator", [att.estimate_h0, att.estimate_h_cv], ids=["h0", "cv"])
+@pytest.mark.parametrize("name", [b"firm", 1, ""], ids=["bytes", "number", "empty"])
+def test_bandwidth_estimators_do_not_coerce_column_names(
+    bandwidth_events: pd.DataFrame,
+    estimator: Callable[..., object],
+    name: object,
+) -> None:
+    """Reject non-string or empty mappings consistently across bandwidth selectors.
+
+    Args:
+        bandwidth_events:
+            Fresh raw first-event table with repeated doses.
+        estimator:
+            Bandwidth-selection function under test.
+        name:
+            Invalid firm-column mapping that must not be coerced into a string.
+    """
+    arguments = {**EVENT_MAPPINGS, "firm_col": name}
+    with pytest.raises(ValueError, match=r"column|firm_col"):
+        estimator(bandwidth_events, **arguments)
 
 
 def test_bandwidth_cv_requires_multiple_cohorts(bandwidth_events: pd.DataFrame) -> None:
