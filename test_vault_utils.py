@@ -1,16 +1,19 @@
 """Unit tests for Vault settings and clients without a live Vault server."""
 
 import os
-from types import SimpleNamespace
+import random
+import time
+from pathlib import Path
+from typing import NamedTuple, TypedDict
 from unittest.mock import Mock, call
 
+import hvac
 import pydantic
 import pytest
 import requests
 from hvac import exceptions as vault_exceptions
 
 import vault_utils
-
 
 VALID_FILENAMES = ["warehouse", ".hidden", "name..", "name with spaces", "данные", r"name\with\backslashes"]
 INVALID_FILENAMES = [
@@ -19,19 +22,46 @@ INVALID_FILENAMES = [
 ]
 
 
+class VaultBackend(NamedTuple):
+    client: Mock
+    constructor: Mock
+    sleep: Mock
+    jitter: Mock
+
+
+class AirflowClientFixture(NamedTuple):
+    client: vault_utils.VaultAirflowClient
+    config: vault_utils.VaultAirflowConfig
+    backend: Mock
+    constructor: Mock
+
+
+class RetryOptions(TypedDict, total=False):
+    initial_delay: float
+    delay_jitter: float
+    attempts: int
+
+
+AuthCredentials = TypedDict(
+    "AuthCredentials",
+    {"role_id": str, "secret_id": str, "role-id": str, "secret-id": str},
+    total=False,
+)
+
+
 @pytest.mark.parametrize("filename", VALID_FILENAMES)
-def test_validate_filename_preserves_valid_posix_filenames(filename):
+def test_validate_filename_preserves_valid_posix_filenames(filename: str) -> None:
     assert vault_utils.validate_filename(filename) == filename
 
 
 @pytest.mark.parametrize("filename", INVALID_FILENAMES)
-def test_validate_filename_rejects_paths_and_invalid_filenames(filename):
+def test_validate_filename_rejects_paths_and_invalid_filenames(filename: str) -> None:
     with pytest.raises(vault_utils.InvalidFilenameError, match="Invalid POSIX filename"):
         vault_utils.validate_filename(filename)
 
 
 @pytest.fixture(autouse=True)
-def clean_vault_environment(monkeypatch):
+def clean_vault_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep settings tests independent of the developer's credentials."""
     settings_names = {
         "approle_path", "url", "role_id", "role-id", "secret_id", "secret-id",
@@ -43,24 +73,24 @@ def clean_vault_environment(monkeypatch):
 
 
 @pytest.fixture
-def auth():
+def auth() -> vault_utils.VaultAuthConfig:
     return vault_utils.VaultAuthConfig(
         url="https://vault.example.test", role_id="test-role", secret_id="test-secret",
     )
 
 
 @pytest.fixture
-def vault_backend(monkeypatch):
+def vault_backend(monkeypatch: pytest.MonkeyPatch) -> VaultBackend:
     backend = Mock()
     backend.is_authenticated.return_value = True
     backend.secrets.kv.v2.read_secret.return_value = {"data": {"data": {"password": "value"}}}
     constructor = Mock(return_value=backend)
     sleep = Mock()
     jitter = Mock(return_value=0.02)
-    monkeypatch.setattr(vault_utils.hvac, "Client", constructor)
-    monkeypatch.setattr(vault_utils.time, "sleep", sleep)
-    monkeypatch.setattr(vault_utils.random, "uniform", jitter)
-    return SimpleNamespace(client=backend, constructor=constructor, sleep=sleep, jitter=jitter)
+    monkeypatch.setattr(hvac, "Client", constructor)
+    monkeypatch.setattr(time, "sleep", sleep)
+    monkeypatch.setattr(random, "uniform", jitter)
+    return VaultBackend(client=backend, constructor=constructor, sleep=sleep, jitter=jitter)
 
 
 @pytest.mark.parametrize(
@@ -70,7 +100,7 @@ def vault_backend(monkeypatch):
         {"role-id": "test-role", "secret-id": "test-secret"},
     ],
 )
-def test_auth_config_accepts_field_names_and_aliases(credentials):
+def test_auth_config_accepts_field_names_and_aliases(credentials: AuthCredentials) -> None:
     config = vault_utils.VaultAuthConfig(url="https://vault.example.test", **credentials)
 
     assert config.role_id == "test-role"
@@ -79,8 +109,8 @@ def test_auth_config_accepts_field_names_and_aliases(credentials):
     assert config.verify is True
 
 
-@pytest.mark.parametrize("value, expected", [("false", False), ("true", True), ("/certs/ca.pem", "/certs/ca.pem")])
-def test_auth_config_parses_tls_verification(value, expected):
+@pytest.mark.parametrize(("value", "expected"), [("false", False), ("true", True), ("/certs/ca.pem", "/certs/ca.pem")])
+def test_auth_config_parses_tls_verification(value: str, expected: bool | str) -> None:
     config = vault_utils.VaultAuthConfig(
         url="https://vault.example.test", role_id="role", secret_id="secret", verify=value,
     )
@@ -88,25 +118,28 @@ def test_auth_config_parses_tls_verification(value, expected):
     assert config.verify == expected
 
 
-def test_auth_config_requires_credentials():
+def test_auth_config_requires_credentials() -> None:
     with pytest.raises(pydantic.ValidationError) as exc_info:
         vault_utils.VaultAuthConfig()
 
     assert {error["loc"][0] for error in exc_info.value.errors()} == {"url", "role-id", "secret-id"}
 
 
-def test_config_is_frozen_and_rejects_extra_fields(auth):
+def test_config_is_frozen_and_rejects_extra_fields(auth: vault_utils.VaultAuthConfig) -> None:
     config = vault_utils.SimpleVaultConfig(meta=vault_utils.VaultMetaConfig(), auth=auth)
 
-    with pytest.raises(pydantic.ValidationError, match="frozen"):
-        config.auth = auth
-    with pytest.raises(pydantic.ValidationError, match="frozen"):
-        config.auth.url = "https://other.example.test"
+    frozen_updates: list[tuple[pydantic.BaseModel, str, object]] = [
+        (config, "auth", auth),
+        (config.auth, "url", "https://other.example.test"),
+    ]
+    for model, field_name, value in frozen_updates:
+        with pytest.raises(pydantic.ValidationError, match="frozen"):
+            setattr(model, field_name, value)
     with pytest.raises(pydantic.ValidationError, match="Extra inputs"):
-        vault_utils.SimpleVaultConfig(meta=config.meta, auth=auth, unknown="value")
+        vault_utils.SimpleVaultConfig.model_validate({"meta": config.meta, "auth": auth, "unknown": "value"})
 
 
-def test_meta_config_requires_an_existing_approle_directory(tmp_path):
+def test_meta_config_requires_an_existing_approle_directory(tmp_path: Path) -> None:
     file_path = tmp_path / "not-a-directory"
     file_path.write_text("content")
 
@@ -115,7 +148,7 @@ def test_meta_config_requires_an_existing_approle_directory(tmp_path):
             vault_utils.VaultMetaConfig(approle_path=invalid_path)
 
 
-def test_airflow_config_from_env_file(tmp_path):
+def test_airflow_config_from_env_file(tmp_path: Path) -> None:
     env_file = tmp_path / "vault.env"
     env_file.write_text(
         "URL=https://vault.example.test\nROLE-ID=file-role\nSECRET-ID=file-secret\n"
@@ -134,7 +167,7 @@ def test_airflow_config_from_env_file(tmp_path):
     assert config.auth.verify is False
 
 
-def test_config_from_env_file_reads_approle_secret_files(tmp_path):
+def test_config_from_env_file_reads_approle_secret_files(tmp_path: Path) -> None:
     secrets_dir = tmp_path / "approle"
     secrets_dir.mkdir()
     (secrets_dir / "role-id").write_text("file-role\n")
@@ -149,7 +182,7 @@ def test_config_from_env_file_reads_approle_secret_files(tmp_path):
     assert config.auth.secret_id.get_secret_value() == "file-secret"
 
 
-def test_config_from_env_uses_case_insensitive_prefixed_names(monkeypatch):
+def test_config_from_env_uses_case_insensitive_prefixed_names(monkeypatch: pytest.MonkeyPatch) -> None:
     for name, value in {
         "vault_url": "https://vault.example.test", "VAULT_ROLE_ID": "env-role",
         "Vault_Secret_Id": "env-secret", "VAULT_VERIFY": "false",
@@ -167,7 +200,7 @@ def test_config_from_env_uses_case_insensitive_prefixed_names(monkeypatch):
     assert config.auth.verify is False
 
 
-def test_config_from_env_reads_unprefixed_secret_filenames(tmp_path, monkeypatch):
+def test_config_from_env_reads_unprefixed_secret_filenames(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "role-id").write_text("file-role")
     (tmp_path / "secret-id").write_text("file-secret")
     monkeypatch.setenv("VAULT_URL", "https://vault.example.test")
@@ -179,13 +212,15 @@ def test_config_from_env_reads_unprefixed_secret_filenames(tmp_path, monkeypatch
     assert config.auth.secret_id.get_secret_value() == "file-secret"
 
 
-def test_airflow_meta_config_rejects_unknown_environment():
+def test_airflow_meta_config_rejects_unknown_environment() -> None:
     with pytest.raises(pydantic.ValidationError, match="env"):
         vault_utils.VaultAirflowMetaConfig(env="qa", mount_point="airflow-secrets")
 
 
 @pytest.mark.parametrize("verify", [False, True, "/certs/ca.pem"])
-def test_client_copies_auth_and_passes_tls_settings(auth, vault_backend, verify):
+def test_client_copies_auth_and_passes_tls_settings(
+    auth: vault_utils.VaultAuthConfig, vault_backend: VaultBackend, verify: bool | str,
+) -> None:
     auth = auth.model_copy(update={"verify": verify})
 
     client = vault_utils.VaultClient(auth)
@@ -197,7 +232,7 @@ def test_client_copies_auth_and_passes_tls_settings(auth, vault_backend, verify)
 
 
 @pytest.mark.parametrize(
-    "kwargs, message",
+    ("kwargs", "message"),
     [
         ({"initial_delay": -0.1}, "initial_delay"),
         ({"delay_jitter": -0.1}, "delay_jitter"),
@@ -205,7 +240,9 @@ def test_client_copies_auth_and_passes_tls_settings(auth, vault_backend, verify)
         ({"attempts": -1}, "attempts"),
     ],
 )
-def test_client_rejects_invalid_retry_options(auth, vault_backend, kwargs, message):
+def test_client_rejects_invalid_retry_options(
+    auth: vault_utils.VaultAuthConfig, vault_backend: VaultBackend, kwargs: RetryOptions, message: str,
+) -> None:
     with pytest.raises(ValueError, match=message):
         vault_utils.VaultClient(auth, **kwargs)
 
@@ -214,7 +251,9 @@ def test_client_rejects_invalid_retry_options(auth, vault_backend, kwargs, messa
 
 @pytest.mark.parametrize("authenticated", [True, False])
 @pytest.mark.parametrize("secret", [{}, {"username": "user", "password": "value"}])
-def test_read_secret_authenticates_only_when_needed(auth, vault_backend, authenticated, secret):
+def test_read_secret_authenticates_only_when_needed(
+    auth: vault_utils.VaultAuthConfig, vault_backend: VaultBackend, authenticated: bool, secret: dict[str, str],
+) -> None:
     vault_backend.client.is_authenticated.return_value = authenticated
     vault_backend.client.secrets.kv.v2.read_secret.return_value = {"data": {"data": secret}}
     client = vault_utils.VaultClient(auth)
@@ -234,7 +273,9 @@ def test_read_secret_authenticates_only_when_needed(auth, vault_backend, authent
 
 
 @pytest.mark.parametrize("response", [None, {}, {"data": None}, {"data": {}}, {"data": []}])
-def test_read_secret_rejects_malformed_responses_without_retry(auth, vault_backend, response):
+def test_read_secret_rejects_malformed_responses_without_retry(
+    auth: vault_utils.VaultAuthConfig, vault_backend: VaultBackend, response: object,
+) -> None:
     vault_backend.client.secrets.kv.v2.read_secret.return_value = response
     client = vault_utils.VaultClient(auth)
 
@@ -247,7 +288,9 @@ def test_read_secret_rejects_malformed_responses_without_retry(auth, vault_backe
 
 
 @pytest.mark.parametrize("secret", [None, [], "text", {"password": 42}, {1: "value"}, {"nested": {}}])
-def test_read_secret_rejects_invalid_values_without_retry(auth, vault_backend, secret):
+def test_read_secret_rejects_invalid_values_without_retry(
+    auth: vault_utils.VaultAuthConfig, vault_backend: VaultBackend, secret: object,
+) -> None:
     vault_backend.client.secrets.kv.v2.read_secret.return_value = {"data": {"data": secret}}
     client = vault_utils.VaultClient(auth)
 
@@ -260,7 +303,7 @@ def test_read_secret_rejects_invalid_values_without_retry(auth, vault_backend, s
 
 
 @pytest.mark.parametrize(
-    "error_type, expected_type",
+    ("error_type", "expected_type"),
     [
         (vault_exceptions.Forbidden, vault_utils.VaultPermissionDeniedError),
         (vault_exceptions.InvalidPath, vault_utils.VaultInvalidPathError),
@@ -268,8 +311,9 @@ def test_read_secret_rejects_invalid_values_without_retry(auth, vault_backend, s
 )
 @pytest.mark.parametrize("operation", ["login", "read"])
 def test_read_secret_translates_permanent_errors_without_retry(
-    auth, vault_backend, error_type, expected_type, operation,
-):
+    auth: vault_utils.VaultAuthConfig, vault_backend: VaultBackend, error_type: type[Exception],
+    expected_type: type[vault_utils.VaultQueryError], operation: str,
+) -> None:
     error = error_type("Vault rejected the request")
     if operation == "login":
         vault_backend.client.is_authenticated.return_value = False
@@ -288,7 +332,9 @@ def test_read_secret_translates_permanent_errors_without_retry(
 
 
 @pytest.mark.parametrize("error_type", [requests.ConnectionError, vault_exceptions.VaultError])
-def test_read_secret_retries_transient_failures(auth, vault_backend, error_type):
+def test_read_secret_retries_transient_failures(
+    auth: vault_utils.VaultAuthConfig, vault_backend: VaultBackend, error_type: type[Exception],
+) -> None:
     vault_backend.client.secrets.kv.v2.read_secret.side_effect = [
         error_type("temporary failure"), {"data": {"data": {"password": "value"}}},
     ]
@@ -304,7 +350,9 @@ def test_read_secret_retries_transient_failures(auth, vault_backend, error_type)
     vault_backend.sleep.assert_called_once_with(pytest.approx(0.12))
 
 
-def test_read_secret_retries_login_and_clamps_negative_sleep(auth, vault_backend):
+def test_read_secret_retries_login_and_clamps_negative_sleep(
+    auth: vault_utils.VaultAuthConfig, vault_backend: VaultBackend,
+) -> None:
     vault_backend.client.is_authenticated.return_value = False
     vault_backend.client.auth.approle.login.side_effect = [requests.ConnectionError("offline"), None]
     vault_backend.jitter.return_value = -0.5
@@ -319,7 +367,9 @@ def test_read_secret_retries_login_and_clamps_negative_sleep(auth, vault_backend
 
 @pytest.mark.parametrize("error_type", [requests.ConnectionError, vault_exceptions.VaultError])
 @pytest.mark.parametrize("attempts", [1, 3])
-def test_read_secret_stops_at_attempt_limit_and_chains_last_error(auth, vault_backend, error_type, attempts):
+def test_read_secret_stops_at_attempt_limit_and_chains_last_error(
+    auth: vault_utils.VaultAuthConfig, vault_backend: VaultBackend, error_type: type[Exception], attempts: int,
+) -> None:
     errors = [error_type(f"failure {index}") for index in range(attempts)]
     vault_backend.client.secrets.kv.v2.read_secret.side_effect = errors
     client = vault_utils.VaultClient(auth, attempts=attempts)
@@ -332,7 +382,7 @@ def test_read_secret_stops_at_attempt_limit_and_chains_last_error(auth, vault_ba
 
 
 @pytest.fixture
-def airflow_client(auth, monkeypatch):
+def airflow_client(auth: vault_utils.VaultAuthConfig, monkeypatch: pytest.MonkeyPatch) -> AirflowClientFixture:
     config = vault_utils.VaultAirflowConfig(
         meta=vault_utils.VaultAirflowMetaConfig(env="stage", mount_point="airflow-secrets"),
         auth=auth,
@@ -341,10 +391,10 @@ def airflow_client(auth, monkeypatch):
     constructor = Mock(return_value=backend)
     monkeypatch.setattr(vault_utils, "VaultClient", constructor)
     client = vault_utils.VaultAirflowClient(config)
-    return SimpleNamespace(client=client, config=config, backend=backend, constructor=constructor)
+    return AirflowClientFixture(client=client, config=config, backend=backend, constructor=constructor)
 
 
-def test_airflow_client_copies_config(airflow_client):
+def test_airflow_client_copies_config(airflow_client: AirflowClientFixture) -> None:
     copied = airflow_client.client.config
 
     assert copied == airflow_client.config
@@ -355,7 +405,9 @@ def test_airflow_client_copies_config(airflow_client):
 
 
 @pytest.mark.parametrize("conn_id", VALID_FILENAMES)
-def test_airflow_client_reads_connection_from_environment_directory(airflow_client, conn_id):
+def test_airflow_client_reads_connection_from_environment_directory(
+    airflow_client: AirflowClientFixture, conn_id: str,
+) -> None:
     airflow_client.backend.read_secret.return_value = {"host": "database.example.test"}
 
     result = airflow_client.client.get_connection(conn_id)
@@ -367,15 +419,15 @@ def test_airflow_client_reads_connection_from_environment_directory(airflow_clie
 
 
 @pytest.mark.parametrize("conn_id", INVALID_FILENAMES)
-def test_airflow_client_rejects_connection_paths(airflow_client, conn_id):
-    with pytest.raises(vault_utils.InvalidFilenameError, match="conn_id.*filename") as exc_info:
+def test_airflow_client_rejects_connection_paths(airflow_client: AirflowClientFixture, conn_id: str) -> None:
+    with pytest.raises(vault_utils.InvalidFilenameError, match=r"conn_id.*filename") as exc_info:
         airflow_client.client.get_connection(conn_id)
 
     assert isinstance(exc_info.value.__cause__, vault_utils.InvalidFilenameError)
     airflow_client.backend.read_secret.assert_not_called()
 
 
-def test_airflow_client_preserves_vault_errors(airflow_client):
+def test_airflow_client_preserves_vault_errors(airflow_client: AirflowClientFixture) -> None:
     error = vault_utils.VaultPermissionDeniedError("access denied")
     airflow_client.backend.read_secret.side_effect = error
 
