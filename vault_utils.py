@@ -18,7 +18,7 @@ import requests
 from hvac import exceptions as vault_exceptions
 
 
-class InvalidFilenameError(ValueError):
+class InvalidFilenameError(Exception):
     """The value is not a valid POSIX filename."""
 
 
