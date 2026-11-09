@@ -26,7 +26,7 @@ def test_validate_filename_preserves_valid_posix_filenames(filename):
 
 @pytest.mark.parametrize("filename", INVALID_FILENAMES)
 def test_validate_filename_rejects_paths_and_invalid_filenames(filename):
-    with pytest.raises(ValueError, match="Invalid POSIX filename"):
+    with pytest.raises(vault_utils.InvalidFilenameError, match="Invalid POSIX filename"):
         vault_utils.validate_filename(filename)
 
 
@@ -368,9 +368,10 @@ def test_airflow_client_reads_connection_from_environment_directory(airflow_clie
 
 @pytest.mark.parametrize("conn_id", INVALID_FILENAMES)
 def test_airflow_client_rejects_connection_paths(airflow_client, conn_id):
-    with pytest.raises(ValueError, match="conn_id.*filename"):
+    with pytest.raises(vault_utils.InvalidFilenameError, match="conn_id.*filename") as exc_info:
         airflow_client.client.get_connection(conn_id)
 
+    assert isinstance(exc_info.value.__cause__, vault_utils.InvalidFilenameError)
     airflow_client.backend.read_secret.assert_not_called()
 
 

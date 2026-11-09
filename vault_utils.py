@@ -18,6 +18,10 @@ import requests
 from hvac import exceptions as vault_exceptions
 
 
+class InvalidFilenameError(ValueError):
+    """The value is not a valid POSIX filename."""
+
+
 def validate_filename(filename: str) -> str:
     """Validate a single POSIX filename without accessing the filesystem.
 
@@ -29,11 +33,11 @@ def validate_filename(filename: str) -> str:
         The original filename, unchanged.
 
     Raises:
-        ValueError:
+        InvalidFilenameError:
             If the filename is empty, is '.' or '..', or contains '/' or a null byte.
     """
     if filename in {"", ".", ".."} or "/" in filename or "\0" in filename:
-        raise ValueError(f"Invalid POSIX filename: {filename!r}.")
+        raise InvalidFilenameError(f"Invalid POSIX filename: {filename!r}.")
     return filename
 
 
@@ -348,14 +352,14 @@ class VaultAirflowClient:
             A dictionary containing the Airflow connection credentials.
 
         Raises:
-            ValueError:
+            InvalidFilenameError:
                 If `conn_id` is not a valid POSIX filename.
             Errors raised by `VaultClient.read_secret()`.
         """
         try:
             conn_id = validate_filename(conn_id)
-        except ValueError as exc:
-            raise ValueError(f"`conn_id` must be a valid filename, got {conn_id!r}.") from exc
+        except InvalidFilenameError as exc:
+            raise InvalidFilenameError(f"`conn_id` must be a valid filename, got {conn_id!r}.") from exc
 
         connections_dir = PurePosixPath(self.config.meta.env) / "airflow" / "connections"
         conn_secrets_path = connections_dir / conn_id
