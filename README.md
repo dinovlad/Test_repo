@@ -6,7 +6,9 @@ separate PyFixest polynomial model for each cohort and horizon.
 `estimate_pi()` estimates dose-specific cohort weights; `evaluate_theta()`
 aggregates cohort effects at each dose and horizon. `estimate_h0()` supplies a
 Silverman bandwidth rule, and `estimate_h_cv()` selects a bandwidth by predicting
-cohorts from doses with leave-one-firm-out cross-validation.
+cohorts from doses with leave-one-firm-out cross-validation. `bootstrap_theta()`
+adds pointwise intervals by resampling complete firms and re-estimating both
+the cohort effects and their kernel weights.
 
 Install the pinned environment:
 
@@ -111,7 +113,8 @@ excluded treated firm–horizon rows, restricted horizons, and extrapolated
 component predictions across the requested grid. Its returned flags remain
 available, and evaluation does not change `model.drop_summary_`.
 Horizon -1 is an exact zero reference; earlier horizons are placebo contrasts.
-Estimates have no standard errors or confidence intervals. The identifying
+`predict()` and `evaluate_theta()` return point estimates. Use
+`bootstrap_theta()` for standard errors and pointwise intervals. The identifying
 assumptions, selected populations, diagnostics, and API are described in
 [att.md](att.md).
 
@@ -126,6 +129,79 @@ cubic polynomial has the same fitted curve as a cubic B-spline with no internal
 knots on the same sample, up to numerical precision. Internal-knot splines are
 not supported; there is no `num_knots` parameter. Selection and aggregation
 rules are unchanged by the polynomial parameterization.
+
+## Firm Bootstrap for Pointwise Intervals
+
+```python
+summary, draws, diagnostics = att.bootstrap_theta(
+    model,
+    doses=[4, 6, 8, 10, 12],
+    outcomes=outcomes,
+    bandwidth=bandwidth,
+    event_times=[-2, -1, 0, 7, 14],
+    n_bootstrap=1999,
+    confidence_level=0.95,
+    random_state=42,
+)
+```
+
+Pass the original outcome panel using the model's configured column names.
+`fit()` retains the complete original firm index and a SHA-256 fingerprint of
+the normalized panel, including firms and rows unused by the fitted comparisons.
+Bootstrap verifies this fingerprint; row order, time components within a period,
+and additional unmapped columns do not matter. It does not require the event
+table again or retain another outcome-panel copy on the model. Models without
+these fitted metadata must be fitted before calling the bootstrap.
+
+Each draw samples as many firms as the original panel contains, with replacement.
+Integer sampling counts apply to every use of a firm across periods, cohorts,
+horizons, control roles, and kernel weights. Counts are processed in batches of
+at most 32; comparison data are reconstructed from the supplied panel as needed.
+There is no expanded copy of the panel for each draw. Weighted polynomial solves
+and control means give the same estimates as fitting duplicated comparison rows;
+they do not call PyFixest or `fit()` again. Each cell's coefficients are evaluated
+at every requested dose.
+
+The original retained comparisons, treated/control membership, dose scaling,
+polynomial degree, and selected bandwidth remain fixed. Cohort shares vary with
+the sampled firms. No minimum-size screening is repeated, and excluded
+comparisons do not enter the bootstrap aggregation.
+
+`summary` preserves every `evaluate_theta()` column and adds `standard_error`,
+`ci_lower`, `ci_upper`, `confidence_level`, `n_bootstrap`, `n_success`, `n_failed`,
+`success_rate`, `conditional_on_success`, and `inference_status`. Standard errors
+use sample standard deviations, and intervals use the successful draws' empirical
+percentiles separately at each dose and horizon. At least two successful draws
+are required; otherwise the standard error and bounds are missing. There is no
+additional success-rate cutoff.
+
+A positive-weight cohort with insufficient polynomial rank or no sampled
+controls makes that draw unavailable at the affected horizon, for every requested
+dose. A cohort with no sampled treated firms instead contributes zero. A draw
+with no sampled treated firms anywhere in the horizon is unavailable. At the
+reference horizon -1, positive total treated mass gives an exact zero without
+regression or control checks. With at least two successful reference draws, its
+standard error and both interval bounds are zero.
+
+`draws` contains all attempted replications, including failed estimates as
+missing values, with columns `replicate` (starting at 1), `event_time`, `dose`,
+`theta`, and `success`. `diagnostics` aggregates failures by `cohort`,
+`event_time`, and `reason`, reporting `n_failures`. A global lack of treated firms
+has a missing cohort label. Multiple comparisons can fail in one draw, so summed
+comparison failure counts can exceed the number of failed draws at a horizon.
+Failures are not replaced, and positive-weight cohorts are not dropped and
+renormalized. Unexpected numerical or implementation errors raise exceptions.
+Each bootstrap call emits at most one aggregated warning.
+
+`inference_status` is `ok` when all draws succeed, `successful_draws_only` when
+an interval uses a subset of draws, and `insufficient_successful_draws` when
+fewer than two draws succeed. `conditional_on_success` is true whenever any draw
+fails. It describes the restricted resampling distribution, not guaranteed
+conditional coverage. Inspect the failure counts and reasons when using these
+intervals, especially for small cohorts. The procedure assumes independent firms,
+holds screening and tuning choices fixed, and ignores KDE smoothing bias. The
+intervals are pointwise, not a simultaneous band over doses or horizons. A short
+run can help assess failure frequency before a longer run.
 
 Run validation from the repository root and share `validation.log` here:
 
@@ -142,11 +218,12 @@ python scripts/validate.py --log validation.log
 
 The script records Python and dependency versions, the imported estimator's
 source, pytest results, and formatting, lint, type, and spelling checks.
-Quality checks target the estimator module, its two test modules, shared fixtures
+Quality checks target the estimator module, its three test modules, shared fixtures
 in `tests/conftest.py`, the validation script, and project documentation, so
 unrelated code in a larger project is not scanned.
 When copying these files into an existing project, include
 [tests/test_att.py](tests/test_att.py),
+[tests/test_bootstrap.py](tests/test_bootstrap.py),
 [tests/test_validate.py](tests/test_validate.py), and
 [tests/conftest.py](tests/conftest.py), along with the estimator, its `py.typed`
 marker, the runner, and documentation. Missing required files make validation
@@ -167,7 +244,9 @@ The pytest tests use synthetic data and compare the real PyFixest cell models ag
 independent least-squares calculations, including no-internal-knot B-spline
 reference curves. They cover saved polynomial transformations, cohort weights,
 bandwidth rules and exact leave-one-firm-out scores, aggregation, missing periods, isolation, duplicate events, zero effects, and
-failed-fit handling. A run that does not satisfy the configured Python or runtime
+failed-fit handling. Bootstrap tests compare sampling counts with explicitly
+duplicated comparison rows and cover successful-draw intervals, failures, panel
+fingerprints, and shared firm weights. A run that does not satisfy the configured Python or runtime
 package requirements is marked as a mismatch even if its numerical tests pass.
 The [validation workflow](.github/workflows/validate.yml) runs the tests and
 formatting, lint, type, and spelling checks with Python 3.11 and pinned runtime
@@ -194,9 +273,11 @@ run these commands after restoring all required files:
 
 ```bash
 python -m ruff check --select I --fix src/labor_cost_optimization/att.py \
-    tests/conftest.py tests/test_att.py tests/test_validate.py scripts/validate.py
+    tests/conftest.py tests/test_att.py tests/test_bootstrap.py \
+    tests/test_validate.py scripts/validate.py
 python -m ruff format src/labor_cost_optimization/att.py \
-    tests/conftest.py tests/test_att.py tests/test_validate.py scripts/validate.py
+    tests/conftest.py tests/test_att.py tests/test_bootstrap.py \
+    tests/test_validate.py scripts/validate.py
 python scripts/validate.py --log validation.log
 ```
 

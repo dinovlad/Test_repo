@@ -117,6 +117,70 @@ def model(panel: Panel) -> att.ATT:
 
 
 @pytest.fixture
+def bootstrap_panel(panel: Panel) -> Panel:
+    """Provide heterogeneous curves, shared controls, and an unused sampled firm.
+
+    Args:
+        panel:
+            Fresh synthetic input tables for two cohorts.
+
+    Returns:
+        Outcome and event tables with a horizon-specific treated sample and
+        three shared controls. The final firm has no usable comparison rows.
+    """
+    import numpy as np
+    import pandas as pd
+
+    outcomes, events = panel
+    outcomes = outcomes.copy()
+    origin = pd.Timestamp("2024-01-01")
+    positions = (outcomes["period"] - origin).dt.days.to_numpy()
+    firm_codes = pd.factorize(outcomes["firm"])[0]
+    outcomes["sales"] += 0.13 * ((firm_codes * 7 + positions * 3) % 11)
+    outcomes["sales"] += 0.017 * (firm_codes % 3) * positions**2
+    second = pd.Timestamp("2024-01-10")
+    second_post = outcomes["firm"].str.startswith("B") & outcomes["period"].ge(second)
+    second_doses = outcomes.loc[second_post, "firm"].map(events.set_index("firm")["hours"])
+    second_horizons = (outcomes.loc[second_post, "period"] - second).dt.days
+    outcomes.loc[second_post, "sales"] += 0.25 * second_doses * (second_horizons + 1)
+    rows = []
+    for position, period in enumerate(pd.date_range(origin, periods=24)):
+        rows.append(("C1", period, 250.0 + 2.2 * position + 0.015 * position**2 + 0.11 * np.sin(position)))
+        rows.append(("C2", period, 400.0 + 4.1 * position + 0.11 * position**2 - 0.07 * np.cos(position)))
+    rows.append(("unused", origin, 70.0))
+    outcomes = pd.concat([outcomes, pd.DataFrame(rows, columns=outcomes.columns)], ignore_index=True)
+    missing = outcomes["firm"].eq("A5") & outcomes["period"].eq(pd.Timestamp("2024-01-09"))
+    return outcomes.loc[~missing].reset_index(drop=True), events.copy()
+
+
+@pytest.fixture
+def bootstrap_model(bootstrap_panel: Panel) -> att.ATT:
+    """Fit the heterogeneous bootstrap fixture without sharing estimator state.
+
+    Args:
+        bootstrap_panel:
+            This test's outcome panel and complete event table.
+
+    Returns:
+        A cubic estimator with two cohorts and horizons minus one through two.
+
+    Raises:
+        ValueError:
+            If the synthetic panel violates input or comparison requirements.
+        RuntimeError:
+            If a required polynomial regression cannot be fitted.
+    """
+    import labor_cost_optimization.att as att
+
+    outcomes, events = bootstrap_panel
+    return att.ATT(firm_col="firm", period_col="period", outcome_col="sales", dose_col="hours").fit(
+        outcomes,
+        events,
+        isolation_window=(-1, 2),
+    )
+
+
+@pytest.fixture
 def kernel_events() -> pd.DataFrame:
     """Provide canonical metadata including one deliberately ineligible firm.
 

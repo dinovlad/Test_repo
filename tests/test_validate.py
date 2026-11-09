@@ -314,6 +314,7 @@ def test_quality_checks_only_target_estimator_files_and_project_docs(
         "src/labor_cost_optimization/att.py",
         "tests/conftest.py",
         "tests/test_att.py",
+        "tests/test_bootstrap.py",
         "tests/test_validate.py",
         "scripts/validate.py",
     }
@@ -365,6 +366,7 @@ def test_missing_validator_tests_fail_without_blocking_remaining_quality_checks(
         "src/labor_cost_optimization/att.py",
         "tests/conftest.py",
         "tests/test_att.py",
+        "tests/test_bootstrap.py",
         "scripts/validate.py",
     }
     assert exit_code == 1

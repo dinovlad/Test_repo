@@ -1,12 +1,13 @@
 """Estimate unpooled continuous-dose ATT curves with separate polynomial models.
 
-Periods have a fixed daily frequency. The estimator reports point estimates;
-negative horizons are placebo contrasts and horizon -1 is a zero reference.
+Periods have a fixed daily frequency. Firm-level bootstrap inference accompanies
+point estimates; negative horizons are placebo contrasts and horizon -1 is a zero reference.
 See att.md for the identifying assumptions and selected-population estimand.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import numbers
 from collections.abc import Iterable
@@ -21,9 +22,10 @@ import scipy.sparse
 import scipy.special
 
 
-__all__ = ["ATT", "estimate_h0", "estimate_h_cv", "estimate_pi", "evaluate_theta"]
+__all__ = ["ATT", "bootstrap_theta", "estimate_h0", "estimate_h_cv", "estimate_pi", "evaluate_theta"]
 
 FloatArray = npt.NDArray[np.float64]
+IntArray = npt.NDArray[np.int64]
 Cell = tuple[pd.Timestamp, int]
 _PERIOD = pd.Timedelta(days=1)
 _PERIOD_NS = 86_400_000_000_000
@@ -110,6 +112,17 @@ class _DataFrameInput(_ValidatedInput):
     """
 
     frame: pd.DataFrame
+
+
+class _BootstrapOptions(_ValidatedInput):
+    """Validate the requested bootstrap confidence level without string coercion.
+
+    Attributes:
+        confidence_level:
+            Finite interval coverage strictly between zero and one.
+    """
+
+    confidence_level: Annotated[float, pydantic.Field(gt=0, lt=1, allow_inf_nan=False)]
 
 
 def _integer(value: Any, name: str, minimum: int | None = None) -> int:
@@ -285,7 +298,8 @@ class ATT:
 
     Each model's intercept absorbs its control mean, so predictions use the
     treatment coefficients directly. Saved dose scaling is reused at prediction.
-    No covariates or inference are implemented.
+    The separate `bootstrap_theta()` function provides firm-level inference.
+    No additional covariates are implemented.
 
     Attributes:
         models_:
@@ -333,6 +347,12 @@ class ATT:
             Mapping from internal comparison labels to cohort-horizon keys.
         effect_columns_:
             Ordered model coefficient names for each fitted non-reference cell.
+        bootstrap_firms_:
+            Every original outcome firm in first-occurrence order, including
+            firms that do not contribute to a fitted comparison.
+        outcome_fingerprint_:
+            SHA-256 digest of the normalized outcome panel, independent of row
+            order, used to verify supplied bootstrap outcomes without caching them.
     """
 
     def __init__(
@@ -413,6 +433,8 @@ class ATT:
         self.cell_keys_: dict[int, Cell] = {}
         self.effect_columns_: dict[Cell, list[str]] = {}
         self.drop_summary_: dict[str, Any] = {}
+        self.bootstrap_firms_ = pd.Index([], dtype=object, tupleize_cols=False)
+        self.outcome_fingerprint_: str | None = None
 
     def _inputs(
         self,
@@ -627,6 +649,8 @@ class ATT:
         self.event_times_ = list(range(lower, upper + 1))
         self.retained_cohorts_ = {e: [] for e in self.event_times_}
         outcome, event = self._inputs(outcomes, events)
+        self.bootstrap_firms_ = pd.Index(outcome["firm_id"].drop_duplicates().to_numpy(copy=True), tupleize_cols=False)
+        self.outcome_fingerprint_ = _panel_fingerprint(outcome, self.bootstrap_firms_)
         try:
             self._prepare_events(outcome, event)
             blocks = self._prepare_comparisons(outcome)
@@ -1605,6 +1629,40 @@ def evaluate_theta(
         RuntimeError:
             If the model has not been fitted successfully.
     """
+    return _evaluate_theta(model, doses, bandwidth=bandwidth, event_times=event_times, log_warning=True)
+
+
+def _evaluate_theta(
+    model: ATT,
+    doses: Iterable[float],
+    *,
+    bandwidth: float,
+    event_times: Iterable[int] | None,
+    log_warning: bool,
+) -> pd.DataFrame:
+    """Evaluate the original aggregation with optional diagnostic logging.
+
+    Args:
+        model:
+            Successfully fitted estimator.
+        doses:
+            Distinct positive finite evaluation doses.
+        bandwidth:
+            Positive finite kernel bandwidth.
+        event_times:
+            Requested fitted horizons, or None for all horizons.
+        log_warning:
+            Whether to log the original aggregation diagnostics.
+
+    Returns:
+        The same estimates and support flags as `evaluate_theta()`.
+
+    Raises:
+        ValueError:
+            Requests, comparison metadata, or aggregation inputs are invalid.
+        RuntimeError:
+            The model has no successful current fit.
+    """
     model._require_fitted()
     dose_values = _validate_doses(doses)
     resolved_event_times = model._resolve_event_times(event_times)
@@ -1709,7 +1767,7 @@ def evaluate_theta(
         event_time in requested_horizons and cell["status"] not in {"fitted", "reference", "no_observed_treated"}
         for (_, event_time), cell in model.cell_diagnostics_.items()
     )
-    if omitted_comparisons or restricted_horizons or extrapolated_predictions:
+    if log_warning and (omitted_comparisons or restricted_horizons or extrapolated_predictions):
         logging.warning(
             "Aggregation summary: %d unavailable cohort-horizon comparisons; "
             "%d excluded treated firm-horizon rows across %d restricted horizons; "
@@ -1720,3 +1778,542 @@ def evaluate_theta(
             extrapolated_predictions,
         )
     return pd.DataFrame(rows).sort_values(["event_time", "dose"]).reset_index(drop=True)
+
+
+def _panel_fingerprint(outcome: pd.DataFrame, firms: pd.Index) -> str:
+    """Fingerprint canonical outcomes independently of row order.
+
+    Args:
+        outcome:
+            Validated canonical firm-period outcomes with finite numeric values.
+        firms:
+            Complete original firm index defining stable integer firm codes.
+
+    Returns:
+        A SHA-256 digest of ordered firm codes, normalized periods, and outcomes.
+
+    Raises:
+        ValueError:
+            The panel does not contain exactly the original firm population.
+    """
+    codes = firms.get_indexer(outcome["firm_id"])
+    if (codes < 0).any() or len(np.unique(codes)) != len(firms):
+        raise ValueError("Bootstrap outcomes must contain exactly the original firms.")
+    periods = outcome["period"].to_numpy(dtype="datetime64[ns]").astype(np.int64) // _PERIOD_NS
+    order = np.lexsort((periods, codes))
+    fingerprint = hashlib.sha256()
+    for values, dtype in (
+        (codes, "<i8"),
+        (periods, "<i8"),
+        (outcome["outcome"].to_numpy(dtype=float), "<f8"),
+    ):
+        fingerprint.update(np.asarray(values[order], dtype=dtype).tobytes())
+    return fingerprint.hexdigest()
+
+
+def _bootstrap_panel(model: ATT, outcomes: pd.DataFrame) -> tuple[pd.Index, FloatArray, int, int]:
+    """Verify supplied outcomes and construct one shared panel lookup.
+
+    Args:
+        model:
+            Fitted estimator with original firm metadata and a panel fingerprint.
+        outcomes:
+            Original outcome table using the estimator's column mappings.
+
+    Returns:
+        Packed firm-period keys, numeric outcomes, period origin, and period span.
+
+    Raises:
+        ValueError:
+            The supplied table is invalid or differs from the fitted outcome panel.
+        RuntimeError:
+            The model predates the required bootstrap metadata and must be refitted.
+    """
+    if not hasattr(model, "bootstrap_firms_") or not getattr(model, "outcome_fingerprint_", None):
+        raise RuntimeError("Refit ATT before bootstrapping to retain original outcome metadata.")
+    columns = [model.firm_col, model.period_col, model.outcome_col]
+    _require_columns(outcomes, columns, "outcomes")
+    if outcomes.empty:
+        raise ValueError("outcomes must contain at least one row.")
+    outcome = outcomes[columns].copy()
+    outcome.columns = ["firm_id", "period", "outcome"]
+    _firm_ids(outcome["firm_id"])
+    outcome["period"] = _periods(outcome["period"])
+    outcome["outcome"] = _numeric(outcome["outcome"], "Outcomes")
+    if outcome.duplicated(["firm_id", "period"]).any():
+        raise ValueError("Outcome rows must be unique by firm and normalized period.")
+    if _panel_fingerprint(outcome, model.bootstrap_firms_) != model.outcome_fingerprint_:
+        raise ValueError("Bootstrap outcomes must match the complete original outcome panel.")
+    codes = model.bootstrap_firms_.get_indexer(outcome["firm_id"])
+    periods = outcome["period"].to_numpy(dtype="datetime64[ns]").astype(np.int64) // _PERIOD_NS
+    origin = int(periods.min())
+    span = int(periods.max()) - origin + 1
+    keys = pd.Index(codes * span + periods - origin)
+    return keys, outcome["outcome"].to_numpy(dtype=float), origin, span
+
+
+def _bootstrap_counts(rng: np.random.Generator, n_firms: int, size: int) -> IntArray:
+    """Draw complete-firm resampling frequencies for a bounded batch.
+
+    Args:
+        rng:
+            Local random generator shared by the complete bootstrap call.
+        n_firms:
+            Number of original outcome firms, including control-only firms.
+        size:
+            Number of bootstrap replications in this batch.
+
+    Returns:
+        Integer sampling counts with shape `(size, n_firms)` and row sums `n_firms`.
+    """
+    return rng.multinomial(n_firms, np.full(n_firms, 1.0 / n_firms), size=size).astype(np.int64, copy=False)
+
+
+def _bootstrap_changes(
+    codes: IntArray,
+    cohort: pd.Timestamp,
+    event_time: int,
+    panel: tuple[pd.Index, FloatArray, int, int],
+) -> FloatArray:
+    """Recover a saved comparison's exact observed outcome differences.
+
+    Args:
+        codes:
+            Original firm positions for one treated or control sample.
+        cohort:
+            Focal cohort period determining the common baseline.
+        event_time:
+            Horizon whose endpoint is relative to the focal cohort.
+        panel:
+            Shared packed keys, numeric outcomes, origin, and period span.
+
+    Returns:
+        Outcome differences between the exact endpoint and baseline for each firm.
+
+    Raises:
+        ValueError:
+            Saved membership references an unknown firm or an unavailable endpoint.
+        RuntimeError:
+            Outcome subtraction produces nonfinite values.
+    """
+    if (codes < 0).any():
+        raise ValueError("Saved comparison firms must belong to the original outcome panel.")
+    keys, values, origin, span = panel
+    period = cohort.value // _PERIOD_NS
+    baseline = keys.get_indexer(codes * span + period - 1 - origin)
+    endpoint = keys.get_indexer(codes * span + period + event_time - origin)
+    if (baseline < 0).any() or (endpoint < 0).any():
+        raise ValueError("Saved comparison endpoints must exist in the original outcome panel.")
+    try:
+        with np.errstate(over="raise", invalid="raise"):
+            differences = values[endpoint] - values[baseline]
+    except FloatingPointError as exc:
+        raise RuntimeError("Bootstrap outcome differences overflowed.") from exc
+    if not np.isfinite(differences).all():
+        raise RuntimeError("Bootstrap outcome differences must remain finite.")
+    return differences
+
+
+def _bootstrap_cell_arrays(
+    model: ATT,
+    key: Cell,
+    panel: tuple[pd.Index, FloatArray, int, int],
+    firm_doses: FloatArray,
+    doses: FloatArray,
+) -> tuple[IntArray, FloatArray, FloatArray, IntArray, FloatArray, FloatArray]:
+    """Prepare one cell without retaining copies of every control sample.
+
+    Args:
+        model:
+            Fitted estimator with saved comparison membership and polynomial bases.
+        key:
+            Cohort and horizon identifying the retained comparison.
+        panel:
+            Shared packed outcome lookup.
+        firm_doses:
+            Original event dose indexed by the complete original firm population.
+        doses:
+            Requested prediction doses in increasing order.
+
+    Returns:
+        Treated positions, polynomial matrix, and outcome differences, followed by
+        control positions, their outcome differences, and the scaled prediction doses.
+
+    Raises:
+        ValueError:
+            Saved comparison metadata does not match the original panel or events.
+        RuntimeError:
+            Polynomial or outcome calculations produce nonfinite values.
+    """
+    cell = model.cell_diagnostics_[key]
+    treated = model.bootstrap_firms_.get_indexer(pd.Index(cell["treated_firms"], tupleize_cols=False))
+    controls = model.bootstrap_firms_.get_indexer(pd.Index(cell["control_firms"], tupleize_cols=False))
+    treated_changes = _bootstrap_changes(treated, key[0], key[1], panel)
+    control_changes = _bootstrap_changes(controls, key[0], key[1], panel)
+    treated_doses = firm_doses[treated]
+    if not np.isfinite(treated_doses).all():
+        raise ValueError("Saved treated firms must have original event doses.")
+    basis = model.bases_[key]
+    try:
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            width = basis["upper"] - basis["lower"]
+            design = np.polynomial.polynomial.polyvander(
+                (treated_doses - basis["lower"]) / width,
+                basis["degree"],
+            )
+            prediction = (doses - basis["lower"]) / width
+    except FloatingPointError as exc:
+        raise RuntimeError("Bootstrap polynomial calculations overflowed.") from exc
+    if not np.isfinite(design).all() or not np.isfinite(prediction).all():
+        raise RuntimeError("Bootstrap polynomial matrices must remain finite.")
+    return treated, design, treated_changes, controls, control_changes, prediction
+
+
+def _bootstrap_merge(
+    mean: FloatArray,
+    anchor: FloatArray,
+    mass: FloatArray,
+    log_kernel: FloatArray,
+    counts: IntArray,
+    effect: FloatArray,
+) -> None:
+    """Accumulate one positive-mass cohort using stable sampled-support anchors.
+
+    Args:
+        mean:
+            Running aggregate predictions to update in place.
+        anchor:
+            Running maximum raw log-kernel values to update in place.
+        mass:
+            Running kernel masses scaled to `anchor`, updated in place.
+        log_kernel:
+            Raw Gaussian log kernels for sampled treated firms and requested doses.
+        counts:
+            Positive frequency counts for these treated firms.
+        effect:
+            This cohort's weighted polynomial treatment effects at requested doses.
+
+    Raises:
+        RuntimeError:
+            Kernel accumulation produces nonfinite masses or predictions.
+    """
+    local_anchor = np.max(log_kernel, axis=0)
+    local_mass = counts @ np.exp(log_kernel - local_anchor)
+    next_anchor = np.maximum(anchor, local_anchor)
+    old_mass = mass * np.exp(anchor - next_anchor)
+    added_mass = local_mass * np.exp(local_anchor - next_anchor)
+    total_mass = old_mass + added_mass
+    try:
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            next_mean = mean * (old_mass / total_mass) + effect * (added_mass / total_mass)
+    except FloatingPointError as exc:
+        raise RuntimeError("Bootstrap kernel aggregation overflowed.") from exc
+    if not np.isfinite(total_mass).all() or (total_mass <= 0).any() or not np.isfinite(next_mean).all():
+        raise RuntimeError("Bootstrap kernel masses and estimates must remain finite.")
+    mean[:] = next_mean
+    anchor[:] = next_anchor
+    mass[:] = total_mass
+
+
+def _bootstrap_horizon(
+    model: ATT,
+    event_time: int,
+    counts: IntArray,
+    panel: tuple[pd.Index, FloatArray, int, int],
+    firm_doses: FloatArray,
+    doses: FloatArray,
+    bandwidth: float,
+    failures: dict[tuple[pd.Timestamp | None, int, str], int],
+) -> FloatArray:
+    """Re-estimate one horizon for a bounded batch of firm bootstrap draws.
+
+    Args:
+        model:
+            Fitted estimator whose original retained comparisons remain fixed.
+        event_time:
+            Requested horizon.
+        counts:
+            Shared complete-firm sampling counts for this batch.
+        panel:
+            Shared packed outcome lookup.
+        firm_doses:
+            Original event dose at each original firm position.
+        doses:
+            Requested evaluation grid in increasing order.
+        bandwidth:
+            Fixed positive Gaussian-kernel bandwidth.
+        failures:
+            Aggregate comparison failure counts to update in place.
+
+    Returns:
+        Batch-by-dose bootstrap estimates, with entire failed rows set to NaN.
+
+    Raises:
+        ValueError:
+            Saved sample metadata or Gaussian-kernel calculations are invalid.
+        RuntimeError:
+            Weighted least squares or other numerical calculations fail unexpectedly.
+    """
+    batch_size = counts.shape[0]
+    estimates = np.zeros((batch_size, len(doses)), dtype=float)
+    anchors = np.full_like(estimates, -np.inf)
+    masses = np.zeros_like(estimates)
+    total_treated = np.zeros(batch_size, dtype=np.int64)
+    failed = np.zeros(batch_size, dtype=bool)
+    reason: tuple[pd.Timestamp | None, int, str]
+    for cohort in model.retained_cohorts_[event_time]:
+        key = (cohort, event_time)
+        if event_time == -1:
+            treated = model.bootstrap_firms_.get_indexer(
+                pd.Index(model.cell_diagnostics_[key]["treated_firms"], tupleize_cols=False),
+            )
+            if (treated < 0).any():
+                raise ValueError("Saved treated firms must belong to the original outcome panel.")
+            total_treated += counts[:, treated].sum(axis=1)
+            continue
+        treated, design, changes, controls, control_changes, prediction = _bootstrap_cell_arrays(
+            model,
+            key,
+            panel,
+            firm_doses,
+            doses,
+        )
+        treated_counts = counts[:, treated]
+        treated_totals = treated_counts.sum(axis=1)
+        total_treated += treated_totals
+        control_counts = counts[:, controls]
+        control_totals = control_counts.sum(axis=1)
+        no_controls = (treated_totals > 0) & (control_totals == 0)
+        if no_controls.any():
+            reason = (cohort, event_time, "no_controls")
+            failures[reason] = failures.get(reason, 0) + int(no_controls.sum())
+            failed |= no_controls
+        try:
+            with np.errstate(over="raise", invalid="raise", divide="raise"):
+                log_kernel = -0.5 * np.square((firm_doses[treated, None] - doses) / bandwidth)
+        except FloatingPointError as exc:
+            raise ValueError("Gaussian-kernel calculations overflowed.") from exc
+        if not np.isfinite(log_kernel).all():
+            raise ValueError("Gaussian-kernel calculations must remain finite.")
+        for draw in np.flatnonzero((treated_totals > 0) & ~no_controls):
+            present = treated_counts[draw] > 0
+            weights = treated_counts[draw, present]
+            weighted_design = design[present] * np.sqrt(weights[:, None])
+            try:
+                with np.errstate(over="raise", invalid="raise", divide="raise"):
+                    weighted_changes = changes[present] * np.sqrt(weights)
+                    coefficient, _, rank, _ = np.linalg.lstsq(
+                        weighted_design,
+                        weighted_changes,
+                        rcond=float(np.finfo(float).eps) * max(int(treated_totals[draw]), design.shape[1]),
+                    )
+            except (np.linalg.LinAlgError, FloatingPointError) as exc:
+                raise RuntimeError("A bootstrap weighted polynomial calculation failed.") from exc
+            if rank < design.shape[1]:
+                reason = (cohort, event_time, "rank_deficient")
+                failures[reason] = failures.get(reason, 0) + 1
+                failed[draw] = True
+                continue
+            try:
+                with np.errstate(over="raise", invalid="raise", divide="raise"):
+                    control_mean = np.dot(control_counts[draw] / control_totals[draw], control_changes)
+                    effect = np.polynomial.polynomial.polyval(prediction, coefficient) - control_mean
+            except FloatingPointError as exc:
+                raise RuntimeError("Bootstrap polynomial predictions overflowed.") from exc
+            if not np.isfinite(coefficient).all() or not np.isfinite(effect).all():
+                raise RuntimeError("Bootstrap regression coefficients and predictions must remain finite.")
+            _bootstrap_merge(
+                estimates[draw],
+                anchors[draw],
+                masses[draw],
+                log_kernel[present],
+                weights,
+                effect,
+            )
+    no_treated = total_treated == 0
+    if no_treated.any():
+        reason = (None, event_time, "no_treated_firms")
+        failures[reason] = failures.get(reason, 0) + int(no_treated.sum())
+        failed |= no_treated
+    estimates[failed] = np.nan
+    return estimates
+
+
+def bootstrap_theta(
+    model: ATT,
+    doses: Iterable[float],
+    *,
+    outcomes: pd.DataFrame,
+    bandwidth: float,
+    event_times: Iterable[int] | None = None,
+    n_bootstrap: int = 1999,
+    confidence_level: float = 0.95,
+    random_state: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Bootstrap dose-specific event-study effects by resampling entire firms.
+
+    Sample the complete original firm population with replacement and reuse each
+    firm's count across every comparison, horizon, dose, and kernel calculation.
+    Keep the fitted comparison membership, polynomial bases, and bandwidth fixed.
+    Percentile intervals and standard errors use successful draws at each horizon;
+    excluding failures does not establish conditional frequentist coverage. Kernel
+    smoothing bias and uncertainty from bandwidth selection are not corrected.
+    The fitted model and supplied outcomes are not modified.
+
+    Args:
+        model:
+            Successfully fitted estimator retaining original firm metadata and its
+            normalized outcome fingerprint. Older fitted objects require refitting.
+        doses:
+            Distinct positive finite doses at which to evaluate the aggregation.
+        outcomes:
+            The complete original outcome table using the model's column mappings.
+            Row order, ignored time components, and additional columns may differ;
+            normalized firm-period observations and numeric outcomes must match.
+        bandwidth:
+            Fixed positive finite Gaussian-kernel bandwidth in dose units.
+        event_times:
+            Distinct fitted integer horizons, or None to report the full window.
+        n_bootstrap:
+            Number of attempted resamples, at least two. Failed draws are retained
+            and are never replaced by additional resampling.
+        confidence_level:
+            Nominal interval coverage strictly between zero and one.
+        random_state:
+            Nonnegative integer seed, or None for nondeterministic local sampling.
+
+    Returns:
+        Three DataFrames: the original `evaluate_theta()` summary with bootstrap
+        standard errors, percentile bounds, attempted/successful/failed counts,
+        success rates, and inference status; all attempted draws with columns
+        `replicate`, `event_time`, `dose`, `theta`, and `success`; and aggregated
+        failures with `cohort`, `event_time`, `reason`, and `n_failures` columns.
+        Replicate numbers start at one. Failed draws retain NaN estimates. Fewer
+        than two successful draws yield missing standard errors and intervals.
+        `conditional_on_success` is true whenever failures were excluded, and
+        `inference_status` is `ok`, `successful_draws_only`, or
+        `insufficient_successful_draws`. Global empty-sample failures use NaT for
+        `cohort`; several cell failures may belong to the same failed horizon draw.
+        At most one aggregated warning covers failures and original support flags.
+
+    Raises:
+        ValueError:
+            Inputs, original comparison metadata, the outcome fingerprint, or
+            Gaussian-kernel calculations are invalid.
+        RuntimeError:
+            The model is unfitted, requires refitting for bootstrap metadata, or
+            unexpected regression or numerical calculations fail.
+    """
+    model._require_fitted()
+    n_bootstrap = _integer(n_bootstrap, "n_bootstrap", 2)
+    seed = None if random_state is None else _integer(random_state, "random_state", 0)
+    try:
+        level = _BootstrapOptions(confidence_level=confidence_level).confidence_level
+    except pydantic.ValidationError:
+        raise ValueError("confidence_level must be finite and strictly between zero and one.") from None
+    dose_values = np.sort(_validate_doses(doses))
+    horizons = model._resolve_event_times(event_times)
+    panel = _bootstrap_panel(model, outcomes)
+    summary = _evaluate_theta(model, dose_values, bandwidth=bandwidth, event_times=horizons, log_warning=False)
+    kernel_bandwidth = float(bandwidth)
+    n_firms = len(model.bootstrap_firms_)
+    event_codes = model.bootstrap_firms_.get_indexer(model.events_["firm_id"])
+    if (event_codes < 0).any():
+        raise ValueError("Saved event firms must belong to the original outcome panel.")
+    firm_doses = np.full(n_firms, np.nan)
+    firm_doses[event_codes] = model.events_["dose"].to_numpy(dtype=float)
+    rng = np.random.default_rng(seed)
+    estimates = np.full((n_bootstrap, len(horizons), len(dose_values)), np.nan)
+    failures: dict[tuple[pd.Timestamp | None, int, str], int] = {}
+    for start in range(0, n_bootstrap, 32):
+        stop = min(start + 32, n_bootstrap)
+        counts = _bootstrap_counts(rng, n_firms, stop - start)
+        for horizon_index, event_time in enumerate(horizons):
+            estimates[start:stop, horizon_index] = _bootstrap_horizon(
+                model,
+                event_time,
+                counts,
+                panel,
+                firm_doses,
+                dose_values,
+                kernel_bandwidth,
+                failures,
+            )
+    successful = np.isfinite(estimates).all(axis=2)
+    n_success = successful.sum(axis=0)
+    n_failed = n_bootstrap - n_success
+    standard_errors = np.full((len(horizons), len(dose_values)), np.nan)
+    lower = np.full_like(standard_errors, np.nan)
+    upper = np.full_like(standard_errors, np.nan)
+    tail = (1.0 - level) / 2.0
+    for horizon_index in range(len(horizons)):
+        if n_success[horizon_index] < 2:
+            continue
+        selected = estimates[successful[:, horizon_index], horizon_index]
+        try:
+            with np.errstate(over="raise", invalid="raise", divide="raise"):
+                standard_errors[horizon_index] = np.std(selected, axis=0, ddof=1)
+                lower[horizon_index], upper[horizon_index] = np.quantile(selected, [tail, 1.0 - tail], axis=0)
+        except FloatingPointError as exc:
+            raise RuntimeError("Bootstrap interval calculations overflowed.") from exc
+        if not all(np.isfinite(values[horizon_index]).all() for values in (standard_errors, lower, upper)):
+            raise RuntimeError("Bootstrap standard errors and interval bounds must remain finite.")
+    summary["standard_error"] = standard_errors.ravel()
+    summary["ci_lower"] = lower.ravel()
+    summary["ci_upper"] = upper.ravel()
+    summary["confidence_level"] = level
+    summary["n_bootstrap"] = n_bootstrap
+    summary["n_success"] = np.repeat(n_success, len(dose_values))
+    summary["n_failed"] = np.repeat(n_failed, len(dose_values))
+    summary["success_rate"] = summary["n_success"] / n_bootstrap
+    summary["conditional_on_success"] = summary["n_failed"] > 0
+    summary["inference_status"] = np.repeat(
+        np.where(
+            n_success < 2,
+            "insufficient_successful_draws",
+            np.where(n_failed > 0, "successful_draws_only", "ok"),
+        ),
+        len(dose_values),
+    )
+    draws = pd.DataFrame(
+        {
+            "replicate": np.repeat(np.arange(1, n_bootstrap + 1), len(horizons) * len(dose_values)),
+            "event_time": np.tile(np.repeat(horizons, len(dose_values)), n_bootstrap),
+            "dose": np.tile(dose_values, n_bootstrap * len(horizons)),
+            "theta": estimates.ravel(),
+            "success": np.repeat(successful.ravel(), len(dose_values)),
+        },
+    )
+    diagnostics = pd.DataFrame(
+        [
+            {"cohort": cohort, "event_time": event_time, "reason": reason, "n_failures": count}
+            for (cohort, event_time, reason), count in failures.items()
+        ],
+        columns=["cohort", "event_time", "reason", "n_failures"],
+    )
+    diagnostics["cohort"] = pd.to_datetime(diagnostics["cohort"])
+    diagnostics = diagnostics.astype({"event_time": "int64", "reason": "object", "n_failures": "int64"}, copy=False)
+    diagnostics = diagnostics.sort_values(["event_time", "cohort", "reason"], na_position="first").reset_index(
+        drop=True,
+    )
+    requested = set(horizons)
+    omitted = sum(
+        event_time in requested and cell["status"] not in {"fitted", "reference", "no_observed_treated"}
+        for (_, event_time), cell in model.cell_diagnostics_.items()
+    )
+    restricted = int(summary.loc[summary["restricted_target"], "event_time"].nunique())
+    extrapolated = int(summary["extrapolated"].sum())
+    if n_failed.any() or omitted or restricted or extrapolated:
+        logging.warning(
+            "Bootstrap summary: %d of %d attempted horizon draws failed; "
+            "%d horizons have fewer than two successful draws. Intervals use successful draws only "
+            "and do not establish conditional coverage. Original aggregation has %d unavailable comparisons, "
+            "%d restricted horizons, and %d extrapolated dose-horizon estimates. Inspect summary and diagnostics.",
+            int(n_failed.sum()),
+            n_bootstrap * len(horizons),
+            int((n_success < 2).sum()),
+            omitted,
+            restricted,
+            extrapolated,
+        )
+    return summary, draws, diagnostics

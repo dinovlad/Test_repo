@@ -1,10 +1,10 @@
 **Implementation Specification: Unpooled Continuous-Dose ATT and Dose-Specific Event-Study Aggregation.**
 
-This document specifies the self-contained Python module [att.py](src/labor_cost_optimization/att.py). The design uses a separate PyFixest OLS model for every cohort-time comparison, with a polynomial dose curve and a saved dose transformation for every comparison. Its point estimates reproduce the parametric `contdid` calculation with no internal knots on the same comparison samples, and a separate Gaussian-kernel function estimates conditional cohort weights. It estimates the effect of each store's first recorded termination, with at most one target event per store. Event selection and control selection are extensions to the article's design; each cell regression is an algebraically equivalent parameterization of the reference point-estimation calculation with the same polynomial degree and no internal knots. The module evaluates every integer horizon in the isolation window: post-treatment effects, pre-treatment placebo contrasts, and the reference period. All estimates are point estimates.
+This document specifies the self-contained Python module [att.py](src/labor_cost_optimization/att.py). The design uses a separate PyFixest OLS model for every cohort-time comparison, with a polynomial dose curve and a saved dose transformation for every comparison. Its point estimates reproduce the parametric `contdid` calculation with no internal knots on the same comparison samples, and a separate Gaussian-kernel function estimates conditional cohort weights. It estimates the effect of each store's first recorded termination, with at most one target event per store. Event selection and control selection are extensions to the article's design; each cell regression is an algebraically equivalent parameterization of the reference point-estimation calculation with the same polynomial degree and no internal knots. The module evaluates every integer horizon in the isolation window: post-treatment effects, pre-treatment placebo contrasts, and the reference period. Point estimates are supplemented by a store-level bootstrap for pointwise intervals for the dose-specific aggregation.
 
 **Periods and Frequency.** The frequency is hardcoded to one calendar day. A period means one step at that fixed frequency. There is no frequency parameter or support for monthly or annual inputs. Input and output period labels are timezone-naive `datetime64[ns]` values normalized to the start of each period. All event-time offsets, isolation bounds, baseline comparisons, and dose units have a daily interpretation.
 
-The public API consists of one class and four functions: `ATT`, `estimate_h0()`, `estimate_h_cv()`, `estimate_pi()`, and `evaluate_theta()`. In this example, `firm_col`, `period_col`, `outcome_col`, and `dose_col` are caller-supplied strings naming columns in the input tables; all four must be provided:
+The public API consists of one class and five functions: `ATT`, `estimate_h0()`, `estimate_h_cv()`, `estimate_pi()`, `evaluate_theta()`, and `bootstrap_theta()`. In this example, `firm_col`, `period_col`, `outcome_col`, and `dose_col` are caller-supplied strings naming columns in the input tables; all four must be provided:
 
 ```python
 import labor_cost_optimization.att as att
@@ -44,6 +44,17 @@ theta = att.evaluate_theta(
     doses=[4, 6, 8, 10, 12],
     bandwidth=bandwidth,
     event_times=[-7, -2, -1, 0, 7, 14],
+)
+
+summary, draws, diagnostics = att.bootstrap_theta(
+    model,
+    doses=[4, 6, 8, 10, 12],
+    outcomes=outcomes,
+    bandwidth=bandwidth,
+    event_times=[-7, -2, -1, 0, 7, 14],
+    n_bootstrap=1999,
+    confidence_level=0.95,
+    random_state=42,
 )
 ```
 
@@ -192,7 +203,7 @@ Only first-event rows populate `events_`, fitted targets and kernel inputs. Buil
 
 **Same-Period Records.** Treat each supplied event row as one actual termination. Without employee identifiers, multiple rows at the same store and normalized period cannot be distinguished automatically from duplicate copies of one record. The working convention is that they are simultaneous terminations, including when their doses match. Preserve their count in `termination_history_`. If the first termination period has more than one record, mark its candidate `overlapping_termination` and exclude it; do not promote a later period or interpret the first row's dose as the combined reduction. Duplicate copies of the same underlying termination must be removed upstream if that is how the source data are recorded.
 
-**Logging Convention.** Every nonfatal warning in this specification must use the standard-library function `logging.warning()`. During `fit()`, collect selection and comparison exclusions in `drop_summary_` and emit one aggregate warning if any occur; do not emit separate warnings for duplicate-event selection, individual cohorts, individual cells, or missing controls. A fit with no exclusions emits no selection warning. Direct prediction warnings remain separate from the fit summary. Each successful `evaluate_theta()` call emits at most one aggregate warning covering its complete requested horizon and dose grid; its internal prediction calculations emit no intermediate warnings. Do not import or use the `warnings` module, warning categories, or `warnings.warn()`. Do not explicitly configure logging handlers or levels in the module; leave logging setup to the caller. Validation and required-model failures remain exceptions.
+**Logging Convention.** Every nonfatal warning in this specification must use the standard-library function `logging.warning()`. During `fit()`, collect selection and comparison exclusions in `drop_summary_` and emit one aggregate warning if any occur; do not emit separate warnings for duplicate-event selection, individual cohorts, individual cells, or missing controls. A fit with no exclusions emits no selection warning. Direct prediction warnings remain separate from the fit summary. Each successful `evaluate_theta()` call emits at most one aggregate warning covering its complete requested horizon and dose grid; its internal prediction calculations emit no intermediate warnings. Each `bootstrap_theta()` call likewise emits at most one aggregate warning combining original aggregation restrictions or extrapolation with bootstrap failures; its internal point-aggregation calculation is quiet. Do not import or use the `warnings` module, warning categories, or `warnings.warn()`. Do not explicitly configure logging handlers or levels in the module; leave logging setup to the caller. Validation and required-model failures remain exceptions.
 
 The outcome panel may have missing store-periods, including temporary inactivity and permanent closure. Every row that is present must have a finite, nonmissing outcome. An absent row is not a zero outcome. Do not fill missing periods, impute outcomes, carry observations forward, or replace a required endpoint with the nearest observed period. A real observed zero is allowed. A store or event contributes to a comparison only when its exact baseline and endpoint rows exist. Missing intermediate periods alone do not invalidate that comparison.
 
@@ -202,7 +213,7 @@ A design-eligible target event has $1-L\le G_i\le T-H$; actual endpoint observat
 
 The inferred coverage interval runs from the earliest to the latest normalized outcome period over the entire panel. Assume the event table is complete for every outcome store throughout that interval, including stores with no recorded terminations and periods when a store is closed or inactive. Completeness cannot be verified from the outcome panel or the presence of individual event records. Preserve all supplied terminations for first-event selection and history screening, including those during missing outcome periods, outside the panel, overlapping other events, or excluded from estimation. Extra event records do not relax the requirement that the full isolation interval lies inside the outcome panel bounds.
 
-Runtime dependencies are NumPy, pandas, Pydantic v2, PyFixest, SciPy, and the Python standard library. Dependency constraints and development-tool requirements are declared in [pyproject.toml](pyproject.toml). The project requires Python 3.11; [.python-version](.python-version) selects that interpreter for tools such as uv. The module covers outcomes per period with missing store-periods allowed, equal weights for treated and control rows within each comparison, no anticipation, post-treatment level estimates, and pre-treatment placebo diagnostics. Covariates, inference, plotting, treatment slopes, and changing the dose within an event are outside this scope.
+Runtime dependencies are NumPy, pandas, Pydantic v2, PyFixest, SciPy, and the Python standard library. Dependency constraints and development-tool requirements are declared in [pyproject.toml](pyproject.toml). The project requires Python 3.11; [.python-version](.python-version) selects that interpreter for tools such as uv. The module covers outcomes per period with missing store-periods allowed, equal weights for treated and control rows within each original point-estimation comparison, no anticipation, post-treatment level estimates, and pre-treatment placebo diagnostics. The separate bootstrap supplies standard errors and pointwise percentile intervals for the aggregation. Covariates, simultaneous confidence bands, plotting, treatment slopes, and changing the dose within an event are outside this scope.
 
 Use the supplied [.pre-commit-config.yaml](.pre-commit-config.yaml) for spelling, formatting, lint, and type checks on Python, Markdown, and notebooks. The hooks use system executables, so activate the development environment before installing or running them:
 
@@ -236,7 +247,7 @@ ATT.fit(
 ATT.predict(doses, *, event_times=None) -> pandas.DataFrame
 ```
 
-Construction requires all four column-name arguments, a positive integer `degree`, and `min_cohort_size` either `None` or a positive integer. Require a two-element `isolation_window` of integer signed offsets with $L\le-1$ and $H\ge0$, and generate all integer horizons in that interval. Set `event_times_ = list(range(L, H + 1))` internally; callers do not choose fitted horizons separately. The lower bound must include the baseline at event period $-1$; reject a positive lower offset rather than converting its sign implicitly. Dose requests must be distinct, finite, and positive. An explicit `event_times` request to `predict()` or `evaluate_theta()` must be a nonempty collection of distinct integers in the fitted interval, including negative values when requested. Dose requests must be nonempty.
+Construction requires all four column-name arguments, a positive integer `degree`, and `min_cohort_size` either `None` or a positive integer. Require a two-element `isolation_window` of integer signed offsets with $L\le-1$ and $H\ge0$, and generate all integer horizons in that interval. Set `event_times_ = list(range(L, H + 1))` internally; callers do not choose fitted horizons separately. The lower bound must include the baseline at event period $-1$; reject a positive lower offset rather than converting its sign implicitly. Dose requests must be distinct, finite, and positive. An explicit `event_times` request to `predict()`, `evaluate_theta()`, or `bootstrap_theta()` must be a nonempty collection of distinct integers in the fitted interval, including negative values when requested. Dose requests must be nonempty.
 
 `fit()` returns `self` and replaces any previously fitted state; a failed refit must not leave an earlier model available for prediction. `predict()` before successful fitting raises an error. Omitting `event_times` in either prediction or aggregation requests the complete fitted interval, including negative periods and the reference period. An out-of-window request raises an error rather than fitting additional models implicitly. `fit()` constructs and screens every `(cohort, event_time)` comparison and fits every eligible non-reference cell separately. Unavailable or screened cells remain explicitly recorded in diagnostics.
 
@@ -384,6 +395,8 @@ Emit one `logging.warning()` message containing the aggregate counts and reason 
 
 - `column_names_`: the four supplied input-column mappings; the `firm_col` and `period_col` mappings are shared by both tables.
 - `min_cohort_size_`: the resolved effective sample-size minimum, including the design floor.
+- `bootstrap_firms_`: the complete index of original outcome stores, including control-only stores and stores unused by any fitted comparison; this is the bootstrap sampling population.
+- `outcome_fingerprint_`: a SHA-256 fingerprint of the canonical complete outcome panel, ordered by the saved store index and normalized period. Bootstrap verifies supplied outcomes against this fingerprint without retaining an outcome-panel copy in the fitted estimator.
 - `events_`: canonical columns `firm_id`, `cohort`, `dose`, and `design_eligible`, with one selected first-event row per store represented in the input events. `cohort` is a normalized `datetime64[ns]` period label. Includes excluded events; these canonical names are internal/output conventions, not required names in the user's input.
 - `termination_history_`: canonical `firm_id`, normalized `cohort` period, and `n_terminations`, unique by store and period; includes later periods excluded from target estimation.
 - `duplicate_diagnostics_`: `n_dropped_events` and `n_affected_firms` from first-event selection.
@@ -574,9 +587,143 @@ This equals the pre-screen observed-endpoint target only when every eligible coh
 
 The screen is sample-dependent; this description is not an inferential result about selection. Both within-cohort store composition and retained cohorts may change across horizons. The fixed isolation window ensures period coverage from $L$ through $H$, including the baseline, for all design-eligible events. No common set of stores with complete outcomes is imposed across horizons; inactivity or closure can still change the observed sample.
 
-**Implementation Boundaries and Validation Plan.** Put the class, all four public functions, and a few private validation, window-selection, polynomial, bandwidth, and cell-regression helpers in the single `src/labor_cost_optimization/att.py` file. Use the `labor_cost_optimization` package under the `src` directory; keep estimator logic in that module. Use `firm` and `period` consistently in all Python identifiers, canonical column names, docstrings, and error/log messages, including private helpers. Use `period_col`, `origin_period_`, `last_period_`, `last_period_index_`, and output column `period`; preserve literal third-party API/type names such as `datetime64[ns]` and `.dt.normalize()`. This plan keeps the application term “store” in explanatory prose; code examples and public schema names follow the general `firm` and `period` terminology. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. Private Pydantic v2 input models use `ConfigDict(arbitrary_types_allowed=True, strict=True)` for runtime type validation. Preserve accepted NumPy integer values and the existing public `ValueError` behavior; numerical, period, isolation, and sample checks remain explicit domain validation. These private models stay in the same module and do not extend the public API. No generic estimator framework or serialization layer is needed. Include the package's `py.typed` marker through `[tool.setuptools.package-data]` so installed consumers can use its inline annotations.
+**Store Bootstrap for Pointwise Intervals.** The bootstrap is a standalone function in the same module:
 
-**Docstring Convention.** Use Google-style docstrings throughout `src/labor_cost_optimization/att.py`, including the module, `ATT`, its constructor and public methods, all four public functions, and private helpers. Start with a concise summary followed by a blank line before any extended description or sections. Use `Args:`, `Returns:`, and `Raises:` where applicable; omit empty or inapplicable sections. Document constructor arguments in `__init__` and fitted public attributes in the class docstring's `Attributes:` section. Include `Args:` whenever a function or method accepts arguments other than `self` or `cls`, `Returns:` whenever its return annotation is not `None`, and `Raises:` for explicit or relevant unhandled exceptions. A one-line helper docstring is appropriate only when none of these sections is required. Wrap references to functions, methods, attributes, and schema columns in backticks.
+```python
+bootstrap_theta(
+    model,
+    doses,
+    *,
+    outcomes,
+    bandwidth,
+    event_times=None,
+    n_bootstrap=1999,
+    confidence_level=0.95,
+    random_state=None,
+) -> tuple[pandas.DataFrame, pandas.DataFrame, pandas.DataFrame]
+```
+
+Return `(summary, draws, diagnostics)`. The original fitted `ATT` object and the supplied outcome table remain unchanged. This is a custom inference implementation for the selected-store estimand described here, not a claim to reproduce the article's or R package's inference routine. Callaway et. al. (2025) provide the identification and aggregation starting point; the bootstrap also inherits the additional design assumptions and selection limitations specified above.
+
+**Bootstrap Inputs and Fixed Specification.** `outcomes` must contain the complete original outcome panel using the model's column mappings. Reuse the same period normalization and numeric validation as fitting. Ignore input row order, within-period time components, and additional unmapped columns. Require all normalized store-period outcome values and all original stores to match `outcome_fingerprint_` and `bootstrap_firms_`, including rows and stores unused by any retained comparison. A matching set of unweighted fitted coefficients is not sufficient: changes to individual control outcomes can preserve their mean while changing bootstrap variation. Models without the required fitted metadata must be fitted before bootstrap evaluation. No event table is supplied again; the selected event labels, retained comparisons, memberships, and history-based decisions are already recorded by `fit()`.
+
+Require a fitted model, a nonempty collection of distinct positive finite doses, a positive finite bandwidth, and distinct requested horizons inside the fitted interval. `event_times=None` selects the entire fitted interval. `n_bootstrap` is an integer of at least two; `confidence_level` is finite and strictly between zero and one; `random_state` is either `None` or a nonnegative integer. Invalid inputs and an unavailable required original comparison raise errors before resampling. The point estimates in `summary` must match `evaluate_theta()` at the supplied grid and bandwidth.
+
+Fix the original horizon-specific retained sets $\mathcal R_e$, exact treated and control memberships, polynomial degrees and saved dose transformations, requested grid, and bandwidth. Do not rerun first-event selection, isolation screening, endpoint screening, bandwidth CV, or the original `min_cohort_size` screen. Sampling counts can change the number of represented stores and distinct doses in a cell; its weighted regression must still be identifiable. Keeping the specification fixed does not establish inference conditional on a data-dependent selection event and does not account for changing screening or tuning decisions across samples.
+
+**Sampling Complete Stores.** Let $N$ count every distinct store in the original outcome panel, not only stores used by the requested horizons. For each of the $B$ attempted replications, sample $N$ stores with replacement, represented by frequency counts
+
+$$
+(M_1^{(b)},\ldots,M_N^{(b)})
+\sim\operatorname{Multinomial}
+\left(N;\frac{1}{N},\ldots,\frac{1}{N}\right).
+$$
+
+The same $M_i^{(b)}$ applies to every period and every treated or control appearance of store $i$, and to its kernel contribution. This preserves within-store dependence and covariance across comparisons, including shared controls and estimated cohort composition. Do not sample calendar periods, individual outcome rows, or fixed numbers within cohorts. Stores with no selected event can still receive counts and contribute as controls. Stores unused by all requested comparisons remain part of the original sampling population. Integer weights are equivalent to duplicating complete store histories with distinct copy identifiers, without constructing those duplicate tables or accidentally deduplicating bootstrap copies.
+
+**Weighted Comparison Estimates.** For $c=(g,e)$, use the outcome difference $\Delta Y_{ic}$ defined above. Write $T_{g,e}=\mathcal I_e\cap\{i:G_i=g\}$ and let $C_{g,e}$ denote the exact original controls for that comparison. Let $p_{g,e}(d)$ contain the intercept and powers of the saved scaled dose through the configured degree. For a non-reference comparison with positive sampled treated mass, compute
+
+$$
+\widehat\gamma_{g,e}^{*(b)}
+=\arg\min_\gamma
+\sum_{i\in T_{g,e}}M_i^{(b)}
+\left[\Delta Y_{ic}-p_{g,e}(D_i)'\gamma\right]^2,
+$$
+
+$$
+\widehat m_{0,g,e}^{*(b)}
+=\frac{
+\sum_{i\in C_{g,e}}M_i^{(b)}\Delta Y_{ic}
+}{\sum_{i\in C_{g,e}}M_i^{(b)}},
+\qquad
+\widehat\tau_{g,e}^{*(b)}(d)
+=p_{g,e}(d)'\widehat\gamma_{g,e}^{*(b)}
+-\widehat m_{0,g,e}^{*(b)}.
+$$
+
+Use a stable weighted least-squares solve, not an explicit matrix inverse. This decomposition is algebraically equivalent to the original treatment-interacted regression fitted to duplicated comparison rows. Subtract the control mean once. Bootstrap does not call `pyfixest.feols()` or `ATT.fit()` again, and it does not change any stored models, coefficients, bases, or diagnostics. Evaluate each solved polynomial at all requested doses.
+
+**Bootstrap Cohort Weights and Aggregation.** Re-estimate the Gaussian-kernel weights with the same sampling counts:
+
+$$
+\widehat\pi_{g,e}^{*(b)}(d)
+=\frac{
+\sum_{i\in T_{g,e}}M_i^{(b)}K_h(D_i-d)
+}{
+\sum_{i\in\mathcal I_e}M_i^{(b)}K_h(D_i-d)
+},
+\qquad
+\widehat\theta^{*(b)}(d,e)
+=\sum_{g\in\mathcal R_e}
+\widehat\pi_{g,e}^{*(b)}(d)
+\widehat\tau_{g,e}^{*(b)}(d).
+$$
+
+Compute kernel masses stably in the log domain, excluding zero sampling counts before taking logarithms. A Gaussian cohort mass is mathematically zero only when the cohort has no sampled treated stores; numerical underflow must not create an apparent zero-mass cohort. Re-estimating both effects and weights in the same draw retains their covariance and the full nonlinear product; there is no delta-method or influence-function approximation in this procedure.
+
+Process sampling counts in batches of at most 32 replications and reconstruct comparison arrays from a shared indexed outcome panel as needed. Do not retain a full $B\times N$ count matrix, duplicate the outcome panel for every draw, or cache all repeated control panels on the fitted model. Temporary kernel work is comparison-specific. The returned draw table necessarily retains the requested replication-by-horizon-by-dose results.
+
+**Successful Draws and Failures.** A draw can be defined at one horizon and unavailable at another. Apply the following rules to each horizon:
+
+| Condition | Bootstrap behavior |
+| --- | --- |
+| No sampled treated stores in one retained cohort, but positive treated mass elsewhere | Define that cohort's aggregate contribution as zero; do not fit its ATT or require sampled controls for it |
+| No sampled treated stores in any retained cohort | Mark the horizon unavailable with reason `no_treated_firms` |
+| Positive treated mass in a non-reference comparison, but no sampled controls | Mark the horizon unavailable with reason `no_controls` |
+| Positive treated mass in a non-reference comparison, but insufficient weighted polynomial rank | Mark the horizon unavailable with reason `rank_deficient` |
+| Reference horizon $e=-1$ with positive overall treated mass | Return zero without fitting regressions or checking sampled controls and polynomial rank |
+
+For a non-reference horizon, an unavailable positive-weight comparison makes the entire draw unavailable at every requested dose. Do not remove that cohort and renormalize the rest, lower the polynomial degree, replace its unknown effect with zero, or redraw until estimation succeeds. A cubic polynomial with four distinct sampled doses can be estimable even when the original sample-size screen required five stores; the original `min_cohort_size` is not a bootstrap screen. Unexpected numerical failures, nonfinite arithmetic, and implementation errors raise exceptions rather than being classified as ordinary sample-support failures.
+
+Let $\mathcal B_e$ be the successful replication indices for horizon $e$, and let $B_e=|\mathcal B_e|$. Use all those successful draws, with no additional minimum success-rate threshold. For $B_e\ge2$, report
+
+$$
+\overline\theta_e^*(d)
+=\frac{1}{B_e}\sum_{b\in\mathcal B_e}\widehat\theta^{*(b)}(d,e),
+\qquad
+\widehat{\operatorname{se}}(d,e)
+=\left[
+\frac{1}{B_e-1}
+\sum_{b\in\mathcal B_e}
+\left(\widehat\theta^{*(b)}(d,e)-\overline\theta_e^*(d)\right)^2
+\right]^{1/2}.
+$$
+
+Let $\ell$ denote `confidence_level` and set $\alpha=1-\ell$. Let $\widehat Q_{d,e}(a)$ be the empirical $a$-quantile of the successful estimates, using NumPy's default linear interpolation. The pointwise percentile interval is
+
+$$
+\left[
+\widehat Q_{d,e}(\alpha/2),
+\widehat Q_{d,e}(1-\alpha/2)
+\right].
+$$
+
+With fewer than two successful draws, leave the standard error and both bounds missing, including at the reference horizon. With at least two successful reference draws, all three values equal zero exactly. Keep the original point estimate regardless of bootstrap failures; the reported center is not replaced by the mean of the successful draws.
+
+Intervals that exclude failed replications use the bootstrap distribution restricted to successful estimation. Label that restriction explicitly; it does not establish nominal or conditional frequentist coverage. A high success rate is not a coverage guarantee, and no automatic threshold converts it into one. Independent stores, adequate information in the retained comparisons, and the stated identification assumptions remain necessary. KDE smoothing bias is ignored, and the selected bandwidth and polynomial specification are held fixed. Intervals are pointwise, not simultaneous across the requested doses and horizons.
+
+**Bootstrap Output Tables and Logging.** `summary` is sorted by `event_time` and `dose`. It contains all original `evaluate_theta()` columns, preserving its point estimates and sample/support flags, plus:
+
+| Column | Meaning |
+| --- | --- |
+| `standard_error` | Sample standard deviation of the successful draws, with `ddof=1` |
+| `ci_lower`, `ci_upper` | Successful-draw percentile bounds at the requested confidence level |
+| `confidence_level` | Nominal interval level supplied to the call |
+| `n_bootstrap` | Total attempted replications, including failures |
+| `n_success`, `n_failed` | Successful and failed replication counts at the horizon; their sum is `n_bootstrap` |
+| `success_rate` | `n_success / n_bootstrap` |
+| `conditional_on_success` | True whenever at least one replication fails at that horizon |
+| `inference_status` | `ok` when all draws succeed; `successful_draws_only` when at least two succeed but some fail; `insufficient_successful_draws` when fewer than two succeed |
+
+`draws` contains `replicate`, `event_time`, `dose`, `theta`, and `success`, sorted by replication, horizon, and dose. Replications are numbered from 1 through `n_bootstrap`. Keep every requested row, including unavailable estimates as `NaN` with `success=False`. Validity and counts are common across doses at a horizon.
+
+`diagnostics` contains `cohort`, `event_time`, `reason`, and `n_failures`, aggregated by comparison and failure reason. The `cohort` column has dtype `datetime64[ns]`; `no_treated_firms` uses `NaT` because it concerns the entire horizon. Each count records the number of replications in which that comparison and reason were reported. Several comparisons can fail within one replication, so summing comparison counts need not equal the horizon's `n_failed`. A clean run returns an empty diagnostics table with the same schema.
+
+Use one aggregated `logging.warning()` when original aggregation restrictions or extrapolation apply, any bootstrap draws fail, or there are insufficient successful draws for inference. Report aggregate counts rather than one warning per cohort, horizon, or replication. Keep the original point-evaluation calculation quiet inside this call. A clean call emits no warning, and no bootstrap operation changes `drop_summary_` or other fitted state.
+
+**Implementation Boundaries and Validation Plan.** Put the class, all five public functions, and a few private validation, window-selection, polynomial, bandwidth, and cell-regression helpers in the single `src/labor_cost_optimization/att.py` file. Use the `labor_cost_optimization` package under the `src` directory; keep estimator logic in that module. Use `firm` and `period` consistently in all Python identifiers, canonical column names, docstrings, and error/log messages, including private helpers. Use `period_col`, `origin_period_`, `last_period_`, `last_period_index_`, and output column `period`; preserve literal third-party API/type names such as `datetime64[ns]` and `.dt.normalize()`. This plan keeps the application term “store” in explanatory prose; code examples and public schema names follow the general `firm` and `period` terminology. Use `logging.warning()` for nonfatal diagnostics and small dictionaries or records for fitted cells. External R code is not a runtime dependency. Private Pydantic v2 input models use `ConfigDict(arbitrary_types_allowed=True, strict=True)` for runtime type validation. Preserve accepted NumPy integer values and the existing public `ValueError` behavior; numerical, period, isolation, and sample checks remain explicit domain validation. These private models stay in the same module and do not extend the public API. No generic estimator framework or serialization layer is needed. Include the package's `py.typed` marker through `[tool.setuptools.package-data]` so installed consumers can use its inline annotations.
+
+**Docstring Convention.** Use Google-style docstrings throughout `src/labor_cost_optimization/att.py`, including the module, `ATT`, its constructor and public methods, all five public functions, and private helpers. Start with a concise summary followed by a blank line before any extended description or sections. Use `Args:`, `Returns:`, and `Raises:` where applicable; omit empty or inapplicable sections. Document constructor arguments in `__init__` and fitted public attributes in the class docstring's `Attributes:` section. Include `Args:` whenever a function or method accepts arguments other than `self` or `cls`, `Returns:` whenever its return annotation is not `None`, and `Raises:` for explicit or relevant unhandled exceptions. A one-line helper docstring is appropriate only when none of these sections is required. Wrap references to functions, methods, attributes, and schema columns in backticks.
 
 Indent argument names, exception classes, and attribute names four spaces relative to the section heading, each followed by a colon on its own line. Start each description on the next line, indented eight spaces, and keep wrapped description lines at that indentation. Plain prose in `Returns:` stays at four spaces. Preserve blank lines between the summary and sections and between successive sections. Do not insert a blank line between a section heading and its first entry. Exception descriptions may use plain prose for multiple related conditions, as in the example below. Document every argument except `self` and `cls`, using its exact signature name; type annotations belong in the signature. Explain returned objects and relevant DataFrame schemas, and describe the conditions for exceptions the caller needs to handle. Describe state changes such as `fit()` replacing earlier fitted state and when fitted attributes become available. Keep docstrings consistent with the implemented behavior and use `firm` and `period` throughout. Nonfatal diagnostics emitted by `logging.warning()` are not exceptions and do not belong in `Raises:`.
 
@@ -608,7 +755,7 @@ Raises:
 """
 ```
 
-The pytest suite in [tests/test_att.py](tests/test_att.py) checks the implementation against independent numerical calculations and targeted examples. Run `uv sync --python 3.11 --group dev`, then `uv run --no-sync python scripts/validate.py --log validation.log` from the repository root. The runner [scripts/validate.py](scripts/validate.py) records environment versions, package-source verification, test tracebacks, and read-only quality checks in a shareable log, continuing after individual failures. It performs no installation and returns a nonzero exit status for any failed check or mismatch with the configured runtime requirements. It uses `packaging` when available to interpret Python constraints and dependency requirements, including ranges and environment markers; missing parsing support is reported without preventing the remaining checks. Run the tests directly with `python -m pytest tests -v`; [tests/test_validate.py](tests/test_validate.py) also checks the diagnostic runner without importing the estimator. Shared, independently initialized fixtures live in [tests/conftest.py](tests/conftest.py); include that file when copying the validation suite. Unit-test assertions may omit messages. Quality commands target only the estimator module, the two test modules, the shared fixture module, the runner, and project documentation. Missing required files produce a failed validation result; quality checks continue on the expected files that are present, with no broad directory scan. Development dependencies include `pytest`, `codespell`, and `orjson`; test fixtures use `orjson` for serialization. Required behaviors include:
+The pytest suites in [tests/test_att.py](tests/test_att.py) and [tests/test_bootstrap.py](tests/test_bootstrap.py) check the implementation against independent numerical calculations and targeted examples. Run `uv sync --python 3.11 --group dev`, then `uv run --no-sync python scripts/validate.py --log validation.log` from the repository root. The runner [scripts/validate.py](scripts/validate.py) records environment versions, package-source verification, test tracebacks, and read-only quality checks in a shareable log, continuing after individual failures. It performs no installation and returns a nonzero exit status for any failed check or mismatch with the configured runtime requirements. It uses `packaging` when available to interpret Python constraints and dependency requirements, including ranges and environment markers; missing parsing support is reported without preventing the remaining checks. Run the tests directly with `python -m pytest tests -v`; [tests/test_validate.py](tests/test_validate.py) also checks the diagnostic runner without importing the estimator. Shared, independently initialized fixtures live in [tests/conftest.py](tests/conftest.py); include that file when copying the validation suite. Unit-test assertions may omit messages. Quality commands target only the estimator module, the three test modules, the shared fixture module, the runner, and project documentation. Missing required files produce a failed validation result; quality checks continue on the expected files that are present, with no broad directory scan. Development dependencies include `pytest`, `codespell`, and `orjson`; test fixtures use `orjson` for serialization. Required behaviors include:
 
 - All four column-name arguments are required; omitting any one raises `TypeError` at construction. No conventional input labels or internal schema names supply defaults. Renaming every input column through the constructor leaves results unchanged, using the same `firm_col` and `period_col` labels in both tables. Inputs missing either shared column fail validation; `outcome_col` and `dose_col` may share a label across the two tables.
 - `fit()` has no `event_times` argument and generates `list(range(-7, 15))` for `(-7, 14)`. Default prediction and aggregation include all 22 horizons; explicit subsets may include negative periods, and out-of-window requests fail.
@@ -644,7 +791,15 @@ The pytest suite in [tests/test_att.py](tests/test_att.py) checks the implementa
 - A CV search emits at most one aggregate warning combining singleton cohorts, a selected final-grid boundary, tied minima, and expansion stop reasons, with correct counts. A clean interior unique-minimum search emits none, including an expansion terminated by a meaningful rise. Bandwidth selection never refits component models or mutates their samples, coefficients, diagnostics, or weights.
 - Aggregation equals a manual weighted sum for both post-treatment and placebo horizons, reports store counts and estimate types, identifies the retained population, and rejects any requested horizon with a missing required cell, including a reference cell with no controls.
 
-The implementation provides point estimates through `ATT`, `estimate_pi()`, and `evaluate_theta()`, with standalone bandwidth choices through `estimate_h0()` and `estimate_h_cv()`. Future inference must cluster or resample by store, carrying its selected event, full termination history, and outcomes together, and account for shared controls, estimated weights, smoothing, and selection. Clustering handles dependence; it does not fix contaminated controls or justify the identifying assumption. Store-level independence and an adequate number of independent stores would still require assessment.
+- Bootstrap sampling counts produce the same cohort curves, kernel weights, and aggregates as explicitly duplicated comparison rows; all-one counts reproduce the original point estimates.
+- One count per original outcome store is shared across every treated/control role and all requested doses and horizons, including stores unused by the requested comparisons. A fixed seed reproduces draws without mutating the fitted model.
+- Zero-mass cohorts contribute zero, while positive-mass rank or control failures invalidate every dose at the affected horizon. No treated mass makes the whole horizon unavailable; reference draws with positive treated mass remain zero without regression checks.
+- Bootstrap does not reapply the original minimum-size screen, change the saved dose basis, refit PyFixest models, or silently drop positive-weight cohorts. Unexpected numerical errors raise instead of producing ordinary failure diagnostics.
+- Successful-only quantiles, sample standard deviations, attempted/successful/failed counts, and status flags match independent calculations. Zero or one successful draw produces missing inference values without discarding raw draws or the original point estimate.
+- Full-panel fingerprint checks accept reordered rows, ignored time components, and extra unmapped columns, but reject changed normalized observations, missing rows, or a changed store population, including changes outside fitted comparison samples.
+- Bootstrap failures and original aggregation warnings produce a single combined warning, with aggregated diagnostics that count failed comparisons independently of the requested dose count.
+
+The implementation provides point estimates through `ATT`, `estimate_pi()`, and `evaluate_theta()`, standalone bandwidth choices through `estimate_h0()` and `estimate_h_cv()`, and store-bootstrap pointwise intervals through `bootstrap_theta()`. Shared store counts preserve dependence from repeated control use and joint effect/weight estimation. Resampling does not fix contaminated controls, justify the identifying assumption, account for changing screening decisions, or remove KDE smoothing bias. Store-level independence and adequate information in the retained comparisons remain substantive requirements.
 
 ## References
 
