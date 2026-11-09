@@ -56,9 +56,6 @@ def test_validate_filename_preserves_valid_posix_filenames(filename: str) -> Non
     Args:
         filename:
             A valid filename, including characters allowed on POSIX systems.
-
-    Raises:
-        AssertionError: If validation changes a valid filename.
     """
     assert vault_utils.validate_filename(filename) == filename
 
@@ -143,9 +140,6 @@ def test_auth_config_accepts_field_names_and_aliases(credentials: AuthCredential
     Args:
         credentials:
             AppRole credentials keyed by field names or their aliases.
-
-    Raises:
-        AssertionError: If credentials are parsed incorrectly, exposed, or TLS is disabled.
     """
     config = vault_utils.VaultAuthConfig(url="https://vault.example.test", **credentials)
 
@@ -164,9 +158,6 @@ def test_auth_config_parses_tls_verification(value: str, expected: bool | str) -
             Raw TLS verification setting supplied to the configuration.
         expected:
             Expected boolean or certificate path after validation.
-
-    Raises:
-        AssertionError: If the parsed TLS setting differs from the expected value.
     """
     config = vault_utils.VaultAuthConfig(
         url="https://vault.example.test", role_id="role", secret_id="secret", verify=value,
@@ -179,7 +170,6 @@ def test_auth_config_requires_credentials() -> None:
     """Verify that authentication validation identifies every missing credential.
 
     Raises:
-        AssertionError: If the validation errors identify the wrong missing fields.
         pytest.fail.Exception: If authentication settings accept missing credentials.
     """
     with pytest.raises(pydantic.ValidationError) as exc_info:
@@ -235,9 +225,6 @@ def test_airflow_config_from_env_file(tmp_path: Path) -> None:
     Args:
         tmp_path:
             Temporary directory in which to create the settings file.
-
-    Raises:
-        AssertionError: If the loaded configuration does not match the file contents.
     """
     env_file = tmp_path / "vault.env"
     env_file.write_text(
@@ -263,9 +250,6 @@ def test_config_from_env_file_reads_approle_secret_files(tmp_path: Path) -> None
     Args:
         tmp_path:
             Temporary directory for the env file and AppRole secret directory.
-
-    Raises:
-        AssertionError: If the AppRole directory or loaded credentials are incorrect.
     """
     secrets_dir = tmp_path / "approle"
     secrets_dir.mkdir()
@@ -287,9 +271,6 @@ def test_config_from_env_uses_case_insensitive_prefixed_names(monkeypatch: pytes
     Args:
         monkeypatch:
             Pytest fixture that supplies temporary Vault environment variables.
-
-    Raises:
-        AssertionError: If the loaded metadata or authentication settings are incorrect.
     """
     for name, value in {
         "vault_url": "https://vault.example.test", "VAULT_ROLE_ID": "env-role",
@@ -316,9 +297,6 @@ def test_config_from_env_reads_unprefixed_secret_filenames(tmp_path: Path, monke
             Temporary directory containing the AppRole secret files.
         monkeypatch:
             Pytest fixture that supplies the server URL and secret directory.
-
-    Raises:
-        AssertionError: If the credentials do not match the unprefixed secret files.
     """
     (tmp_path / "role-id").write_text("file-role")
     (tmp_path / "secret-id").write_text("file-secret")
@@ -354,9 +332,6 @@ def test_client_copies_auth_and_passes_tls_settings(
             Mocked Vault constructor and supporting dependencies.
         verify:
             Boolean TLS setting or certificate path to pass to the backend.
-
-    Raises:
-        AssertionError: If credentials are shared instead of copied or TLS settings are lost.
     """
     auth = auth.model_copy(update={"verify": verify})
 
@@ -393,7 +368,6 @@ def test_client_rejects_invalid_retry_options(
             Parameter name expected in the validation error.
 
     Raises:
-        AssertionError: If a backend is created despite invalid retry settings.
         pytest.fail.Exception: If the invalid retry setting is accepted.
     """
     with pytest.raises(ValueError, match=message):
@@ -418,9 +392,6 @@ def test_read_secret_authenticates_only_when_needed(
             Whether the backend reports an existing authenticated session.
         secret:
             Valid secret dictionary returned by the backend.
-
-    Raises:
-        AssertionError: If the secret, login behavior, read arguments, or retry timing is wrong.
     """
     vault_backend.client.is_authenticated.return_value = authenticated
     vault_backend.client.secrets.kv.v2.read_secret.return_value = {"data": {"data": secret}}
@@ -455,7 +426,6 @@ def test_read_secret_rejects_malformed_responses_without_retry(
             Response without the required nested secret data structure.
 
     Raises:
-        AssertionError: If the underlying error is lost or the malformed response is retried.
         pytest.fail.Exception: If the malformed response is accepted.
     """
     vault_backend.client.secrets.kv.v2.read_secret.return_value = response
@@ -484,7 +454,6 @@ def test_read_secret_rejects_invalid_values_without_retry(
             Secret payload that is not a dictionary mapping strings to strings.
 
     Raises:
-        AssertionError: If the validation cause is lost or invalid data triggers a retry.
         pytest.fail.Exception: If the invalid secret payload is accepted.
     """
     vault_backend.client.secrets.kv.v2.read_secret.return_value = {"data": {"data": secret}}
@@ -525,7 +494,6 @@ def test_read_secret_translates_permanent_errors_without_retry(
             Backend operation to fail, either login or secret reading.
 
     Raises:
-        AssertionError: If the cause is lost or a permanent error triggers a retry.
         pytest.fail.Exception: If the permanent error is swallowed.
     """
     error = error_type("Vault rejected the request")
@@ -558,9 +526,6 @@ def test_read_secret_retries_transient_failures(
             Mocked Vault client and retry timing dependencies.
         error_type:
             Transient exception type raised before a successful response.
-
-    Raises:
-        AssertionError: If the retry result, read arguments, or delay is incorrect.
     """
     vault_backend.client.secrets.kv.v2.read_secret.side_effect = [
         error_type("temporary failure"), {"data": {"data": {"password": "value"}}},
@@ -587,9 +552,6 @@ def test_read_secret_retries_login_and_clamps_negative_sleep(
             AppRole credentials used when retrying authentication.
         vault_backend:
             Mocked Vault client and retry timing dependencies.
-
-    Raises:
-        AssertionError: If login is not retried, the secret is wrong, or the delay is negative.
     """
     vault_backend.client.is_authenticated.return_value = False
     vault_backend.client.auth.approle.login.side_effect = [requests.ConnectionError("offline"), None]
@@ -621,7 +583,6 @@ def test_read_secret_stops_at_attempt_limit_and_chains_last_error(
             Maximum number of read attempts allowed by the client.
 
     Raises:
-        AssertionError: If the attempt limit is ignored or the final cause is incorrect.
         pytest.fail.Exception: If exhausted retries do not raise a query error.
     """
     errors = [error_type(f"failure {index}") for index in range(attempts)]
@@ -665,9 +626,6 @@ def test_airflow_client_copies_config(airflow_client: AirflowClientFixture) -> N
     Args:
         airflow_client:
             Airflow client, original configuration, and mocked Vault dependencies.
-
-    Raises:
-        AssertionError: If configuration objects are shared or the copied auth is not forwarded.
     """
     copied = airflow_client.client.config
 
@@ -689,9 +647,6 @@ def test_airflow_client_reads_connection_from_environment_directory(
             Airflow client and mocked Vault dependencies.
         conn_id:
             Valid connection filename to append to the environment-specific directory.
-
-    Raises:
-        AssertionError: If the connection result, secret path, or mount point is incorrect.
     """
     airflow_client.backend.read_secret.return_value = {"host": "database.example.test"}
 
@@ -714,7 +669,6 @@ def test_airflow_client_rejects_connection_paths(airflow_client: AirflowClientFi
             Invalid connection filename or path that must be rejected.
 
     Raises:
-        AssertionError: If the validation cause is lost or Vault is queried for an invalid ID.
         pytest.fail.Exception: If the invalid connection ID is accepted.
     """
     with pytest.raises(vault_utils.InvalidFilenameError, match=r"conn_id.*filename") as exc_info:
@@ -732,7 +686,6 @@ def test_airflow_client_preserves_vault_errors(airflow_client: AirflowClientFixt
             Airflow client and mocked Vault dependencies.
 
     Raises:
-        AssertionError: If the propagated error is not the original Vault exception.
         pytest.fail.Exception: If the Vault error is swallowed.
     """
     error = vault_utils.VaultPermissionDeniedError("access denied")

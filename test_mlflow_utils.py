@@ -144,7 +144,6 @@ def test_config_serializes_secrets_and_paths_as_strings(config_values: dict[str,
             Valid MLflow settings with an existing certificate path.
 
     Raises:
-        AssertionError: Serialization, field types, or secret masking differ from expectations.
         pytest.fail.Exception: Updating the frozen field does not raise a validation error.
     """
     config = mlflow_utils.MlflowConfig.model_validate(config_values)
@@ -176,7 +175,6 @@ def test_config_rejects_empty_or_missing_fields(
             Empty string to assign, or None to remove the field.
 
     Raises:
-        AssertionError: The validation error does not identify the invalid field.
         pytest.fail.Exception: A missing or empty required setting is accepted.
     """
     values = dict(config_values)
@@ -224,9 +222,6 @@ def test_setup_environment_loads_dotenv(
             Valid MLflow settings with an existing certificate path.
         env_override:
             Whether setup should replace existing settings from the dotenv file.
-
-    Raises:
-        AssertionError: The environment does not contain every configured file value.
     """
     mlflow_utils.setup_mlflow_env(env_file=env_file, env_override=env_override)
 
@@ -247,9 +242,6 @@ def test_setup_environment_preserves_existing_values(
             Valid MLflow settings with an existing certificate path.
         monkeypatch:
             Fixture that restores temporary environment and dependency patches.
-
-    Raises:
-        AssertionError: Existing values are replaced or missing settings are not loaded.
     """
     monkeypatch.setenv("MLFLOW_TRACKING_USERNAME", "existing-user")
     monkeypatch.setenv("UNRELATED_SETTING", "keep-me")
@@ -275,9 +267,6 @@ def test_setup_environment_can_override_existing_values(
             Valid MLflow settings with an existing certificate path.
         monkeypatch:
             Fixture that restores temporary environment and dependency patches.
-
-    Raises:
-        AssertionError: File settings are not applied or an unrelated value is changed.
     """
     for name in config_values:
         monkeypatch.setenv(name, "existing-value")
@@ -313,7 +302,6 @@ def test_setup_environment_override_requires_valid_dotenv_values(
             Empty string to assign, or None to remove the field.
 
     Raises:
-        AssertionError: The wrong field fails validation or the environment changes on failure.
         pytest.fail.Exception: Invalid file settings are accepted during override.
     """
     for name, value in config_values.items():
@@ -349,7 +337,6 @@ def test_setup_environment_override_requires_env_file(
             Fixture that restores temporary environment and dependency patches.
 
     Raises:
-        AssertionError: Required fields are not reported or the environment changes on failure.
         pytest.fail.Exception: Override succeeds without the required file settings.
     """
     for name, value in config_values.items():
@@ -374,9 +361,6 @@ def test_setup_environment_validates_existing_variables(
             Valid MLflow settings with an existing certificate path.
         monkeypatch:
             Fixture that restores temporary environment and dependency patches.
-
-    Raises:
-        AssertionError: Valid environment settings are changed during validation.
     """
     for name, value in config_values.items():
         monkeypatch.setenv(name, value)
@@ -394,7 +378,6 @@ def test_setup_environment_rejects_missing_file_without_mutating_environment(tmp
             Temporary directory for the files used by this test.
 
     Raises:
-        AssertionError: The environment changes despite file validation failing.
         pytest.fail.Exception: A missing dotenv file is accepted.
     """
     before = dict(os.environ)
@@ -433,9 +416,6 @@ def test_log_pydantic_serializes_model(monkeypatch: pytest.MonkeyPatch) -> None:
     Args:
         monkeypatch:
             Fixture that restores temporary environment and dependency patches.
-
-    Raises:
-        AssertionError: The JSON contents or destination passed to MLflow are incorrect.
     """
     model = ExampleModel(name="sample", count=2)
     log_text = Mock()
@@ -458,7 +438,6 @@ def test_logging_requires_active_run(monkeypatch: pytest.MonkeyPatch, kind: str)
             Artifact logger to exercise: pydantic or binary.
 
     Raises:
-        AssertionError: An upload is attempted despite the absence of an active run.
         pytest.fail.Exception: Logging succeeds without an active run.
     """
     monkeypatch.setattr(mlflow, "active_run", Mock(return_value=None))
@@ -491,9 +470,6 @@ def test_load_pydantic_uses_run_uri_and_validates_json(monkeypatch: pytest.Monke
     Args:
         monkeypatch:
             Fixture that restores temporary environment and dependency patches.
-
-    Raises:
-        AssertionError: The artifact URI or validated model differs from expectations.
     """
     load_text = Mock(return_value='{"name":"sample","count":2}')
     monkeypatch.setattr(mlflow.artifacts, "load_text", load_text)
@@ -541,9 +517,6 @@ def test_log_binary_uploads_contents_and_cleans_temporary_file(
             Destination path of the artifact within the run.
         artifact_dir:
             Expected destination directory, or None for a root artifact.
-
-    Raises:
-        AssertionError: Upload contents, destination, call count, or cleanup are incorrect.
     """
     uploaded: list[Path] = []
 
@@ -555,9 +528,6 @@ def test_log_binary_uploads_contents_and_cleans_temporary_file(
                 Path of the temporary file passed to the upload call.
             artifact_path:
                 Upload directory within the run, or None for a root artifact.
-
-        Raises:
-            AssertionError: The file name, payload bytes, or destination directory are incorrect.
         """
         path = Path(local_path)
         assert path.name == "data.bin"
@@ -586,7 +556,6 @@ def test_log_binary_rejects_unsafe_paths(monkeypatch: pytest.MonkeyPatch, artifa
             Absolute path or path containing a parent-directory component.
 
     Raises:
-        AssertionError: Rejected paths still trigger an upload or advance the source stream.
         pytest.fail.Exception: An unsafe artifact path is accepted.
     """
     monkeypatch.setattr(mlflow, "active_run", Mock(return_value=object()))
@@ -609,7 +578,6 @@ def test_log_binary_cleans_temporary_directory_on_upload_failure(monkeypatch: py
             Fixture that restores temporary environment and dependency patches.
 
     Raises:
-        AssertionError: The original failure changes or the temporary directory remains.
         pytest.fail.Exception: The upload failure is swallowed.
     """
     uploaded: list[Path] = []
@@ -657,7 +625,6 @@ def test_log_file_opens_binary_stream_and_closes_it(
             Whether the logging stub raises after reading the file.
 
     Raises:
-        AssertionError: The stream contents, destination, or final closed state are incorrect.
         pytest.fail.Exception: The configured upload failure does not propagate.
     """
     source = tmp_path / "source.bin"
@@ -674,7 +641,6 @@ def test_log_file_opens_binary_stream_and_closes_it(
                 Destination path of the artifact within the run.
 
         Raises:
-            AssertionError: The binary payload or destination path is incorrect.
             RuntimeError: The fail parameter requests an upload failure.
         """
         streams.append(stream)
@@ -700,9 +666,6 @@ def test_log_buffer_rewinds_before_logging(monkeypatch: pytest.MonkeyPatch) -> N
     Args:
         monkeypatch:
             Fixture that restores temporary environment and dependency patches.
-
-    Raises:
-        AssertionError: Logging occurs early or omits bytes before the buffer cursor.
     """
     logged: list[tuple[bytes, str]] = []
 
@@ -734,7 +697,6 @@ def test_log_buffer_skips_logging_when_context_fails(monkeypatch: pytest.MonkeyP
             Fixture that restores temporary environment and dependency patches.
 
     Raises:
-        AssertionError: Partial buffer contents are passed to the upload helper.
         pytest.fail.Exception: The buffer-writing failure is swallowed.
     """
     log_binary = Mock()
@@ -767,7 +729,6 @@ def test_load_binary_downloads_and_cleans_up(monkeypatch: pytest.MonkeyPatch, fa
             Whether the consumer raises after reading the downloaded file.
 
     Raises:
-        AssertionError: The request, contents, stream closure, or directory cleanup are incorrect.
         pytest.fail.Exception: The configured consumer failure does not propagate.
     """
     directories: list[Path] = []
@@ -787,7 +748,6 @@ def test_load_binary_downloads_and_cleans_up(monkeypatch: pytest.MonkeyPatch, fa
             The path to the binary file created in the download directory.
 
         Raises:
-            AssertionError: The requested run ID or artifact path is incorrect.
             OSError: The simulated downloaded file cannot be written.
         """
         assert run_id == "run-1"
@@ -806,7 +766,6 @@ def test_load_binary_downloads_and_cleans_up(monkeypatch: pytest.MonkeyPatch, fa
         """Read the downloaded stream and optionally fail inside its context.
 
         Raises:
-            AssertionError: The downloaded binary payload is incorrect.
             RuntimeError: The fail parameter requests a consumer failure.
         """
         with mlflow_utils.load_binary("nested/data.bin", run_id="run-1") as stream:
@@ -832,9 +791,6 @@ def test_client_initializes_environment_before_sdk(monkeypatch: pytest.MonkeyPat
     Args:
         monkeypatch:
             Fixture that restores temporary environment and dependency patches.
-
-    Raises:
-        AssertionError: Setup arguments, call ordering, or the stored SDK client are incorrect.
     """
     expected_env_file = Path.home() / "mlflow.env"
     calls = Mock()
@@ -863,9 +819,6 @@ def test_client_reuses_and_restores_existing_experiment(
             Wrapper paired with its mocked tracking client.
         lifecycle_stage:
             Whether the existing experiment is active or deleted.
-
-    Raises:
-        AssertionError: The wrong ID is returned or experiment restoration is incorrect.
     """
     wrapper, sdk = client
     sdk.get_experiment_by_name.return_value = mlflow.entities.Experiment(
@@ -888,9 +841,6 @@ def test_client_creates_missing_experiment(client: tuple[mlflow_utils.MlflowClie
     Args:
         client:
             Wrapper paired with its mocked tracking client.
-
-    Raises:
-        AssertionError: The experiment creation arguments or returned ID are incorrect.
     """
     wrapper, sdk = client
     sdk.get_experiment_by_name.return_value = None
@@ -913,9 +863,6 @@ def test_client_recovers_from_experiment_creation_race(
             Wrapper paired with its mocked tracking client.
         lifecycle_stage:
             Whether the existing experiment is active or deleted.
-
-    Raises:
-        AssertionError: The winning experiment is not reused or restored as required.
     """
     wrapper, sdk = client
     experiment = mlflow.entities.Experiment(
@@ -949,7 +896,6 @@ def test_client_propagates_unrecoverable_experiment_creation_errors(
             MLflow error code returned by experiment creation.
 
     Raises:
-        AssertionError: The exception changes or the experiment lookup count is incorrect.
         pytest.fail.Exception: An unrecoverable creation failure is swallowed.
     """
     wrapper, sdk = client
@@ -984,9 +930,6 @@ def test_log_pyfunc_model_logs_payload_artifacts_and_result(
             Temporary directory for the files used by this test.
         caplog:
             Fixture that captures warning and error log messages.
-
-    Raises:
-        AssertionError: Logged data, artifact handling, run lifecycle, or result metadata differ.
     """
     wrapper, sdk = client
     start_run, log_model = model_logging
@@ -1043,9 +986,6 @@ def test_log_pyfunc_model_supports_defaults(
             Wrapper paired with its mocked tracking client.
         model_logging:
             Mocks for the active-run context and PyFunc model logging.
-
-    Raises:
-        AssertionError: Default payloads, model name, or artifact calls are incorrect.
     """
     wrapper, sdk = client
     _, log_model = model_logging
@@ -1081,7 +1021,6 @@ def test_log_pyfunc_model_rejects_blank_names(
             Blank value assigned to the selected name.
 
     Raises:
-        AssertionError: Tracking or model logging begins before name validation succeeds.
         pytest.fail.Exception: A blank experiment or model name is accepted.
     """
     wrapper, sdk = client
@@ -1118,7 +1057,6 @@ def test_log_pyfunc_model_wraps_failures_and_marks_created_runs_failed(
             Tracking operation configured to raise the simulated failure.
 
     Raises:
-        AssertionError: The error cause or failed-run termination calls are incorrect.
         pytest.fail.Exception: A logging failure is not raised as RuntimeError.
     """
     wrapper, sdk = client
@@ -1153,7 +1091,6 @@ def test_log_pyfunc_model_preserves_original_failure_when_status_update_fails(
             Fixture that captures warning and error log messages.
 
     Raises:
-        AssertionError: The original cause changes or the status-update failure is not logged.
         pytest.fail.Exception: The logging failure is swallowed after status update fails.
     """
     wrapper, sdk = client
@@ -1183,9 +1120,6 @@ def test_register_model_optionally_sets_alias(
             Fixture that restores temporary environment and dependency patches.
         alias:
             Optional registry alias; None or an empty string omits it.
-
-    Raises:
-        AssertionError: Registration arguments or optional alias assignment are incorrect.
     """
     wrapper, sdk = client
     register_model = Mock(return_value=SimpleNamespace(version="7"))
@@ -1221,7 +1155,6 @@ def test_register_model_rejects_blank_names(
             Blank value assigned to the selected name.
 
     Raises:
-        AssertionError: Registration is attempted with a blank required argument.
         pytest.fail.Exception: A blank model URI or registry name is accepted.
     """
     wrapper, _ = client
@@ -1252,7 +1185,6 @@ def test_register_model_wraps_registration_and_alias_errors(
             Whether alias assignment fails instead of model registration.
 
     Raises:
-        AssertionError: The cause changes or alias assignment follows failed registration.
         pytest.fail.Exception: A registration or alias failure is not raised as RuntimeError.
     """
     wrapper, sdk = client
@@ -1283,9 +1215,6 @@ def test_load_model_returns_pyfunc_model(
             Wrapper paired with its mocked tracking client.
         monkeypatch:
             Fixture that restores temporary environment and dependency patches.
-
-    Raises:
-        AssertionError: The wrong URI is loaded or the returned model instance changes.
     """
     wrapper, _ = client
     model = object()
@@ -1310,7 +1239,6 @@ def test_load_model_wraps_errors_with_uri(
             Fixture that restores temporary environment and dependency patches.
 
     Raises:
-        AssertionError: The loading error does not preserve its original cause.
         pytest.fail.Exception: A model loading failure is not raised as RuntimeError.
     """
     wrapper, _ = client
