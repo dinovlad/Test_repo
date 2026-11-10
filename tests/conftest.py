@@ -1,18 +1,10 @@
-"""Provide independent estimator inputs and temporary validation checkouts."""
+"""Provide independent synthetic inputs for estimator and bootstrap tests."""
 
 from __future__ import annotations
 
-import importlib.metadata
-import importlib.util
-import io
-import subprocess
-import types
-import unittest.mock
 from collections.abc import Callable
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-import orjson
 import pytest
 
 
@@ -22,10 +14,6 @@ if TYPE_CHECKING:
     import labor_cost_optimization.att as att
 
     Panel = tuple[pd.DataFrame, pd.DataFrame]
-
-
-ReportResult = tuple[bool, str, list[str]]
-Report = Callable[..., ReportResult]
 
 
 def _make_panel(
@@ -220,133 +208,3 @@ def bandwidth_events() -> pd.DataFrame:
             "hours": [4.0, 4.0, 6.0, 4.0, 7.0, 9.0, 6.0, 10.0],
         },
     )
-
-
-@pytest.fixture
-def validator() -> types.ModuleType:
-    """Load an independent validation module without importing the estimator.
-
-    Returns:
-        A fresh module object containing the standalone validation runner.
-
-    Raises:
-        RuntimeError:
-            If Python cannot construct a loader for the validation script.
-        OSError:
-            If the validation script cannot be read.
-    """
-    script = Path(__file__).resolve().parents[1] / "scripts" / "validate.py"
-    spec = importlib.util.spec_from_file_location("local_validation_script", script)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load validation script: {script}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.fixture
-def checkout(tmp_path: Path, validator: types.ModuleType) -> Path:
-    """Create the files needed for a complete validation run.
-
-    Args:
-        tmp_path:
-            Directory for the temporary checkout.
-        validator:
-            This test's validation runner and required-file configuration.
-
-    Returns:
-        The checkout root containing the expected Python files and documentation.
-
-    Raises:
-        OSError:
-            If a fixture directory or source file cannot be created.
-    """
-    for relative in [*validator.CHECKED_PYTHON_FILES, "README.md", "docs/att.md"]:
-        path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("# Validation fixture.\n", encoding="utf-8")
-    return tmp_path
-
-
-@pytest.fixture
-def report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, validator: types.ModuleType) -> Report:
-    """Create environment reports using isolated project metadata.
-
-    Args:
-        tmp_path:
-            Directory for temporary project metadata.
-        monkeypatch:
-            Fixture for replacing metadata lookups and Git commands.
-        validator:
-            This test's independent validation module.
-
-    Returns:
-        A callable reporting a project's success flag, log, and queried names.
-    """
-
-    def make_report(
-        requirements: list[str],
-        versions: dict[str, str],
-        *,
-        requires_python: str = ">=3.0",
-        dev_requirements: list[str] | None = None,
-    ) -> ReportResult:
-        """Report temporary project requirements and installed distributions.
-
-        Args:
-            requirements:
-                Runtime dependency declarations to write to project metadata.
-            versions:
-                Installed distribution versions to return from metadata lookups.
-            requires_python:
-                Python requirement for the temporary project.
-            dev_requirements:
-                Optional development dependency declarations.
-
-        Returns:
-            The validation result, captured report, and queried distributions.
-
-        Raises:
-            OSError:
-                If temporary project metadata cannot be written.
-        """
-        normalized = {name.lower().replace("_", "-"): value for name, value in versions.items()}
-        queried: list[str] = []
-
-        def installed(name: str) -> str:
-            """Return fixture metadata or the normal missing-distribution error.
-
-            Args:
-                name:
-                    Distribution name requested by the validation runner.
-
-            Returns:
-                The configured installed version of the requested distribution.
-
-            Raises:
-                importlib.metadata.PackageNotFoundError:
-                    If the fixture does not provide the requested distribution.
-            """
-            queried.append(name)
-            key = name.lower().replace("_", "-")
-            if key not in normalized:
-                raise importlib.metadata.PackageNotFoundError(name)
-            return normalized[key]
-
-        python_requirement = orjson.dumps(requires_python).decode("utf-8")
-        runtime_requirements = orjson.dumps(requirements).decode("utf-8")
-        config = f"[project]\nrequires-python = {python_requirement}\ndependencies = {runtime_requirements}\n"
-        if dev_requirements is not None:
-            development_requirements = orjson.dumps(dev_requirements).decode("utf-8")
-            config += f"[dependency-groups]\ndev = {development_requirements}\n"
-        (tmp_path / "pyproject.toml").write_text(config, encoding="utf-8")
-        file = io.StringIO()
-        git = subprocess.CompletedProcess([], 0, "fixture commit\n", "")
-        with monkeypatch.context() as scoped:
-            scoped.setattr(validator, "ROOT", tmp_path)
-            scoped.setattr(validator.importlib.metadata, "version", installed)
-            scoped.setattr(validator.subprocess, "run", unittest.mock.Mock(return_value=git))
-            result = validator.environment_report(file)
-        return result, file.getvalue(), queried
-
-    return make_report

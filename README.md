@@ -269,16 +269,16 @@ python scripts/validate.py --log validation.log
 
 The script records Python and dependency versions, the imported estimator's
 source, pytest results, and formatting, lint, type, and spelling checks.
-Quality checks target the estimator module, its three test modules, shared fixtures
+Quality checks target the estimator module, its test module, shared fixtures
 in `tests/conftest.py`, the validation script, and project documentation, so
 unrelated code in a larger project is not scanned.
-When copying these files into an existing project, include
-[tests/test_att.py](tests/test_att.py),
-[tests/test_bootstrap.py](tests/test_bootstrap.py),
-[tests/test_validate.py](tests/test_validate.py), and
-[tests/conftest.py](tests/conftest.py), along with the estimator, its `py.typed`
-marker, the runner, and documentation. Missing required files make validation
-fail, while quality checks continue on the expected files that are present.
+The portable test directory contains [tests/test_att.py](tests/test_att.py) and
+[tests/conftest.py](tests/conftest.py). With the estimator package and `pytest`
+installed, run `python -m pytest tests -v`; the tests require no validation
+script, repository configuration, documentation, or external data files.
+The repository validation script additionally checks its expected source and
+documentation files. Missing required files make validation fail, while quality
+checks continue on the expected files that are present.
 It reads Python and dependency constraints from your `pyproject.toml`, including
 exact pins, ranges, unversioned dependencies, extras, and environment markers.
 Version checks use `packaging` when available; missing parsing support or
@@ -302,6 +302,8 @@ package requirements is marked as a mismatch even if its numerical tests pass.
 The [validation workflow](.github/workflows/validate.yml) runs the tests and
 formatting, lint, type, and spelling checks with Python 3.11 and pinned runtime
 dependencies on pushes to `cgbs-att` and pull requests.
+It also runs a copy of the test directory outside the checkout without the
+repository's pytest configuration.
 
 To run individual checks directly:
 
@@ -310,11 +312,9 @@ uv run --no-sync python -m pytest tests -v
 uv run --no-sync pre-commit run --all-files
 ```
 
-With an activated environment, use `python -m pytest tests -v`. To check only
-the validation runner, use `python -m pytest tests/test_validate.py -v`.
-Ensure the development dependencies, including `pytest`, `codespell`, and
-`orjson`, are installed in the same environment. The validation script never
-installs them.
+With an activated environment, use `python -m pytest tests -v`.
+Ensure the development dependencies, including `pytest` and `codespell`, are
+installed in the same environment. The validation script never installs them.
 
 The pre-commit hooks apply formatting and lint fixes; the validation script's
 quality checks are read-only.
@@ -324,11 +324,9 @@ run these commands after restoring all required files:
 
 ```bash
 python -m ruff check --select I --fix src/labor_cost_optimization/att.py \
-    tests/conftest.py tests/test_att.py tests/test_bootstrap.py \
-    tests/test_validate.py scripts/validate.py
+    tests/conftest.py tests/test_att.py scripts/validate.py
 python -m ruff format src/labor_cost_optimization/att.py \
-    tests/conftest.py tests/test_att.py tests/test_bootstrap.py \
-    tests/test_validate.py scripts/validate.py
+    tests/conftest.py tests/test_att.py scripts/validate.py
 python scripts/validate.py --log validation.log
 ```
 

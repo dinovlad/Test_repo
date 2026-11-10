@@ -31,8 +31,6 @@ CHECKED_PYTHON_FILES = [
     "src/labor_cost_optimization/att.py",
     "tests/conftest.py",
     "tests/test_att.py",
-    "tests/test_bootstrap.py",
-    "tests/test_validate.py",
     "scripts/validate.py",
 ]
 

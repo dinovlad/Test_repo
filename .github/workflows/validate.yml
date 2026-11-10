@@ -19,14 +19,21 @@ jobs:
           python-version: "3.11"
       - name: Install project and validation tools
         run: >-
-          python -m pip install -e . pytest codespell orjson
+          python -m pip install -e . pytest codespell
           "ruff>=0.15.0" "mypy>=1.19.0"
           "pandas-stubs==1.5.3.*" "scipy-stubs==1.15.*"
       - name: Run validation
         run: python scripts/validate.py --log validation.log
+      - name: Check portable test directory
+        run: |
+          portable_dir="$(mktemp -d)"
+          mkdir "$portable_dir/tests"
+          cp tests/conftest.py tests/test_att.py "$portable_dir/tests/"
+          cd "$portable_dir"
+          python -m pytest tests -q --import-mode=importlib
       - name: Show formatting changes if validation fails
         if: failure()
         run: >-
           python -m ruff format --diff
           src/labor_cost_optimization/att.py
-          tests/conftest.py tests/test_att.py tests/test_bootstrap.py tests/test_validate.py scripts/validate.py
+          tests/conftest.py tests/test_att.py scripts/validate.py
