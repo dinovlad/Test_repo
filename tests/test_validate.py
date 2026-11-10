@@ -247,7 +247,7 @@ def test_failed_environment_check_still_runs_tests_and_writes_summary(
         failure:
             Backend failure or reporting error to simulate.
     """
-    for relative in ("README.md", "att.md"):
+    for relative in ("README.md", "docs/att.md"):
         (checkout / relative).unlink()
     log_path = checkout / "validation.log"
     monkeypatch.setattr(validator, "ROOT", checkout)
@@ -324,7 +324,7 @@ def test_quality_checks_only_target_estimator_files_and_project_docs(
         "Mypy": (["mypy"], files),
         "Spelling": (
             ["codespell_lib", "--ignore-words-list=ure,missings"],
-            files | {"README.md", "att.md"},
+            files | {"README.md", "docs/att.md"},
         ),
     }
     assert exit_code == 0
@@ -376,7 +376,7 @@ def test_missing_validator_tests_fail_without_blocking_remaining_quality_checks(
     assert set(commands["Ruff formatting"][5:]) == present
     assert set(commands["Ruff lint"][4:]) == present
     assert set(commands["Mypy"][3:]) == present
-    assert set(commands["Spelling"][4:]) == present | {"README.md", "att.md"}
+    assert set(commands["Spelling"][4:]) == present | {"README.md", "docs/att.md"}
 
 
 def test_no_expected_python_files_never_runs_unscoped_quality_commands(

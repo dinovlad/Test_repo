@@ -39,7 +39,7 @@ The user has explicitly retained the following project conventions:
   descriptions on separate lines. Keep blank lines between sections. Exception
   conditions may use complete prose rather than mandatory bullet lists.
 - Keep estimator logic in the single `src/labor_cost_optimization/att.py` module
-  and its design document in the root `att.md`; do not scaffold the generic
+  and its design document in `docs/att.md`; do not scaffold the generic
   project-layout example solely for compliance.
 
 ## Skills

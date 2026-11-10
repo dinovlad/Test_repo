@@ -334,7 +334,7 @@ def main() -> int:
             emit("Environment reporting failed:\n" + traceback.format_exc(), file)
             environment_ok = False
         results = [("Runtime requirements", environment_ok)]
-        required_docs = [] if args.tests_only else ["README.md", "att.md"]
+        required_docs = [] if args.tests_only else ["README.md", "docs/att.md"]
         sources = [path for path in CHECKED_PYTHON_FILES if (ROOT / path).is_file()]
         documents = [path for path in required_docs if (ROOT / path).is_file()]
         missing = [path for path in [*CHECKED_PYTHON_FILES, *required_docs] if not (ROOT / path).is_file()]

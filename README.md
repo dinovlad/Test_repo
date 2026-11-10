@@ -91,7 +91,7 @@ The search also stops a direction after three consecutive negligible score
 changes, after `max_expansions=50` additional evaluations, or before a generated
 bandwidth or squared scaled dose distance would leave the numerical range.
 Those stops produce a warning rather than claiming an upward turn was found.
-Invalid initial grids still raise an error. See [att.md](att.md) for the exact
+Invalid initial grids still raise an error. See [docs/att.md](docs/att.md) for the exact
 floating-point tolerance and stop rules.
 
 The mean multiclass Brier loss gives every firm equal weight, holding out only
@@ -120,7 +120,7 @@ Horizon -1 is an exact zero reference; earlier horizons are placebo contrasts.
 `predict()` and `evaluate_theta()` return point estimates. Use
 `bootstrap_theta()` for standard errors and pointwise intervals. The identifying
 assumptions, selected populations, diagnostics, and API are described in
-[att.md](att.md).
+[docs/att.md](docs/att.md).
 
 Fitting reuses indexed baseline observations and batches endpoint and termination
 history lookups across cohorts at each horizon. Each comparison still has its
@@ -322,7 +322,7 @@ python scripts/validate.py --log validation.log
 
 Use Harvard author–year citations in code docstrings and project documentation.
 Cite the continuous-treatment article inline as Callaway et. al. (2025), and
-link to its full entry in the [references section of att.md](att.md#references).
+link to its full entry in the [references section of docs/att.md](docs/att.md#references).
 Reference entries list authors, publication year, title, publication venue or
 working-paper status, a stable URL or DOI, and access information when applicable.
 Use title case for document headings and retain the cited work's title in each

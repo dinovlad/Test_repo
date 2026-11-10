@@ -261,7 +261,7 @@ def checkout(tmp_path: Path, validator: types.ModuleType) -> Path:
         OSError:
             If a fixture directory or source file cannot be created.
     """
-    for relative in [*validator.CHECKED_PYTHON_FILES, "README.md", "att.md"]:
+    for relative in [*validator.CHECKED_PYTHON_FILES, "README.md", "docs/att.md"]:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("# Validation fixture.\n", encoding="utf-8")

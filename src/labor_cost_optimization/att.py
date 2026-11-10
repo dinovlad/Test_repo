@@ -2,7 +2,7 @@
 
 Periods have a fixed daily frequency. Firm-level bootstrap inference accompanies
 point estimates; negative horizons are placebo contrasts and horizon -1 is a zero reference.
-See att.md for the identifying assumptions and selected-population estimand.
+See docs/att.md for the identifying assumptions and selected-population estimand.
 """
 
 from __future__ import annotations
