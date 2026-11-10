@@ -446,10 +446,10 @@ The self-contained `att.py` module exposes one class and five functions: `ATT`, 
 
 The frequency is fixed at one calendar day. Input and output period labels are timezone-naive `datetime64[ns]`, normalized to the start of each period. Time-of-day components are ignored. Event-time offsets, isolation bounds, and hours removed per period consequently have a daily interpretation. There is no frequency parameter or support for monthly or annual inputs.
 
-The example assumes `att.py` is importable as `att`; adjust the import to its package location when integrating the module. `outcomes` and `events` are the input DataFrames, and the four column-name variables identify their columns. They have no default names.
+`outcomes` and `events` are the input DataFrames, and the four column-name variables identify their columns. They have no default names.
 
 ```python
-import att
+from labor_cost_optimization import att
 
 bandwidth, cv_scores = att.estimate_h_cv(
     events,
