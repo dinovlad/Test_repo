@@ -39,8 +39,15 @@ The user has explicitly retained the following project conventions:
   descriptions on separate lines. Keep blank lines between sections. Exception
   conditions may use complete prose rather than mandatory bullet lists.
 - Keep estimator logic in the single `src/labor_cost_optimization/att.py` module
-  and its design document in `docs/att.md`; do not scaffold the generic
+  and its portable documentation in `docs/att.md`; do not scaffold the generic
   project-layout example solely for compliance.
+
+## Estimator Maintenance Notes
+
+When maintaining the estimator or its documentation, also read
+[docs/att_codex.md](docs/att_codex.md). It contains repository-specific coding,
+environment, validation, and implementation guidance. Keep those instructions
+out of the portable `docs/att.md`, which documents the theory and public API.
 
 ## Skills
 
