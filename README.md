@@ -43,7 +43,7 @@ The four column-name variables are caller-supplied strings. Both tables must
 use the same firm and period labels. Periods are timezone-naive `datetime64[ns]`
 values, normalized at a fixed daily frequency. Missing firm-period rows are
 allowed; outcomes on present rows must be finite. The event table must contain
-the complete termination history used for isolation and control selection.
+the complete termination history used for target isolation and first-treatment status.
 
 Pydantic v2 `Field` constraints, cached `TypeAdapter` instances, and
 `validate_call` validate configuration and input types. NumPy scalar inputs are
@@ -106,7 +106,7 @@ models or change the selected population. These are custom bandwidth choices,
 not methods prescribed by the article.
 
 The implementation keeps each firm's first termination as its only target,
-retains later terminations for screening, and reports exclusions in one warning
+retains later terminations for target isolation, and reports exclusions in one warning
 per `fit()` call. Inspect `model.drop_summary_` for additional event rows,
 excluded first events, unavailable treated rows, and rejected comparisons;
 detailed reasons remain in the event, availability, and cell diagnostics. Treated
@@ -122,8 +122,21 @@ Horizon -1 is an exact zero reference; earlier horizons are placebo contrasts.
 assumptions, selected populations, diagnostics, and API are described in
 [docs/att.md](docs/att.md).
 
-Fitting reuses indexed baseline observations and batches endpoint and termination
-history lookups across cohorts at each horizon. Each comparison still has its
+For cohort `g` at a post-treatment endpoint `t`, controls are firms whose first
+termination is strictly after `t`, including firms with no recorded termination.
+This follows Callaway et. al. (2025), Theorem C.1. A future termination inside the
+target's isolation window does not exclude a control before that termination;
+previously treated firms never reenter the control pool. For negative and
+reference horizons, controls first terminate strictly after `g`, keeping both
+comparison periods untreated and excluding the focal cohort. Every control needs
+observed outcomes at the fixed baseline and current endpoint. First-treatment
+status uses all first-event records, including target-ineligible and out-of-panel
+events; a control need not pass its own target-isolation screen. Correct untreated
+status also requires relevant pre-panel history or a credible untreated-at-start
+assumption; complete within-panel records alone cannot rule out earlier treatment.
+
+Fitting reuses indexed baseline observations and batches endpoint and first-event
+lookups across cohorts at each horizon. Each comparison still has its
 own polynomial transformation and rank checks. Each regression uses a
 `poly(..., raw=True)` formula with only its own comparison rows, avoiding a
 global matrix of interactions with every cell. Preparation still collects the

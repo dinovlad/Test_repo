@@ -2,6 +2,8 @@
 
 Periods have a fixed daily frequency. Firm-level bootstrap inference accompanies
 point estimates; negative horizons are placebo contrasts and horizon -1 is a zero reference.
+Controls are not yet treated through the comparison endpoint; placebo and reference
+comparisons use never-treated firms or firms first treated after the focal cohort.
 See docs/att.md for the identifying assumptions and selected-population estimand.
 """
 
@@ -578,6 +580,10 @@ class ATT:
     ) -> Self:
         """Fit separate polynomial regressions for eligible non-reference cells.
 
+        Controls have their first event after the later of the focal cohort and
+        comparison endpoint, or no recorded event. Target isolation screening
+        does not restrict controls by events after that comparison cutoff.
+
         Args:
             outcomes:
                 Firm-period outcome table using the configured columns. Missing
@@ -631,6 +637,8 @@ class ATT:
         Only treated availability uses a firm-by-horizon array. Control lookups
         process one horizon at a time over observed baseline rows. Each cell
         retains its own polynomial scaling and rank check, with no pooling.
+        All first events determine control timing, including excluded targets.
+        Controls satisfy G > max(g, g + e), with no-event firms always untreated.
 
         Args:
             outcome:
@@ -648,18 +656,19 @@ class ATT:
         """
         # First-event metadata is already stably sorted by cohort.
         eligible = self.events_.loc[self.events_["design_eligible"]]
-        history = self.termination_history_
         firm_index = pd.Index(outcome["firm_id"].drop_duplicates(), tupleize_cols=False)
         firm_values = firm_index.to_numpy(dtype=object)
         outcome_firms = firm_index.get_indexer(outcome["firm_id"])
         outcome_periods = outcome["period"].to_numpy(dtype="datetime64[ns]").astype(np.int64) // _PERIOD_NS
         outcome_values = outcome["outcome"].to_numpy(dtype=float)
-        history_periods = history["cohort"].to_numpy(dtype="datetime64[ns]").astype(np.int64) // _PERIOD_NS
-        history_firms = firm_index.get_indexer(history["firm_id"])
-        origin = min(int(outcome_periods.min()), int(history_periods.min()))
-        span = max(int(outcome_periods.max()), int(history_periods.max())) - origin + 1
+        origin = int(outcome_periods.min())
+        span = int(outcome_periods.max()) - origin + 1
         outcome_keys = pd.Index(outcome_firms * span + outcome_periods - origin)
-        history_keys = np.sort(history_firms * span + history_periods - origin)
+        first_periods = np.full(len(firm_index), np.iinfo(np.int64).max, dtype=np.int64)
+        event_firms = firm_index.get_indexer(self.events_["firm_id"])
+        first_periods[event_firms] = (
+            self.events_["cohort"].to_numpy(dtype="datetime64[ns]").astype(np.int64) // _PERIOD_NS
+        )
 
         cohort_periods = pd.DatetimeIndex(eligible["cohort"].drop_duplicates().sort_values())
         cohort_days = cohort_periods.to_numpy(dtype="datetime64[ns]").astype(np.int64) // _PERIOD_NS
@@ -698,14 +707,7 @@ class ATT:
         baseline_cohorts = baseline_cohorts[baseline_rows]
         baseline_firms = outcome_firms[baseline_rows]
         baseline_keys = baseline_firms * span + outcome_periods[baseline_rows] - origin
-        lower, upper = self.isolation_window_
-        lower_keys = baseline_firms * span + cohort_days[baseline_cohorts] + lower - origin
-        upper_keys = baseline_firms * span + cohort_days[baseline_cohorts] + upper - origin
-        clean = np.searchsorted(history_keys, lower_keys, side="left") == np.searchsorted(
-            history_keys,
-            upper_keys,
-            side="right",
-        )
+        baseline_first_periods = first_periods[baseline_firms]
         blocks: list[tuple[Cell, pd.DataFrame, FloatArray]] = []
         for horizon_index, e in enumerate(self.event_times_):
             endpoints = outcome_keys.get_indexer(baseline_keys + e + 1)
@@ -715,7 +717,8 @@ class ATT:
                 changes[common] = outcome_values[endpoints[common]] - outcome_values[baseline_rows[common]]
             if not np.isfinite(changes[common]).all():
                 raise ValueError("Outcome differences must be finite.")
-            control_rows = np.flatnonzero(common & clean)
+            control_cutoffs = cohort_days[baseline_cohorts] + max(e, 0)
+            control_rows = np.flatnonzero(common & (baseline_first_periods > control_cutoffs))
             control_bounds = np.r_[0, np.cumsum(np.bincount(baseline_cohorts[control_rows], minlength=n_cohorts))]
             treated_rows = np.flatnonzero(available[:, horizon_index])
             treated_bounds = np.r_[0, np.cumsum(np.bincount(target_cohorts[treated_rows], minlength=n_cohorts))]

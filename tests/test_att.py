@@ -62,7 +62,7 @@ def independent_att(
     doses: FloatArray,
     degree: int = 3,
 ) -> FloatArray:
-    """Compute a no-knot B-spline regression and clean-control contrast.
+    """Compute a no-knot B-spline regression and not-yet-treated contrast.
 
     Args:
         outcomes:
@@ -76,7 +76,7 @@ def independent_att(
         treated_firms:
             Firms belonging to the comparison's observed treated sample.
         control_firms:
-            Firms belonging to its observed clean comparison sample.
+            Not-yet-treated firms with both comparison outcomes observed.
         doses:
             Doses at which to evaluate the independently fitted curve.
         degree:
@@ -159,7 +159,8 @@ def test_separate_models_match_independent_spline_estimates(
         assert block["cohort"].eq(key[0]).all()
         assert block["event_time"].unique().tolist() == [key[1]]
         assert not block["firm_id"].duplicated().any()
-        assert len(block) <= 8
+        expected_rows = 14 if key[0] == FIRST and key[1] < 2 else 7 if key[0] == FIRST else 8
+        assert len(block) == expected_rows
         assert not any(column.startswith("effect_") for column in block.columns)
         treated = block["treated"] == 1
         cell_doses = events.set_index("firm")["hours"].loc[block.loc[treated, "firm_id"]].to_numpy(dtype=float)
@@ -176,8 +177,9 @@ def test_separate_models_match_independent_spline_estimates(
     for key, group in results.groupby(["cohort", "event_time"]):
         cohort, event_time = cast(tuple[pd.Timestamp, int], key)
         cell = fitted.cell_diagnostics_[(cohort, event_time)]
-        assert tuple(cell["control_firms"]) == ("C0",)
-        assert cell["n_controls"] == 1
+        expected_controls = (*[f"B{i}" for i in range(7)], "C0") if cohort == FIRST and event_time < 2 else ("C0",)
+        assert tuple(cell["control_firms"]) == expected_controls
+        assert cell["n_controls"] == len(expected_controls)
         expected = independent_att(
             outcomes,
             events,
@@ -286,16 +288,12 @@ def test_prepared_comparisons_match_direct_row_lookup(
         baseline = cohort - pd.Timedelta(days=1)
         targets = [row for row in events.itertuples(index=False) if row.period == cohort]
         baseline_firms = [row.firm for row in outcomes.itertuples(index=False) if row.period == baseline]
-        blocked = {
-            row.firm
-            for row in events.itertuples(index=False)
-            if cohort + pd.Timedelta(days=WINDOW[0]) <= row.period <= cohort + pd.Timedelta(days=WINDOW[1])
-        }
         for event_time in range(-2, 4):
             key = (cohort, event_time)
             endpoint = cohort + pd.Timedelta(days=event_time)
             common = [firm for firm in baseline_firms if (firm, endpoint) in values]
             treated = [row.firm for row in targets if row.firm in common]
+            blocked = {row.firm for row in events.itertuples(index=False) if row.period <= max(cohort, endpoint)}
             controls = [firm for firm in common if firm not in blocked]
             for row in targets:
                 missing_base = (row.firm, baseline) not in values
@@ -741,11 +739,11 @@ def test_same_period_ties_are_not_promoted_to_later_events(
     assert "A0" not in fitted.cell_diagnostics_[(FIRST, 0)]["treated_firms"]
 
 
-def test_later_history_still_blocks_controls_after_first_event_selection(
+def test_first_event_permanently_excludes_previously_treated_controls(
     panel: Panel,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Preserve later conflicting terminations after excluding a first event.
+    """Exclude previously treated firms even when their target event is unusable.
 
     Args:
         panel:
@@ -774,8 +772,72 @@ def test_later_history_still_blocks_controls_after_first_event_selection(
     selected = fitted.events_.set_index("firm_id")
     assert selected.loc["C0", "cohort"] == pd.Timestamp("2024-01-02")
     assert not selected.loc["C0", "design_eligible"]
-    for cohort in (FIRST, SECOND):
-        assert set(fitted.cell_diagnostics_[(cohort, 0)]["control_firms"]) == {"C1"}
+    assert set(fitted.cell_diagnostics_[(FIRST, 0)]["control_firms"]) == {"C1", *[f"B{i}" for i in range(7)]}
+    assert set(fitted.cell_diagnostics_[(SECOND, 0)]["control_firms"]) == {"C1"}
+    assert "C0" not in fitted.cell_diagnostics_[(SECOND, 3)]["control_firms"]
+
+
+def test_not_yet_treated_controls_follow_each_endpoint_and_exclude_focal_cohort(panel: Panel) -> None:
+    """Use future and never-treated firms without imposing control isolation.
+
+    Args:
+        panel:
+            Fresh synthetic outcome and event tables.
+    """
+    outcomes, events = panel
+    extra_events = pd.DataFrame(
+        [
+            ("past_outside", pd.Timestamp("2023-12-25"), 4.0),
+            ("past_outside", pd.Timestamp("2024-01-20"), 3.0),
+            ("past_before_window", FIRST - pd.Timedelta(days=3), 4.0),
+            ("at_baseline", FIRST - pd.Timedelta(days=1), 4.0),
+            ("focal_excluded", FIRST, 4.0),
+            ("focal_excluded", FIRST + pd.Timedelta(hours=3), 5.0),
+            ("future_excluded", FIRST + pd.Timedelta(days=1), 4.0),
+            ("future_excluded", FIRST + pd.Timedelta(days=2), 5.0),
+            ("at_window_end", FIRST + pd.Timedelta(days=3), 4.0),
+            ("after_window", FIRST + pd.Timedelta(days=4), 4.0),
+            ("future_outside", pd.Timestamp("2024-01-30"), 4.0),
+            ("future_gap", pd.Timestamp("2024-01-31"), 4.0),
+        ],
+        columns=events.columns,
+    )
+    additional = []
+    for firm in extra_events["firm"].drop_duplicates():
+        rows = outcomes.loc[outcomes["firm"].eq("C0")].copy()
+        rows["firm"] = firm
+        if firm == "future_gap":
+            rows = rows.loc[rows["period"].ne(FIRST + pd.Timedelta(days=1))]
+        additional.append(rows)
+    outcomes = pd.concat([outcomes, *additional], ignore_index=True)
+    events = pd.concat([events, extra_events], ignore_index=True)
+    fitted = att.ATT(**MAPPINGS).fit(outcomes, events, isolation_window=WINDOW)
+
+    later_cohort = {f"B{i}" for i in range(7)}
+    always = {"C0", "after_window", "future_outside"}
+    for horizon in range(-2, 4):
+        expected = always.copy()
+        if horizon < 1:
+            expected.add("future_excluded")
+        if horizon < 2:
+            expected.update(later_cohort)
+        if horizon < 3:
+            expected.add("at_window_end")
+        if horizon != 1:
+            expected.add("future_gap")
+        cell = fitted.cell_diagnostics_[(FIRST, horizon)]
+        assert set(cell["control_firms"]) == expected
+        assert cell["n_controls"] == len(expected)
+        assert not set(cell["control_firms"]) & set(cell["treated_firms"])
+        assert not {"past_outside", "past_before_window", "at_baseline", "focal_excluded"} & expected
+
+    selected = fitted.events_.set_index("firm_id")
+    assert not selected.loc["future_excluded", "design_eligible"]
+    assert not selected.loc["future_outside", "design_eligible"]
+    assert not selected.loc["past_outside", "design_eligible"]
+    assert selected.loc["past_outside", "cohort"] == pd.Timestamp("2023-12-25")
+    assert not selected.loc["focal_excluded", "design_eligible"]
+    assert "focal_excluded" not in fitted.cell_diagnostics_[(FIRST, 0)]["treated_firms"]
 
 
 @pytest.mark.parametrize("event_time", [-1, 0], ids=["reference", "post"])
@@ -795,7 +857,8 @@ def test_missing_controls_cannot_be_hidden_by_aggregation(
             Horizon at which to remove the required control observation.
     """
     outcomes, events = panel
-    missing = (outcomes["firm"] == "C0") & (outcomes["period"] == FIRST - pd.Timedelta(days=1))
+    potential_controls = outcomes["firm"].eq("C0") | outcomes["firm"].str.startswith("B")
+    missing = potential_controls & outcomes["period"].eq(FIRST - pd.Timedelta(days=1))
     with caplog.at_level(logging.WARNING):
         fitted = att.ATT(**MAPPINGS).fit(
             outcomes.loc[~missing],

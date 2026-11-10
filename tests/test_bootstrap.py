@@ -104,7 +104,8 @@ def _expanded_theta(
 
     Args:
         model:
-            Fitted comparison memberships, without using its prediction methods.
+            Retained treated samples and degree, without using its predictions
+            or stored control memberships.
         outcomes:
             Original outcome rows.
         events:
@@ -127,6 +128,7 @@ def _expanded_theta(
     multiplicity = dict(zip(model.bootstrap_firms_, counts))
     observed = outcomes.pivot(index="firm", columns="period", values="sales")
     original_doses = events.set_index("firm")["hours"]
+    first_periods = events.groupby("firm", sort=False)["period"].min().reindex(observed.index)
     groups: list[tuple[pd.Timestamp, list[str]]] = []
     for cohort in model.retained_cohorts_[event_time]:
         cell = model.cell_diagnostics_[(cohort, event_time)]
@@ -141,15 +143,16 @@ def _expanded_theta(
     expanded_doses: list[float] = []
     cohort_labels: list[int] = []
     for cohort, treated in groups:
-        cell = model.cell_diagnostics_[(cohort, event_time)]
-        controls = [firm for firm in cell["control_firms"] for _ in range(int(multiplicity[firm]))]
+        baseline = cohort - pd.Timedelta(days=1)
+        endpoint = cohort + pd.Timedelta(days=event_time)
+        changes = observed[endpoint] - observed[baseline]
+        not_yet_treated = first_periods.isna() | first_periods.gt(max(cohort, endpoint))
+        original_controls = observed.index[not_yet_treated & changes.notna()]
+        controls = [firm for firm in original_controls for _ in range(int(multiplicity[firm]))]
         if not controls:
             if available_cohorts:
                 continue
             return np.full(len(doses), np.nan)
-        baseline = cohort - pd.Timedelta(days=1)
-        endpoint = cohort + pd.Timedelta(days=event_time)
-        changes = observed[endpoint] - observed[baseline]
         raw_doses = original_doses.reindex(treated).to_numpy(dtype=float)
         design = np.polynomial.polynomial.polyvander(raw_doses, model.degree)
         response = changes.reindex(treated).to_numpy(dtype=float)
@@ -226,7 +229,7 @@ def test_bootstrap_matches_expanded_firms_and_reuses_global_counts(
     bootstrap_model: att.ATT,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Match duplicated rows while preserving shared controls and fixed bases.
+    """Match duplicated rows with horizon-specific future controls and fixed bases.
 
     Args:
         bootstrap_panel:
@@ -251,7 +254,12 @@ def test_bootstrap_matches_expanded_firms_and_reuses_global_counts(
     bases = copy.deepcopy(bootstrap_model.bases_)
     diagnostics_before = copy.deepcopy(bootstrap_model.cell_diagnostics_)
     original_models = bootstrap_model.models_.copy()
-    original_point = att.evaluate_theta(bootstrap_model, DOSES, bandwidth=BANDWIDTH, event_times=[0, 1])
+    first, second = pd.Timestamp("2024-01-08"), pd.Timestamp("2024-01-10")
+    assert "B0" in bootstrap_model.cell_diagnostics_[(first, 1)]["control_firms"]
+    assert "B0" not in bootstrap_model.cell_diagnostics_[(first, 2)]["control_firms"]
+    for horizon in (0, 1, 2):
+        assert "A0" not in bootstrap_model.cell_diagnostics_[(second, horizon)]["control_firms"]
+    original_point = att.evaluate_theta(bootstrap_model, DOSES, bandwidth=BANDWIDTH, event_times=[0, 1, 2])
     monkeypatch.setattr(bootstrap_model, "fit", unittest.mock.Mock(side_effect=AssertionError("Unexpected refit")))
     monkeypatch.setattr(att.pf, "feols", unittest.mock.Mock(side_effect=AssertionError("Unexpected PyFixest fit")))
     attribute_names = set(vars(bootstrap_model))
@@ -261,7 +269,7 @@ def test_bootstrap_matches_expanded_firms_and_reuses_global_counts(
         DOSES,
         outcomes=outcomes,
         bandwidth=BANDWIDTH,
-        event_times=[0, 1],
+        event_times=[0, 1, 2],
         n_bootstrap=len(rows),
     )
 
@@ -273,11 +281,11 @@ def test_bootstrap_matches_expanded_firms_and_reuses_global_counts(
     assert set(draws["replicate"]) == {1, 2, 3}
     pd_testing.assert_frame_equal(summary[original_point.columns], original_point)
     for replication, counts in enumerate(rows, start=1):
-        for horizon in (0, 1):
+        for horizon in (0, 1, 2):
             expected = _expanded_theta(bootstrap_model, outcomes, events, counts, DOSES, horizon, BANDWIDTH)
             actual = draws.loc[draws["replicate"].eq(replication) & draws["event_time"].eq(horizon), "theta"]
             np_testing.assert_allclose(actual, expected, atol=1e-8, rtol=1e-8)
-    for horizon in (0, 1):
+    for horizon in (0, 1, 2):
         values = draws.loc[draws["event_time"].eq(horizon)].pivot(index="replicate", columns="dose", values="theta")
         result = summary.loc[summary["event_time"].eq(horizon)]
         np_testing.assert_allclose(result["standard_error"], values.std(axis=0, ddof=1))
@@ -489,9 +497,9 @@ def test_available_cohorts_skip_only_the_cell_without_controls(
         bootstrap_panel:
             Original observations and event metadata.
         bootstrap_model:
-            Model whose first cohort also supplies controls for the second cohort.
+            Model whose second cohort also supplies controls for the first cohort.
         monkeypatch:
-            Fixture removing the first cohort's clean comparison firms.
+            Fixture removing all never-treated comparison firms.
     """
     outcomes, events = bootstrap_panel
     model = bootstrap_model
@@ -509,7 +517,7 @@ def test_available_cohorts_skip_only_the_cell_without_controls(
     assert draws["success"].all()
     assert summary["n_success"].eq(2).all()
     assert diagnostics["reason"].tolist() == ["no_controls"]
-    assert diagnostics["cohort"].tolist() == [pd.Timestamp("2024-01-08")]
+    assert diagnostics["cohort"].tolist() == [pd.Timestamp("2024-01-10")]
     for replication, counts in enumerate(rows, start=1):
         expected = _expanded_theta(model, outcomes, events, counts, DOSES, 0, BANDWIDTH, available_cohorts=True)
         np_testing.assert_allclose(draws.loc[draws["replicate"].eq(replication), "theta"], expected, atol=1e-8)

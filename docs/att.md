@@ -6,7 +6,7 @@ The `att.py` module estimates continuous-dose treatment effects separately by tr
 
 ### Units, Treatment, and Isolation
 
-Callaway et. al. (2025) provide the identification and aggregation starting point for a staggered-adoption design with a fixed continuous dose. In the application described here, store $`i`$ is the unit, $`G_i`$ is its earliest recorded termination period, and $`D_i>0`$ is the scheduled hours per period removed by that termination. Only the first termination is a target event. Later terminations remain relevant to eligibility and control selection, but do not create additional target events or aggregation contributions.
+Callaway et. al. (2025) provide the identification and aggregation starting point for a staggered-adoption design with a fixed continuous dose. In the application described here, store $`i`$ is the unit, $`G_i`$ is its earliest recorded termination period, and $`D_i>0`$ is the scheduled hours per period removed by that termination. Only the first termination is a target event. Later terminations remain relevant to target-event isolation, but do not create additional target events or aggregation contributions. Control eligibility is determined by the first termination period.
 
 The fixed treatment label is
 
@@ -18,9 +18,9 @@ The outcome $`Y_{it}`$ is store sales per period. The dose measures hours remove
 
 The isolation window $`(L,H)`$ satisfies $`L\le-1`$ and $`H\ge0`$ and includes every integer event period $`e\in\lbrace L,L+1,\ldots,H\rbrace`$. For a termination at $`g`$, the closed interval $`[g+L,g+H]`$ must lie within the overall outcome panel bounds and contain no other termination at the same store. With the first and last panel periods indexed by 1 and $`T`$, eligibility requires $`g+L\ge1`$ and $`g+H\le T`$. Equality at a boundary is allowed. Simultaneous terminations exclude the affected target because only one selected termination is exempted from the overlap count.
 
-Termination recording is assumed complete for every outcome store throughout the overall panel bounds, including periods without sales observations. Additional termination history outside those bounds does not extend the observed panel. Dropping an event from target estimation does not remove it from the history used to screen other comparisons. A target whose full isolation interval crosses a panel boundary is excluded at every horizon, even if a shorter comparison has observed endpoints.
+Termination recording is assumed complete for every outcome store throughout the overall panel bounds, including periods without sales observations. Additional termination history outside those bounds does not extend the observed panel. Dropping an event from target estimation does not remove it from termination history or erase its store's first-treatment status. A target whose full isolation interval crosses a panel boundary is excluded at every horizon, even if a shorter comparison has observed endpoints.
 
-Write $`S_i=1`$ for a target passing these design restrictions and $`\mathcal{E}`$ for the resulting event population before endpoint and small-sample screening. The same isolation window applies at all horizons. Changing it can change the population even at event period zero. Window lengths must reflect plausible anticipation and changing carryover effects; spacing between events alone does not establish identification. Reuse of store outcomes across comparisons also creates dependence.
+Write $`S_i=1`$ for a target passing these design restrictions and $`\mathcal{E}`$ for the resulting event population before endpoint and small-sample screening. The same isolation window applies at all horizons. Changing it can change the population even at event period zero. Window lengths must reflect plausible anticipation and disruption by additional terminations; spacing between events alone does not establish identification. Reuse of store outcomes across comparisons also creates dependence.
 
 ### Observed Comparisons and Parallel Trends
 
@@ -30,17 +30,23 @@ For cohort $`g`$ and horizon $`e`$, the outcome period is $`t=g+e`$, with baseli
 A_i(e)=O_{i,G_i-1}\thinspace{}O_{i,G_i+e}.
 ```
 
-Both endpoints must be observed exactly; missing intervening periods do not prevent this comparison. Let $`\mathcal{E}_e`$ contain the design-eligible events satisfying $`A_i(e)=1`$. The clean control set is
+Both endpoints must be observed exactly; missing intervening periods do not prevent this comparison. Let $`\mathcal{E}_e`$ contain the design-eligible events satisfying $`A_i(e)=1`$. For control selection, $`G_s`$ is the first termination in the full supplied history of store $`s`$, with $`G_s=\infty`$ for a store with no recorded termination. The control set is
 
 ```math
 \mathcal{C}_{g,e}=\lbrace s:\quad
-\text{no termination at store }s\text{ lies in }[g+L,g+H],\quad
+G_s>\max(g,g+e),\quad
 O_{s,g-1}=O_{s,g+e}=1\rbrace.
 ```
 
-Each control store contributes once, regardless of workforce size, and a treated store cannot control for itself. The history screen extends through $`g+H`$ at every horizon; endpoint availability can still change the treated and control samples across horizons. A store with a sufficiently earlier termination can serve as a control only under the parallel-trends and carryover restrictions below. Such a store is not untreated in the article's absorbing-treatment sense.
+For post-treatment horizons $`e\ge0`$, this is $`G_s>t`$ with $`t=g+e`$: the control has not yet been treated at the comparison endpoint, including stores with no recorded termination. This is the control-timing rule in Callaway et. al. (2025), Theorem C.1, printed p. 40. A store first treated exactly at $`t`$ is excluded. A store first treated after $`t`$ can be a control even when that termination lies before the end $`g+H`$ of the target's isolation window. Previously treated stores never reenter the control pool.
 
-For an eligible target, $`Y^{\mathrm{term}}_{i,t}`$ denotes store sales under the observed termination and $`Y^{\mathrm{keep}}_{i,t}`$ sales if that employee continues at the original scheduled hours through the comparison endpoint. The regimes share the actual pre-event history, with subsequent staffing responses following their respective regimes. This contrast does not remove every earlier termination from the store's history.
+For negative horizons, including the reference at $`e=-1`$, the rule becomes $`G_s>g`$. This keeps both the endpoint and the fixed baseline $`g-1`$ untreated and excludes the entire focal cohort, including its ineligible target candidates. It is the module's fixed-baseline placebo convention; Theorem C.1 states the post-treatment identification result.
+
+Each control store contributes once, regardless of workforce size. Its own target event need not pass isolation, endpoint-availability, or sample-size screening. Control timing uses every selected first-event record, including excluded candidates and events outside the outcome panel. The post-treatment timing-eligible pool shrinks as the endpoint advances and future stores become treated; missing endpoint outcomes can also change the actual sample. A future termination immediately after the endpoint is allowed, so no anticipation remains an identifying assumption.
+
+The article-style untreated interpretation requires correctly observed treatment-entry periods. The module can identify only the earliest supplied event, not a store's lifetime first termination. Relevant earlier history must be supplied, or an untreated-at-panel-start assumption must be credible. Complete recording within the outcome panel alone cannot rule out earlier unrecorded treatment, including for a store assigned an infinite cutoff because it has no event rows.
+
+For an eligible target, $`Y^{\mathrm{term}}_{i,t}`$ denotes store sales under the observed termination and $`Y^{\mathrm{keep}}_{i,t}`$ sales if that employee continues at the original scheduled hours through the comparison endpoint. The regimes share the actual history before this first recorded termination, with subsequent staffing responses following their respective regimes. The scope of the supplied history determines which event is considered first.
 
 For post-treatment horizons $`e\ge0`$, the event-specific analogue of the article's unpooled target is
 
@@ -58,7 +64,7 @@ E[Y^{\mathrm{keep}}_{i,t}-Y^{\mathrm{keep}}_{i,g-1}
 =E[Y_{s,t}-Y_{s,g-1}\mid s\in\mathcal{C}_{g,e}].
 ```
 
-The right-hand expectation weights control stores equally. Earlier terminations may leave persistent level effects that difference out; changing carryover effects must still satisfy this restriction. There is no covariate or treatment-history adjustment to repair a failure of it. Strong parallel trends is not assumed, and slopes across doses are not interpreted as causal marginal responses.
+The right-hand expectation weights eligible not-yet-treated control stores equally. The first-treatment cutoff keeps controls untreated at both comparison periods. Parallel trends must still hold for the isolated, endpoint-observed target population and its observed controls; matching the article's timing rule alone does not establish this selected-sample restriction. There is no covariate or treatment-history adjustment to repair a failure of it. Strong parallel trends is not assumed, and slopes across doses are not interpreted as causal marginal responses.
 
 Isolation based on later terminations and selection on observed outcomes use post-event information and may themselves be affected by the focal termination. Identification is asserted for this selected population under the stated restriction. Excluding stores after closure does not recover an effect that includes their subsequent sales or closure consequences. Generalization to all isolated events needs additional assumptions or a different outcome definition. The selected population is not guaranteed to remain isolated and observed under both counterfactual regimes. Parametric estimation also requires an adequate dose-curve specification and relevant dose support.
 
@@ -111,25 +117,25 @@ Negative-horizon values therefore represent the corresponding placebo or referen
 
 ### Relationship to Callaway et. al. (2025)
 
-One adoption period and a fixed dose per store match the article's treatment-label structure. The target-event screen, observed-outcome selection, and clean-window control rule introduce the following differences.
+One adoption period and a fixed dose per store match the article's treatment-label structure, and post-treatment controls follow its not-yet-treated timing rule. Target-event isolation, observed-outcome selection, and pre-treatment conventions retain the distinctions below.
 
 | Feature | Article's Staggered-Adoption Setting | Store-Termination Design |
 | --- | --- | --- |
-| Treatment histories | One adoption period and fixed subsequent dose per unit, Assumption 3-MP, printed p. 39 | One first-termination label and dose per store; later terminations screen overlap and control eligibility |
+| Treatment histories | One adoption period and fixed subsequent dose per unit, Assumption 3-MP, printed p. 39 | One first-termination label and dose per store; later terminations screen target-event overlap |
 | Observation structure | Independent sampled units, Assumption 1-MP, p. 39 | One outcome trajectory per store; independence across stores remains an assumption, and stores may recur across comparisons |
 | Outcome availability | Outcomes in every modeled panel period | Store-period gaps are allowed; each comparison has its own observed-endpoint population |
-| Counterfactual and parallel trends | Outcomes without treatment; PT-MP and Theorem C.1, pp. 39–40 | No focal termination, retaining actual prior history; parallel trends for selected events and clean controls with observed endpoints |
-| Controls | Not-yet-treated or never-treated units, Theorem C.1, p. 40 | Stores without termination in the specified window; sufficiently earlier terminations are allowed only under the stated identifying restriction |
+| Counterfactual and parallel trends | Outcomes without treatment; PT-MP and Theorem C.1, pp. 39–40 | No first recorded termination; parallel trends for isolated events and not-yet-treated controls with observed endpoints |
+| Controls | Not-yet-treated or never-treated units at the outcome period, Theorem C.1, p. 40 | The same post-treatment cutoff, with exact observed endpoints; no previously treated controls |
 | Aggregation population | Dose-specific event-study aggregation over treatment cohorts, p. 41 | That structure applied to eligible first terminations with observed endpoints and horizon-specific retained cohorts |
-| Pre-treatment output | The cited post-treatment ATT aggregation has a causal level-effect interpretation | Negative horizons are fixed-baseline placebo contrasts, with event period -1 normalized to zero |
+| Pre-treatment output | The cited post-treatment ATT aggregation has a causal level-effect interpretation | Negative horizons are fixed-baseline placebo contrasts using cohorts treated after the focal cohort; event period -1 is normalized to zero |
 
-The dose-specific event-study aggregation on printed page 41 is unnumbered. It supplies the aggregation structure, rather than identification for the additional selection and control rules used here. Remark C.1 on page 42 discusses component estimation and aggregation. The kernel weighting, bandwidth criteria, and bootstrap below are custom additions, rather than the article's prescribed estimators or inference routine.
+The dose-specific event-study aggregation on printed page 41 is unnumbered. It supplies the aggregation structure; the additional target isolation and observed-outcome restrictions still require the stated selected-sample identifying assumptions. Remark C.1 on page 42 discusses component estimation and aggregation. The kernel weighting, bandwidth criteria, and bootstrap below are custom additions, rather than the article's prescribed estimators or inference routine.
 
 ### Polynomial Comparison Estimation
 
 The parametric level-effect calculation in `contdid::cont_did_acrt` fits raw outcome changes on an intercept and dose B-splines within the focal treated cohort, then subtracts the control group's mean change. Without internal knots, degree-$`q`$ B-splines span the same functions as ordinary polynomials of degree at most $`q`$. For identical samples, degree, and baseline convention, the polynomial regression below reproduces that point-estimation calculation up to numerical precision. This equivalence does not extend to specifications with internal spline knots or additional covariates.
 
-Let $`\mathcal{J}`$ contain the non-reference cells $`c=(g,e)`$ with $`e\ne-1`$ that pass treated-design screening and have clean controls. Each cell contains one row per eligible treated store and one row per clean control store. Its row outcome is
+Let $`\mathcal{J}`$ contain the non-reference cells $`c=(g,e)`$ with $`e\ne-1`$ that pass treated-design screening and have eligible controls. Each cell contains one row per eligible treated store and one row per eligible control store. Its row outcome is
 
 ```math
 \Delta Y_{ic}=Y_{i,g+e}-Y_{i,g-1}.
@@ -188,7 +194,7 @@ At the reference horizon, $`A_i(-1)=O_{i,G_i-1}`$. The same treated-sample, dose
 
 ### Comparison Screening and the Restricted Target
 
-The treatment component has $`p=q+1`$ coefficients. Full rank algebraically requires at least $`p`$ treated observations, while this design uses a floor of $`p+1`$ to retain positive residual degrees of freedom in the treated component. At least one clean control is also required. Neither additional control rows nor observations in other cells relax the treated floor. If an additional user-selected minimum is $`n_{\mathrm{user}}`$, the threshold is
+The treatment component has $`p=q+1`$ coefficients. Full rank algebraically requires at least $`p`$ treated observations, while this design uses a floor of $`p+1`$ to retain positive residual degrees of freedom in the treated component. At least one eligible control is also required. Neither additional control rows nor observations in other cells relax the treated floor. If an additional user-selected minimum is $`n_{\mathrm{user}}`$, the threshold is
 
 ```math
 n_{\min}=
@@ -200,7 +206,7 @@ p+1,&\text{if the minimum is unspecified},\\
 
 For a cubic curve, $`p=4`$ and the default minimum is five treated stores. Meeting the threshold does not guarantee precision. Each cell also needs at least $`p`$ distinct treated doses and a full-rank intercept-plus-power design. Numerical rank decisions can depend on scaling and floating-point tolerance even when polynomial parameterizations are mathematically equivalent.
 
-A cohort failing sample size, support, or rank is excluded only at the affected horizon. It may remain estimable at others, and its stores' complete termination histories still govern control selection. A comparison with no observed treated endpoints is absent from that horizon's observed-event population. A retained treated comparison with no controls is an estimation failure, not an extra population screen: aggregation does not silently discard it or supply a zero effect.
+A cohort failing sample size, support, or rank is excluded only at the affected horizon. It may remain estimable at others, and its stores' first termination periods still determine when they can serve as controls. A comparison with no observed treated endpoints is absent from that horizon's observed-event population. A retained treated comparison with no controls is an estimation failure, not an extra population screen: aggregation does not silently discard it or supply a zero effect.
 
 Let $`\mathcal{R}_e\subseteq\mathcal{G}_e`$ be the retained cohort set and $`\mathcal{I}_e`$ the stores in those cohorts with eligible first events and both endpoints observed. After screening, the cohort probabilities concern
 
@@ -513,7 +519,7 @@ Missing store-period rows are allowed, including inactivity and permanent closur
 
 The overall screening interval is inferred from the earliest and latest normalized outcome periods across the complete panel. Calendar gaps are preserved. It is not inferred separately per store, from termination periods, or by ranking observed labels. All supplied events enter first-event selection and history screening, including events outside the panel, during missing-outcome periods, or subsequently excluded from estimation. Extra event records do not extend the screening interval.
 
-The event table must record every termination of every outcome store during the overall panel interval, including periods of inactivity or closure. Completeness is a data assumption, not something the module can establish from observed records. Stores without terminations need no event row; zero-dose placeholder events are invalid.
+The event table must record every termination of every outcome store during the overall panel interval, including periods of inactivity or closure. Completeness is a data assumption, not something the module can establish from observed records. Stores without terminations need no event row; zero-dose placeholder events are invalid. First-treatment control eligibility also requires enough earlier history to identify treatment entry, or a justified untreated-at-panel-start assumption. A store with no supplied event is treated as having no observed treatment entry; the module cannot verify that it was never treated before the panel.
 
 ### First Events and Termination History
 
@@ -523,7 +529,7 @@ Selection uses a stable sort by normalized period and retains the entire first r
 
 Every input row is treated as one actual termination. Multiple rows at the same store and normalized period count as simultaneous terminations, even when their doses match. If the earliest period has several records, the selected candidate is marked `overlapping_termination` and excluded. If those records are duplicate copies of the same underlying termination, remove the copies upstream; employee identifiers are unavailable to distinguish them automatically.
 
-`events_` contains one first-event row per represented store. `termination_history_` retains all distinct store-period combinations and their record counts. Later and excluded events continue to block inappropriate treated or control comparisons.
+`events_` contains one first-event row per represented store, including target-ineligible candidates; control timing uses all of those rows. `termination_history_` retains all distinct store-period combinations and their record counts for target isolation. Once a store has its first termination, it cannot serve as a control at that period or later, regardless of later terminations or target exclusions.
 
 `duplicate_diagnostics_` reports `n_dropped_events`, the input event-row count minus the number of represented stores, and `n_affected_firms`, the number of stores with more than one event row. For example, three rows for one store and two for another mean three additional target rows removed across two stores. These counts include later and simultaneous records; they do not imply erroneous source duplicates. They also appear in `drop_summary_` as `duplicate_event_rows` and `duplicate_event_firms`.
 
@@ -560,7 +566,7 @@ NumPy integer and floating-point scalars are accepted where appropriate. Numeric
 
 `fit()` returns `self` and replaces prior fitted state. Any failed refit invalidates previous predictions. Calling `predict()` without a successful current fit raises `RuntimeError`. Invalid prediction requests or nonfinite polynomial predictions raise `ValueError`.
 
-Each non-reference cohort–horizon comparison has a separate PyFixest OLS model and its own polynomial coefficients. There is no pooling across cohorts or horizons. Treated and control rows have equal weights within an original comparison. Samples follow the isolation, exact-endpoint, and clean-control rules in the theoretical section. One store contributes at most once as treated and at most once as control within a comparison, and cannot be both in that comparison. It can appear in other comparisons when eligible.
+Each non-reference cohort–horizon comparison has a separate PyFixest OLS model and its own polynomial coefficients. There is no pooling across cohorts or horizons. Treated and control rows have equal weights within an original comparison. Target samples follow the isolation and exact-endpoint rules in the theoretical section. Controls require their first termination strictly after the later of the focal cohort period and comparison endpoint, plus both observed outcomes; their own target isolation eligibility is not required. One store contributes at most once as treated and at most once as control within a comparison, and cannot be both in that comparison. It can appear in other comparisons when eligible.
 
 Every comparison saves the polynomial transformation estimated from its own endpoint-observed treated doses. Predictions reuse its `lower`, `upper`, and `degree` values. Requesting dose 8 alone or alongside other doses produces the same prediction at 8. Different horizons may save different transformations because their observed samples differ.
 
@@ -570,9 +576,9 @@ Non-reference predictions outside a comparison's observed dose range use polynom
 
 With `degree=3` and `min_cohort_size=None`, each treated comparison needs at least five observed stores. A smaller explicit minimum cannot reduce the design floor; a larger one increases it. The resolved value is stored in `min_cohort_size_`. `None` does not disable screening, and passing the minimum does not guarantee precision.
 
-A treated comparison also needs at least `degree + 1` distinct doses and full column rank of its saved polynomial design. The numerical rank criterion uses NumPy's standard SVD tolerance. Each store counts once; extra outcome rows, other cohorts, control observations, and further terminations cannot satisfy a treated-sample requirement. At least one clean control is needed; a singleton control group can supply a point estimate.
+A treated comparison also needs at least `degree + 1` distinct doses and full column rank of its saved polynomial design. The numerical rank criterion uses NumPy's standard SVD tolerance. Each store counts once; extra outcome rows, other cohorts, control observations, and further terminations cannot satisfy a treated-sample requirement. At least one eligible control is needed; a singleton control group can supply a point estimate.
 
-Sample-size, dose-support, and rank screens drop only the affected cohort–horizon comparison. A cohort can remain usable at other horizons. Screened stores remain in termination history and may be eligible controls elsewhere. The polynomial degree is not reduced to rescue a comparison.
+Sample-size, dose-support, and rank screens drop only the affected cohort–horizon comparison. A cohort can remain usable at other horizons. Screened stores retain their first-event status and may serve as controls for earlier cohorts only while satisfying the first-treatment cutoff and endpoint requirements. The polynomial degree is not reduced to rescue a comparison.
 
 | Status or Reason | Meaning |
 | --- | --- |
@@ -585,7 +591,7 @@ Sample-size, dose-support, and rank screens drop only the affected cohort–hori
 | `small_sample` | The observed treated sample is below `min_cohort_size_` |
 | `insufficient_doses` | The treated sample has fewer than `degree + 1` distinct doses |
 | `rank_deficient` | The saved treated polynomial design is not full column rank |
-| `no_controls` | A nonempty treated design passes screening but lacks endpoint-observed clean controls |
+| `no_controls` | A nonempty treated design passes screening but lacks endpoint-observed eligible controls |
 | `fitted` | A non-reference comparison was fitted successfully |
 | `reference` | The reference comparison passed bookkeeping checks and has exact zero coefficients |
 | `model_failed` | A backend fitting or coefficient-validation failure invalidated the fit |
@@ -606,7 +612,7 @@ If no non-reference cell passes all required checks, fitting fails; reference ce
 | `dose` | Requested dose |
 | `att` | Component estimate at that dose and horizon |
 | `estimate_type` | `att` for nonnegative horizons, `placebo` below -1, or `reference` at -1 |
-| `n_treated`, `n_controls` | Numbers of stores in the original comparison; `n_treated` refers to the future termination cohort even before treatment |
+| `n_treated`, `n_controls` | Numbers of stores in the original comparison; `n_treated` refers to the future termination cohort even before treatment, and `n_controls` can change across horizons as controls become treated or endpoint availability changes |
 | `extrapolated` | Whether a non-reference prediction lies outside that cell's observed dose support |
 
 Unavailable or screened comparisons are omitted, with diagnostics and aggregate warnings where applicable. Ordinary outcome-availability exclusions are recorded separately. Every successful reference prediction has `att=0`.
