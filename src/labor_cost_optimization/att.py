@@ -1050,7 +1050,6 @@ def _validate_aggregation_firms(firms: Iterable[object], name: str) -> list[obje
     Args:
         firms:
             Firm identifiers to validate without converting their types.
-
         name:
             Argument name used in validation messages.
 
@@ -1450,13 +1449,10 @@ def estimate_pi(
             Canonical first-event metadata with firm_id, cohort, and dose
             columns, containing one row per firm. Cohort periods must be
             normalized, timezone-naive datetime64[ns] values.
-
         doses:
             Distinct positive finite doses at which to evaluate weights.
-
         eligible_firms:
             Unique firm identifiers defining the eligible sample.
-
         bandwidth:
             Positive finite Gaussian-kernel bandwidth in dose units.
 
@@ -1540,13 +1536,10 @@ def evaluate_theta(
         model:
             Successfully fitted ATT instance with comparison diagnostics and
             saved component coefficients. This function does not refit it.
-
         doses:
             Distinct positive finite doses at which to evaluate effects.
-
         bandwidth:
             Positive finite Gaussian-kernel bandwidth in dose units.
-
         event_times:
             Distinct fitted integer event periods to report. None selects the
             complete fitted interval, including its reference period.
