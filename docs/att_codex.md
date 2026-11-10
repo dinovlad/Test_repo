@@ -10,7 +10,11 @@ Follow the repository rules for imports, type annotations, serialization, and Am
 
 ## Development Environment and Commands
 
-The project targets Python 3.11 (`>=3.11,<3.12`) and records dependencies in [pyproject.toml](../pyproject.toml); [.python-version](../.python-version) selects the interpreter. Runtime pins are `numpy==1.26.4`, `pandas==1.5.3`, `pyfixest==0.60.0`, and `scipy==1.15.2`, with `pydantic>=2,<3`. Development dependencies remain in `[dependency-groups].dev`; keep the existing uv workflow. The user has authorized Python 3.12 for local testing only, without changing project settings. Report such checks as compatibility checks, not validation of the pinned Python 3.11 environment.
+The `att.py` module depends on NumPy, pandas, Pydantic v2, PyFixest, SciPy, and the Python standard library; R is not a runtime dependency.
+
+The supported runtime is Python 3.11 with `numpy==1.26.4`, `pandas==1.5.3`, `pydantic>=2,<3`, `pyfixest==0.60.0`, and `scipy==1.15.2`. These library versions define the documented compatibility baseline when copying the module to another project.
+
+The project targets Python 3.11 (`>=3.11,<3.12`) and records dependencies in [pyproject.toml](../pyproject.toml); [.python-version](../.python-version) selects the interpreter. Development dependencies remain in `[dependency-groups].dev`; keep the existing uv workflow. The user has authorized Python 3.12 for local testing only, without changing project settings. Report such checks as compatibility checks, not validation of the pinned Python 3.11 environment.
 
 Use the supplied [.pre-commit-config.yaml](../.pre-commit-config.yaml) for spelling, formatting, lint, and type checks on Python, Markdown, and notebooks. The hooks use system executables, so activate the development environment before installing or running them:
 

@@ -442,9 +442,7 @@ Discarding failed replications restricts the bootstrap distribution to successfu
 
 ### Module Scope and Usage
 
-The self-contained `att.py` module exposes one class and five functions: `ATT`, `estimate_h0()`, `estimate_h_cv()`, `estimate_pi()`, `evaluate_theta()`, and `bootstrap_theta()`. It depends on NumPy, pandas, Pydantic v2, PyFixest, SciPy, and the Python standard library; R is not a runtime dependency. The module supports separate polynomial dose curves, cohort aggregation, and pointwise bootstrap intervals. It does not provide covariates, spline knots, treatment-slope estimates, changing-dose treatment paths, simultaneous confidence bands, or plotting.
-
-The supported runtime is Python 3.11 with `numpy==1.26.4`, `pandas==1.5.3`, `pydantic>=2,<3`, `pyfixest==0.60.0`, and `scipy==1.15.2`. These library versions define the documented compatibility baseline when copying the module to another project.
+The self-contained `att.py` module exposes one class and five functions: `ATT`, `estimate_h0()`, `estimate_h_cv()`, `estimate_pi()`, `evaluate_theta()`, and `bootstrap_theta()`. The module supports separate polynomial dose curves, cohort aggregation, and pointwise bootstrap intervals. It does not provide covariates, spline knots, treatment-slope estimates, changing-dose treatment paths, simultaneous confidence bands, or plotting.
 
 The frequency is fixed at one calendar day. Input and output period labels are timezone-naive `datetime64[ns]`, normalized to the start of each period. Time-of-day components are ignored. Event-time offsets, isolation bounds, and hours removed per period consequently have a daily interpretation. There is no frequency parameter or support for monthly or annual inputs.
 
