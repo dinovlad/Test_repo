@@ -1200,7 +1200,11 @@ def test_normalization_renaming_and_input_order_preserve_estimates(
     placebo = result.loc[result["event_time"] == -2, "att"]
     np_testing.assert_allclose(placebo, 0.3 * 6 + 0.02 * 6**2, atol=1e-8)
     post = result.loc[result["event_time"] == 0, "att"]
-    np_testing.assert_allclose(post, 2 + 0.5 * 6 - 0.03 * 6**2 + 0.004 * 6**3, atol=1e-8)
+    post_effect = 2 + 0.5 * 6 - 0.03 * 6**2 + 0.004 * 6**3
+    future_doses = np.arange(5.0, 12.0)
+    # The later cohort's pre-trend enters the first cohort's control mean.
+    control_pretrend = np.sum(0.3 * future_doses + 0.02 * future_doses**2) / (len(future_doses) + 1)
+    np_testing.assert_allclose(post, [post_effect - control_pretrend, post_effect], atol=1e-8)
     assert fitted.origin_period_ == pd.Timestamp("2024-01-01")
     assert fitted.last_period_ == pd.Timestamp("2024-01-24")
 
