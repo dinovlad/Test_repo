@@ -156,7 +156,7 @@ summary, draws, diagnostics = att.bootstrap_theta(
     outcomes=outcomes,
     bandwidth=bandwidth,
     event_times=[-2, -1, 0, 7, 14],
-    n_bootstrap=1999,
+    n_bootstrap=100,
     confidence_level=0.95,
     random_state=42,
     failure_policy="available_cohorts",
@@ -185,17 +185,18 @@ polynomial degree, and selected bandwidth remain fixed. Cohort shares vary with
 the sampled firms. No minimum-size screening is repeated, and excluded
 original comparisons do not enter the bootstrap aggregation.
 
-`failure_policy="strict"` is the default. A positive-weight cohort with
-insufficient polynomial rank or no sampled controls makes that draw unavailable
-at the affected horizon, for every requested dose.
-
-Use `failure_policy="available_cohorts"` to keep each estimable cohort instead.
+The defaults are `n_bootstrap=100` and `failure_policy="available_cohorts"`.
+This policy keeps each estimable cohort.
 For each draw and horizon, the kernel weights are estimated over the available
 cohorts and normalized to sum to one. The aggregate is the sum of those weights
 times their ATT estimates; no additional normalization is needed after defining
 the weights this way. A single available cohort is sufficient. If none remain,
 the corresponding estimates are missing. Failed positive-weight cohorts remain
 visible in the diagnostics.
+
+With `failure_policy="strict"`, a positive-weight cohort with insufficient
+polynomial rank or no sampled controls makes that draw unavailable at the
+affected horizon, for every requested dose.
 
 `summary` preserves every `evaluate_theta()` column and adds `standard_error`,
 `ci_lower`, `ci_upper`, `confidence_level`, `n_bootstrap`, `n_success`, `n_failed`,

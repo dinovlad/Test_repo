@@ -370,6 +370,7 @@ def test_failed_horizons_use_successful_draws_without_rescreening_or_redrawing(
             event_times=[-1, 0, 1],
             n_bootstrap=3,
             confidence_level=0.8,
+            failure_policy="strict",
         )
     assert sum(size for _, size in requests) == 3
     assert len(caplog.records) == 1
@@ -649,12 +650,12 @@ def test_available_cohorts_preserve_survivors_when_excluded_kernel_mass_dominate
         np_testing.assert_allclose(draws.loc[draws["replicate"].eq(replication), "theta"], expected, atol=1e-8)
 
 
-def test_available_cohorts_match_strict_when_every_sampled_cell_is_estimable(
+def test_bootstrap_defaults_match_explicit_options_and_complete_strict_draws(
     bootstrap_panel: Panel,
     bootstrap_model: att.ATT,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Preserve complete-draw results and the existing default policy.
+    """Use 100 available-cohort draws by default and preserve complete strict results.
 
     Args:
         bootstrap_panel:
@@ -665,22 +666,28 @@ def test_available_cohorts_match_strict_when_every_sampled_cell_is_estimable(
             Fixture repeating complete, nonuniformly weighted firm draws.
     """
     outcomes, _ = bootstrap_panel
-    rows = np.vstack([_counts(bootstrap_model), _counts(bootstrap_model, {"A0": 2, "A1": 0, "C0": 2, "C1": 0})])
+    rows = np.vstack(
+        [_counts(bootstrap_model), _counts(bootstrap_model, {"A0": 2, "A1": 0, "C0": 2, "C1": 0})] * 50,
+    )
     results = []
     for policy in (None, "strict", "available_cohorts"):
-        _force_counts(monkeypatch, rows)
-        options: dict[str, Any] = {} if policy is None else {"failure_policy": policy}
+        requests = _force_counts(monkeypatch, rows)
+        options: dict[str, Any] = {} if policy is None else {"failure_policy": policy, "n_bootstrap": 100}
         results.append(
             att.bootstrap_theta(
                 bootstrap_model,
                 DOSES,
                 outcomes=outcomes,
                 bandwidth=BANDWIDTH,
-                n_bootstrap=2,
                 **options,
             ),
         )
-    for default, explicit in zip(results[0], results[1], strict=True):
+        assert sum(size for _, size in requests) == 100
+    summary, draws, _ = results[0]
+    assert summary["n_bootstrap"].eq(100).all()
+    assert summary["failure_policy"].eq("available_cohorts").all()
+    assert set(draws["replicate"]) == set(range(1, 101))
+    for default, explicit in zip(results[0], results[2], strict=True):
         pd_testing.assert_frame_equal(default, explicit)
     for strict, available in zip(results[1], results[2], strict=True):
         columns = [column for column in strict.columns if column != "failure_policy"]
@@ -1069,6 +1076,7 @@ def test_numerical_kernel_underflow_cannot_hide_positive_mass_rank_failure(
         bandwidth=1e-150,
         event_times=[0],
         n_bootstrap=2,
+        failure_policy="strict",
     )
     assert not draws.loc[draws["replicate"].eq(1), "success"].any()
     assert draws.loc[draws["replicate"].eq(1), "theta"].isna().all()

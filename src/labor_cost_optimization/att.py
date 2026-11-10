@@ -2128,10 +2128,10 @@ def bootstrap_theta(
     outcomes: pd.DataFrame,
     bandwidth: _PositiveReal,
     event_times: pydantic.SkipValidation[Iterable[int] | None] = None,
-    n_bootstrap: Annotated[_Integer, pydantic.Field(ge=2)] = 1999,
+    n_bootstrap: Annotated[_Integer, pydantic.Field(ge=2)] = 100,
     confidence_level: Annotated[_Real, pydantic.Field(gt=0, lt=1)] = 0.95,
     random_state: Annotated[_Integer, pydantic.Field(ge=0)] | None = None,
-    failure_policy: Literal["strict", "available_cohorts"] = "strict",
+    failure_policy: Literal["strict", "available_cohorts"] = "available_cohorts",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Bootstrap dose-specific event-study effects by resampling entire firms.
 
@@ -2160,17 +2160,17 @@ def bootstrap_theta(
         event_times:
             Distinct fitted integer horizons, or None to report the full window.
         n_bootstrap:
-            Number of attempted resamples, at least two. Failed draws are retained
-            and are never replaced by additional resampling.
+            Number of attempted resamples, at least two; defaults to 100. Failed
+            draws are retained and are never replaced by additional resampling.
         confidence_level:
             Nominal interval coverage strictly between zero and one.
         random_state:
             Nonnegative integer seed, or None for nondeterministic local sampling.
         failure_policy:
-            With "strict", any failed positive-mass cell makes that horizon draw
-            unavailable. With "available_cohorts", aggregate the estimable cells
-            using kernel weights normalized over those cohorts; no available
-            cohorts means a missing estimate.
+            Defaults to "available_cohorts": aggregate the estimable cells using
+            kernel weights normalized over those cohorts; no available cohorts
+            means a missing estimate. With "strict", any failed positive-mass
+            cell makes that horizon draw unavailable.
 
     Returns:
         Three DataFrames: the original `evaluate_theta()` summary with bootstrap

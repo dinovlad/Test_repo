@@ -483,7 +483,7 @@ summary, draws, diagnostics = att.bootstrap_theta(
     outcomes=outcomes,
     bandwidth=bandwidth,
     event_times=[-7, -2, -1, 0, 7, 14],
-    n_bootstrap=1999,
+    n_bootstrap=100,
     confidence_level=0.95,
     random_state=42,
     failure_policy="available_cohorts",
@@ -782,10 +782,10 @@ bootstrap_theta(
     outcomes,
     bandwidth,
     event_times=None,
-    n_bootstrap=1999,
+    n_bootstrap=100,
     confidence_level=0.95,
     random_state=None,
-    failure_policy="strict",
+    failure_policy="available_cohorts",
 ) -> tuple[pandas.DataFrame, pandas.DataFrame, pandas.DataFrame]
 ```
 
@@ -798,10 +798,10 @@ The function returns `(summary, draws, diagnostics)` without changing the fitted
 | `outcomes` | Complete original outcome table, using the fitted model's column mappings |
 | `bandwidth` | Fixed positive finite kernel bandwidth in dose units |
 | `event_times` | Distinct fitted integer horizons, or `None` for the full fitted interval |
-| `n_bootstrap` | Integer number of attempted draws, at least 2; default 1999 |
+| `n_bootstrap` | Integer number of attempted draws, at least 2; default 100 |
 | `confidence_level` | Finite nominal interval level strictly between zero and one; default 0.95 |
 | `random_state` | Nonnegative integer seed or `None` for nondeterministic local sampling |
-| `failure_policy` | `"strict"` by default, or `"available_cohorts"` |
+| `failure_policy` | `"available_cohorts"` by default, or `"strict"` |
 
 The complete normalized store-period observations and numeric outcomes must match the original fit, including stores or rows unused by the requested comparisons. Row order, ignored time-of-day components, and extra unmapped columns may differ. Matching original coefficients alone is insufficient. `outcome_fingerprint_` and `bootstrap_firms_` enforce this contract; models lacking that metadata require refitting. The event table is not supplied again.
 
